@@ -1,0 +1,393 @@
+#!/opt/aigw/venv/bin/python3
+"""
+aigw-passkey -- CLI for managing aigw host/root-shell passkeys.
+
+This tool never decides whether a passkey is valid, and never decides who is
+allowed to do what with it either -- it only talks to aigw-unlockd (running
+as root, listening on /run/aigw-unlockd.sock) over the wire protocol
+documented in that program's own docstring, and aigw-unlockd's own
+SO_PEERCRED checks (_require_peer_is_user_or_root, and the tier-specific
+rule in verb_mint_registration_token) are what actually enforce every
+permission decision below. Concretely:
+
+  * `register <user> [--tier host|root]` asks aigw-unlockd to mint a
+    one-time, 5-minute registration token and prints a URL for the *target
+    user* (not necessarily the caller) to open in a browser to complete
+    navigator.credentials.create(). This tool cannot complete a
+    registration by itself -- WebAuthn credential creation is a browser API
+    call that requires the target user's own authenticator, and
+    deliberately so: it means this CLI is only ever the "who is allowed to
+    authorize a new passkey of this tier" gate, never a "who has this
+    passkey" gate. That is decided by whoever holds the authenticator.
+  * `list` / `revoke` / `status` / `lock` all just relay to aigw-unlockd,
+    which owns /etc/aigw/passkeys/<user>.json (root:root 0600) and the
+    in-memory unlock-window state; this file touches neither directly, so
+    there is exactly one writer for that credential store (see
+    aigw-unlockd's own docstring for why that matters).
+
+WHY THIS IS NO LONGER ROOT-ONLY (two-tier credentials, 2026-08-30)
+--------------------------------------------------------------------
+Before this change the whole tool refused to run as anyone but root, because
+only root could ever be authorized for anything it did (only root could
+enrol the one and only kind of credential, and only root/self could touch
+someone else's window state -- but the CLI never bothered distinguishing
+"self" since it never ran as non-root at all). The two-tier model changes
+who is allowed to do what:
+
+  * `register --tier root` is UNCHANGED from the original rule ("only root
+    may authorize a root-tier passkey") -- still root-only, full stop,
+    checked here for a fast/friendly refusal AND independently by
+    aigw-unlockd's verb_mint_registration_token (SO_PEERCRED uid must be 0)
+    so a bug in this file's own check alone can never grant it.
+  * `register --tier host` (the new default) may be run by an ordinary user
+    FOR THEMSELVES, from a local session (in practice: SSH in, then run
+    `aigw-passkey register <yourself>`). The proof this is really them,
+    not a hijacked web
+    session, is the same SO_PEERCRED uid check aigw-unlockd already uses
+    everywhere else: a stolen aigw Cookie can drive that user's
+    aigw-backend over the web, but it cannot make a Unix socket's peer uid
+    be anything other than the uid of the process that actually opened it.
+    Root may also mint a host-tier token for someone else, same as always.
+  * `list` / `revoke` / `status` / `lock` may now be run by an ordinary
+    user against THEIR OWN username -- this was already true of
+    aigw-unlockd's status/touch/lock verbs (_require_peer_is_user_or_root
+    accepts self-or-root, not just root), it just had no way to be
+    exercised while this file refused to run as non-root at all.
+
+Every check in this file is client-side friendliness ONLY -- a clearer error
+message than a bare "permission denied" from the socket -- never the actual
+security boundary. aigw-unlockd enforces every one of these rules again,
+independently, via SO_PEERCRED (see that program's own docstring's "SOCKET
+PERMISSIONS ARE NOT THE SECURITY BOUNDARY HERE"), so a bug or an outright
+bypass of this file (a hand-rolled client speaking the same wire protocol
+straight to the socket) gets exactly the same denials this file would have
+given, not fewer.
+
+Never touches, prompts for, or requires the target user's Unix password --
+there is no code path in this file that could, since it only ever sends
+{verb, user, ...} JSON to aigw-unlockd.
+
+FILE MODE (not applied by this file -- an operator must set it)
+-------------------------------------------------------------------------
+This file must be deployed 0755 (world-executable), not 0700 -- non-root
+users now have legitimate uses for it (register --tier host for themselves,
+list/status/lock/revoke on their own username) and 0700 would make every
+one of those an EPERM before this script's own Python even starts. This
+file does not chmod itself; whoever installs it should
+`chmod 0755 aigw-passkey`.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import socket
+import sys
+import time
+
+SOCK_PATH = "/run/aigw-unlockd.sock"
+WEBAUTHN_CONFIG_PATH = "/etc/aigw/webauthn.json"
+
+# The actual browser-facing registration endpoint (serving the page that
+# calls navigator.credentials.create() and relays begin-registration /
+# finish-registration to aigw-unlockd via aigw-backend) is aigw-gateway's
+# job, not this CLI's. This path is provisional; whoever wires up that
+# endpoint should update it here to match, or better, make aigw-unlockd's
+# mint-registration-token response carry the full URL so there is exactly
+# one place this is spelled out.
+#
+# origin comes from the same /etc/aigw/webauthn.json aigw-unlockd itself
+# reads (deployment-specific domain, see that daemon's own comment) -- read
+# lazily, only by the "register" subcommand below, so every other
+# subcommand (status/list/revoke/lock) keeps working even before this file
+# exists.
+def _register_url_base():
+    try:
+        with open(WEBAUTHN_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        origin = cfg["origin"]
+    except (OSError, json.JSONDecodeError, KeyError) as e:
+        print(f"aigw-passkey: {WEBAUTHN_CONFIG_PATH}: {e} (expected JSON with an 'origin' key)",
+              file=sys.stderr)
+        sys.exit(1)
+    return f"{origin}/agents/passkey/register"
+
+
+def _is_root():
+    return os.geteuid() == 0
+
+
+def _self_username():
+    """The caller's own Unix username, for the self-vs-root checks below.
+    getpass.getuser() (not pwd.getpwuid(os.getuid())) to match exactly what
+    every other self-identifying piece of this system already uses
+    (aigw-backend's _unlockd_call, aigw-mint-session-cookie's SUDO_USER
+    fallback) -- see aigw-unlockd's own _peer_sudo_user comment for that
+    precedent."""
+    return getpass.getuser()
+
+
+def _check_target_user(target_user, action):
+    """Client-side mirror of aigw-unlockd's _require_peer_is_user_or_root
+    ("non-root may operate on themselves only") for
+    `list` / `status` -- a friendlier, immediate error than a bare
+    "permission denied" from the socket after a round trip, NOT the actual
+    security boundary (aigw-unlockd enforces the identical rule itself via
+    SO_PEERCRED, see this file's own module docstring). Root may target
+    anyone, or `None` (meaning "every user", for list/status without an
+    argument). A non-root caller with no target defaults to themselves --
+    trying "list everyone" as a non-root user and having aigw-unlockd deny
+    it would be a worse experience than just doing the one thing they are
+    actually allowed to do. Returns the user to actually query."""
+    if _is_root():
+        return target_user
+    self_user = _self_username()
+    if target_user is None:
+        return self_user
+    if target_user != self_user:
+        print(
+            f"aigw-passkey: non-root may only {action} their own account ({self_user}), not {target_user!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return target_user
+
+
+def _require_target_is_self_or_root(target_user, action):
+    """Same rule as _check_target_user, for `revoke`/`lock` where the
+    target user is a required argument (there is no "default to self" case
+    to fall back to -- the user always named someone)."""
+    if _is_root():
+        return
+    self_user = _self_username()
+    if target_user != self_user:
+        print(
+            f"aigw-passkey: non-root may only {action} their own account ({self_user}), not {target_user!r}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _call(req):
+    """Send one newline-delimited JSON request to aigw-unlockd and return
+    its parsed JSON response. Any transport failure is fatal for the CLI
+    (fail closed -- there is no meaningful fallback if the trust anchor
+    itself is unreachable)."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(SOCK_PATH)
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            f = s.makefile("rb")
+            line = f.readline()
+    except FileNotFoundError:
+        print(
+            f"aigw-passkey: {SOCK_PATH} does not exist -- is aigw-unlockd installed and enabled?"
+            " (systemctl status aigw-unlockd)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        print(
+            f"aigw-passkey: cannot reach aigw-unlockd ({e}) -- is it running?"
+            " (systemctl status aigw-unlockd)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not line:
+        print("aigw-passkey: aigw-unlockd closed the connection without answering", file=sys.stderr)
+        sys.exit(1)
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        print("aigw-passkey: aigw-unlockd sent a malformed response", file=sys.stderr)
+        sys.exit(1)
+
+
+def _fail(resp, fallback):
+    print(f"aigw-passkey: {resp.get('error', fallback)}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_register(args):
+    # Client-side mirror of aigw-unlockd's verb_mint_registration_token
+    # rule -- see this file's module docstring for why
+    # this check alone is not the security boundary. root may register any
+    # tier for anyone; non-root may only register a HOST-tier credential,
+    # and only for themselves.
+    if not _is_root():
+        self_user = _self_username()
+        if args.user != self_user:
+            print(
+                f"aigw-passkey: non-root may only register a passkey for themselves ({self_user}), "
+                f"not {args.user!r}. Ask root to run this for you, or SSH in as {args.user!r} yourself.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if args.tier != "host":
+            print(
+                f"aigw-passkey: non-root may only register a 'host'-tier passkey for themselves; "
+                f"'root' tier requires root (sudo aigw-passkey register {args.user} --tier root).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    resp = _call({"verb": "mint-registration-token", "user": args.user, "tier": args.tier})
+    if not resp.get("ok"):
+        _fail(resp, "could not mint a registration token")
+    token = resp["token"]
+    url = f"{_register_url_base()}?user={args.user}&token={token}"
+    print(f"One-time {args.tier}-tier registration token minted for '{args.user}' (valid 5 minutes, single use).")
+    print(f"Have {args.user} open this URL in a browser to register a passkey:")
+    print(url)
+
+
+def cmd_list(args):
+    user = _check_target_user(args.user, "list")
+    resp = _call({"verb": "list-credentials", "user": user})
+    if not resp.get("ok"):
+        _fail(resp, "could not list credentials")
+    creds = resp["credentials"]
+    if not creds:
+        print("(no users with registered credentials)" if user is None else f"{user}: (no credentials)")
+        return
+    for u, entries in sorted(creds.items()):
+        if not entries:
+            print(f"{u}: (no credentials)")
+            continue
+        print(f"{u}:")
+        for c in entries:
+            # "synced" flags a backup-eligible credential (BE, see
+            # aigw-unlockd's own comment where this is recorded). Worth
+            # showing because on 2026-08-30 every credential that enrolled
+            # fine here and then failed every unlock -- the authenticator
+            # returning user-verification clear no matter what -- was one.
+            # It is a hint for a human, not a verdict: a phone passkey used
+            # over the cross-device flow is synced too and works correctly.
+            be = c.get("backup_eligible")
+            kind = "?" if be is None else ("synced" if be else "device-bound")
+            # tier (shown alongside the existing device-bound/synced
+            # indicator) comes back from aigw-unlockd already resolved through
+            # _credential_tier()'s fail-safe default, so what is printed
+            # here is exactly what this credential is actually treated as
+            # -- never the raw, possibly-absent stored field.
+            # transports: what the authenticator reported at enrolment, and
+            # what aigw-unlockd puts back on excludeCredentials so Android
+            # Chrome prompts locally instead of waiting on the cross-device
+            # channel (aigw-unlockd's _annotate_transports). "?" means the
+            # credential predates recording them (it is then excluded as
+            # "internal" -- see LEGACY_EXCLUDE_TRANSPORTS); "none" means the
+            # browser reported nothing, which is itself worth seeing when a
+            # registration on that device hangs.
+            tr = c.get("transports")
+            transports = "?" if tr is None else (",".join(tr) if tr else "none")
+            print(
+                f"  {c['id']}  tier={c.get('tier', 'host')}  created={c.get('created_at', '?')}"
+                f"  sign_count={c.get('sign_count', 0)}  {kind}"
+                f"  aaguid={c.get('aaguid', '?')}  transports={transports}"
+            )
+
+
+def cmd_revoke(args):
+    _require_target_is_self_or_root(args.user, "revoke a credential for")
+    resp = _call({"verb": "revoke-credential", "user": args.user, "credential_id": args.credential_id})
+    if not resp.get("ok"):
+        _fail(resp, "could not revoke credential")
+    print(f"Revoked credential {args.credential_id} for {args.user} (any open unlock window was also closed).")
+
+
+def _format_status_line(user, resp):
+    if not resp.get("ok"):
+        return f"{user}: error: {resp.get('error', 'unknown error')}"
+    if not resp.get("unlocked"):
+        return f"{user}: locked"
+    remaining = int(resp["expires_at"] - time.time())
+    # tier: which kind of window is open, not just
+    # that one is -- "unlocked" alone would not tell an operator whether a
+    # given user could currently reach root or only host.
+    tier = resp.get("tier") or "?"
+    return f"{user}: unlocked (tier={tier}), {max(remaining, 0)}s remaining (expires at epoch {resp['expires_at']})"
+
+
+def cmd_status(args):
+    user = _check_target_user(args.user, "check the status of")
+    if user:
+        resp = _call({"verb": "status", "user": user})
+        print(_format_status_line(user, resp))
+        return
+    # user is None only when args.user was already None AND the caller is
+    # root (_check_target_user defaults a non-root caller to themselves) --
+    # i.e. "status for every enrolled user", which needs the same root-only
+    # listing verb_list_credentials uses for "every user".
+    listing = _call({"verb": "list-credentials"})
+    if not listing.get("ok"):
+        _fail(listing, "could not list users")
+    users = sorted(listing["credentials"])
+    if not users:
+        print("(no users with registered credentials)")
+        return
+    for u in users:
+        resp = _call({"verb": "status", "user": u})
+        print(_format_status_line(u, resp))
+
+
+def cmd_lock(args):
+    _require_target_is_self_or_root(args.user, "lock")
+    resp = _call({"verb": "lock", "user": args.user})
+    if not resp.get("ok"):
+        _fail(resp, "could not lock")
+    print(f"{args.user}: locked.")
+
+
+def main():
+    # No blanket _require_root() any more: who may run
+    # which subcommand, and against which target user, is now decided
+    # per-subcommand above (cmd_register's tier-aware check;
+    # _check_target_user / _require_target_is_self_or_root for the rest),
+    # matching aigw-unlockd's own SO_PEERCRED rules -- see this file's
+    # module docstring's "WHY THIS IS NO LONGER ROOT-ONLY" section.
+    parser = argparse.ArgumentParser(
+        prog="aigw-passkey",
+        description=(
+            "Manage aigw host/root-shell passkeys. Root may act on anyone; "
+            "everyone else may only register a host-tier passkey for "
+            "themselves and manage their own credentials/unlock window. "
+            "See aigw-unlockd's own module docstring for the full design."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("register", help="mint a one-time, 5-minute registration token and print the URL to open")
+    p.add_argument("user")
+    p.add_argument(
+        "--tier", choices=("host", "root"), default="host",
+        help="credential tier to register (default: host). "
+             "'root' requires root; non-root may only pick 'host', and only for themselves.",
+    )
+    p.set_defaults(func=cmd_register)
+
+    p = sub.add_parser("list", help="list stored credentials (default: your own, if not root)")
+    p.add_argument("user", nargs="?", default=None)
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("revoke", help="revoke one stored credential (your own, unless root)")
+    p.add_argument("user")
+    p.add_argument("credential_id")
+    p.set_defaults(func=cmd_revoke)
+
+    p = sub.add_parser(
+        "status", help="show whether the unlock window is open, and for how long (default: your own, if not root)"
+    )
+    p.add_argument("user", nargs="?", default=None)
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("lock", help="close the unlock window now (your own, unless root)")
+    p.add_argument("user")
+    p.set_defaults(func=cmd_lock)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

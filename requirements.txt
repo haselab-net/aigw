@@ -1,0 +1,13 @@
+# Install into the exact venv path aigw-gateway/aigw-backend's shebang
+# expects (see README.md "導入時に必要な設定"):
+#   python3 -m venv /opt/aigw/venv
+#   /opt/aigw/venv/bin/pip install -r requirements.txt
+
+# Required -- aigw-gateway's Google OAuth login flow imports these directly
+# (no fallback if missing).
+google-auth-oauthlib
+google-auth
+
+# Optional -- aigw-backend imports this lazily inside a try/except and just
+# skips sending Web Push notifications if it isn't installed.
+pywebpush

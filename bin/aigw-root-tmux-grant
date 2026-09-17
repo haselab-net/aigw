@@ -1,0 +1,139 @@
+#!/bin/bash
+# aigw-root-tmux-grant <user> [--revoke] -- ExecStartPost/ExecStopPost for
+# aigw-root-tmux@<user>.service.
+#
+# Hands exactly one named Unix user access to the root tmux server that unit
+# just started, and nobody else. Two independent layers, both enforced
+# outside this script:
+#
+#   1. Filesystem. The socket lives in /run/aigw-root-tmux/<user>/, a 0700
+#      directory owned by that user, and the socket itself is chowned to them
+#      and left at 0600. Any other non-root process gets EACCES from the
+#      kernel before it can even reach the socket.
+#   2. tmux itself. `server-access -aw <user>` is tmux's own (3.3+)
+#      access-control list for exactly this situation -- a server shared with
+#      another uid. Without it, tmux's server refuses a client whose uid is
+#      not the server's own with "access not allowed", verified on this host.
+#      With it, only the listed user is accepted; a different uid that
+#      somehow reached the socket still gets refused.
+#
+# So a stray request from some other user's process is rejected twice over,
+# and never by this script's own logic.
+#
+# Read-only ACL bridge to /root/.claude/projects (added 2026-08-29): a
+# `claude` process run by hand inside a root-shell pane runs as literal
+# root, so its own conversation logs land in /root/.claude/projects/<key>/
+# -- not the mounted sandhome aigw-backend (running as $user) can already
+# see. Without this, aigw-backend's transcript tailer (_watch_shell_claude
+# in aigw-backend) can never read those files, so a root-shell session's
+# replies never reach the aigw phone chat log at all (the raw tmux screen
+# mirror still worked -- only the chat-log view was silently empty; see
+# the deployment notes). This grants no new privilege: a
+# user enabled for aigw-root-tmux@<user>.service already has unrestricted
+# root the moment they open a root-shell pane (the deployment notes' accepted
+# tradeoff), so letting their own backend process *read* root's home
+# directory on their behalf exposes nothing that user's own root pane
+# couldn't already `cat` for itself. Deliberately still not a sudo
+# wrapper: `setfacl` here takes no user-supplied argument, and grants a
+# fixed, narrow, always-read-only path -- see the rejected-sudo-wrapper
+# note in /etc/sudoers.d/aigw for why an open command channel was ruled
+# out. `-x`/`--revoke` mirrors this off on ExecStopPost, so disabling the
+# unit closes the bridge the same one command already closes every root
+# pane with (the deployment notes).
+set -euo pipefail
+
+user="${1:?usage: aigw-root-tmux-grant <user> [--revoke]}"
+revoke=0
+if [ "${2:-}" = "--revoke" ]; then
+  revoke=1
+fi
+sock="/run/aigw-root-tmux/$user/sock"
+
+getent passwd "$user" >/dev/null || { echo "no such user: $user" >&2; exit 1; }
+
+if [ "$revoke" = 1 ]; then
+  if systemctl is-active --quiet "aigw-root-tmux@$user.service"; then
+    # Server still running (2026-08-31, "sever access, don't kill the
+    # server" -- the deployment notes: closing a window
+    # no longer stops this unit). Do NOT unlink the socket in this case: an
+    # AF_UNIX socket, once unlink()ed, can never be reconnected to by a new
+    # client even while the server process that bound it keeps running --
+    # unlike a file's permission bits, there is no "undo" for that short of
+    # actually restarting the server, which is exactly what this branch is
+    # trying to avoid. Lock it back down to root-owned 0600 instead (the
+    # same state ExecStart's own tmux process would leave a freshly bound
+    # socket in before this script's grant half ever touches it) and pull
+    # $user off tmux's own server-access list -- both of this script's two
+    # independent layers, still enforced, without destroying the special
+    # file a later re-grant needs to find still there. (Caught 2026-08-31:
+    # the original unconditional `rm -f` here made every re-grant to an
+    # already-running server fail with "tmux socket never appeared" --
+    # `_grant_access`'s own wait loop was waiting for something that could
+    # only ever have been recreated by a NEW server's ExecStart, which
+    # never came.)
+    if [ -S "$sock" ]; then
+      chown root:root "$sock"
+      chmod 600 "$sock"
+    fi
+    tmux -S "$sock" server-access -d "$user" 2>/dev/null || true
+  else
+    # Server is actually gone (a real `systemctl stop` -- e.g.
+    # verb_revoke_credential's "no legitimate way back in, tear it down").
+    # The socket file does NOT go away on its own in this case: this used to
+    # say it did ("ExecStart itself owned it, and systemd has already
+    # reaped that process"), but that was wrong and was caught on
+    # 2026-08-30: with the unit `inactive` and no server running,
+    # /run/aigw-root-tmux/<user>/sock was still sitting there, still 0600
+    # <user>, left behind by the tmux process systemd had SIGTERMed. tmux
+    # only unlinks its socket on its own orderly shutdown paths.
+    #
+    # That matters because root_shell_allowed() in aigw-backend is literally
+    # os.access(sock, R_OK|W_OK) -- a stale file answers "yes" exactly like a
+    # live one. The documented contract for that check is "if it says yes, the
+    # button will work" (the deployment notes), which a leftover socket quietly
+    # breaks: the UI offers root-shell and every use of it fails with
+    # ECONNREFUSED instead. Safe to unlink here specifically because no
+    # server is left listening on it to be cut off from -- the very next
+    # thing to bind this path is a brand new ExecStart, which needs the old
+    # file gone to bind cleanly anyway.
+    rm -f "$sock"
+  fi
+  for d in /root /root/.claude; do
+    [ -d "$d" ] && setfacl -x "u:$user" "$d" 2>/dev/null || true
+  done
+  if [ -d /root/.claude/projects ]; then
+    setfacl -R -x "u:$user" /root/.claude/projects 2>/dev/null || true
+    setfacl -R -d -x "u:$user" /root/.claude/projects 2>/dev/null || true
+  fi
+  exit 0
+fi
+
+# Type=simple means systemd runs us as soon as the tmux process is forked,
+# which can be before it has finished creating its socket.
+for _ in $(seq 1 50); do
+  [ -S "$sock" ] && break
+  sleep 0.1
+done
+[ -S "$sock" ] || { echo "tmux socket never appeared: $sock" >&2; exit 1; }
+
+chown "$user" "$sock"
+chmod 600 "$sock"
+# "user already added" (re-running this against an already-granted server,
+# e.g. by hand) exits 1 too, indistinguishable here from a real failure --
+# but idempotent re-granting is exactly what every line below this one also
+# needs to be, so don't let tmux's own success/already-done distinction
+# abort those.
+tmux -S "$sock" server-access -aw "$user" || true
+
+# --x only (no read): lets $user's own aigw-backend traverse into a known
+# child path without being able to list /root or /root/.claude themselves.
+install -d -m 0700 -o root -g root /root/.claude/projects
+setfacl -m "u:$user:--x" /root
+setfacl -m "u:$user:--x" /root/.claude
+# rX = read, plus execute *only* where already a directory (so files stay
+# non-executable) -- recursive over what's there now, and -d (default ACL,
+# also recursive) so every conversation log or new project directory
+# `claude` creates under here from now on inherits the same grant without
+# this script having to run again.
+setfacl -R -m "u:$user:rX" /root/.claude/projects
+setfacl -R -d -m "u:$user:rX" /root/.claude/projects

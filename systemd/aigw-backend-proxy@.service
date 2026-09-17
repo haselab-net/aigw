@@ -1,0 +1,14 @@
+[Unit]
+Description=Start owning user's aigw-backend (if needed) and proxy this connection to it
+# Accept=yes means one of these units per connection, and systemd keeps a
+# finished instance around in memory as long as it is in a failed state --
+# hundreds had piled up in `systemctl list-units` before this was set.
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/local/sbin/aigw-proxy-handler
+# socat exits 1 when either side hangs up mid-transfer ("E write(...): Broken
+# pipe"), which for a phone that navigated away is normal, not a failure.
+# aigw-proxy-handler's own giving-up path deliberately exits 2 instead, so
+# real errors still show up as failed units.
+SuccessExitStatus=1

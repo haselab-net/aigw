@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>aigw</title>
+<link rel="manifest" href="/agents/manifest.json">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { overflow: hidden; } /* the page itself never scrolls -- only #messages/#view-list do */
+  body {
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #0b0f14; color: #e6e6e6; margin: 0;
+    display: flex; flex-direction: column;
+    /* Layered so the page always matches the ACTUAL visible area, not the
+       full-chrome viewport: 100vh is a fallback for very old browsers;
+       100dvh (dynamic viewport height) already tracks the browser's own
+       UI (URL bar collapsing, etc.) in modern browsers; --app-height is set
+       by app.js from the VisualViewport API, which is what actually tracks
+       the on-screen keyboard reliably across iOS/Android (viewport-meta's
+       interactive-widget=resizes-content above helps too, but browser
+       support for it alone is inconsistent -- this is the more robust
+       layer). Each line overrides the previous only where the browser
+       understands it, so this degrades safely on older browsers. */
+    height: 100vh;
+    height: 100dvh;
+    height: var(--app-height, 100dvh);
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.8rem 1rem; background: #131a22; flex-shrink: 0;
+  }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  .header-left { display: flex; align-items: center; gap: 0.6rem; }
+  .header-right { display: flex; align-items: center; gap: 0.7rem; }
+  /* Tappable (2026-08-28, at the user's request): logging out moved from
+     its own always-visible link to a tap-to-confirm on the username itself,
+     to free up header space -- see the click handler in app.js. */
+  header .who { font-size: 0.8rem; color: #9aa5b1; cursor: pointer; text-decoration: underline dotted; }
+  header a { color: #9aa5b1; font-size: 0.8rem; text-decoration: none; }
+  /* Native pull-to-refresh has no scroll context to trigger from -- the
+     page itself never scrolls (see the html/body rule above) -- so this is
+     the only way to reload aigw on a phone without a browser chrome bar.
+     #reload-btn lives in #chat-header (2026-08-15) since #top-header is
+     hidden while chatting anyway; #top-reload-btn (2026-08-28, at the
+     user's request) is #top-header's own copy, same look. */
+  #reload-btn, #top-reload-btn { background: none; border: none; color: #9aa5b1; font-size: 1.1rem; padding: 0.2rem 0.4rem; cursor: pointer; }
+  #machine-select {
+    background: #131a22; color: #9aa5b1; border: 1px solid #2a3542; border-radius: 6px;
+    font-size: 0.75rem; padding: 0.15rem 0.3rem;
+  }
+
+  #view-list { padding: 1rem; overflow-y: auto; flex: 1; min-height: 0; }
+  .session-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.8rem 1rem; background: #131a22; border-radius: 10px; margin-bottom: 0.6rem;
+  }
+  .session-row .label { font-weight: 600; }
+  .session-row .meta { font-size: 0.75rem; color: #9aa5b1; }
+  .session-row .delete-btn, .session-row .edit-btn, .session-row .archive-btn {
+    background: none; border: none; color: #9aa5b1; font-size: 1.1rem;
+    padding: 0.4rem 0.6rem; flex-shrink: 0;
+  }
+  /* Bottom-of-list toggle for the archived sessions
+     it reveals -- same look as #new-session-bar's controls, not a
+     .session-row, so it never gets mistaken for a session itself. */
+  #archive-toggle-btn {
+    display: block; width: 100%; margin-top: 0.2rem; padding: 0.6rem;
+    border-radius: 8px; border: 1px solid #2a3542; background: #1c2531;
+    color: #9aa5b1; font-size: 0.85rem;
+  }
+  #archived-list { margin-top: 0.6rem; }
+  #archived-list .session-row { opacity: 0.75; }
+  /* touch-action: none stops the browser from treating a drag on the handle
+     as a page scroll -- without it, pointermove on a touchscreen never
+     fires past the initial pointerdown. */
+  .session-row .drag-handle {
+    cursor: grab; color: #9aa5b1; margin-right: 0.3rem; touch-action: none;
+    display: inline-block; user-select: none;
+  }
+  .session-row.dragging {
+    position: relative; z-index: 5; opacity: 0.85;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 0.4rem; }
+  .dot.alive { background: #34a853; }
+  .dot.stopped { background: #666; }
+
+  #new-session-bar { display: flex; flex-direction: column; gap: 0.5rem; padding: 0.8rem 1rem; background: #131a22; }
+  .nsb-row { display: flex; gap: 0.5rem; align-items: center; }
+  #new-session-bar select, #new-session-bar input, #new-session-bar button {
+    padding: 0.6rem; border-radius: 8px; border: 1px solid #2a3542; background: #1c2531; color: #e6e6e6;
+  }
+  #new-session-bar input { flex: 1; min-width: 0; }
+  #new-session-bar button { background: #4285F4; border: none; font-weight: 600; }
+  #new-session-bar button:disabled { opacity: 0.5; }
+  /* Working directory / resume pickers -- claude preset only, see app.js's
+     applyPresetOptions(). Everything here must be free to shrink
+     (min-width: 0), or a deep path or a long conversation title widens the
+     whole row past the screen. #ssh-cwd-opts is the same
+     idea for a drives-capable ssh machine's Claude preset (winbox-a/
+     winbox-b), so it shares every rule below with #claude-opts -- only the
+     markup inside differs (no resume row: see app.js). */
+  #claude-opts, #ssh-cwd-opts { display: none; flex-direction: column; gap: 0.5rem; }
+  #claude-opts.visible, #ssh-cwd-opts.visible { display: flex; }
+  #claude-opts select, #ssh-cwd-opts select { flex: 1; min-width: 0; font-size: 0.85rem; }
+  #claude-opts .nsb-icon, #ssh-cwd-opts .nsb-icon { color: #9aa5b1; font-size: 0.85rem; flex-shrink: 0; }
+  /* The breadcrumb keeps its *end* visible (direction: rtl flips which side
+     the ellipsis lands on): with sandhome/a/b/c/d (or D:/a/b/c/d) the deepest
+     component is the one that identifies where you are. */
+  #cwd-crumb, #ssh-cwd-crumb {
+    flex: 1; min-width: 0; font-size: 0.85rem; font-family: ui-monospace, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
+  }
+  #cwd-up, #ssh-cwd-up {
+    flex-shrink: 0; padding: 0.35rem 0.7rem; border-radius: 8px; border: 1px solid #2a3542;
+    background: #1c2531; color: #e6e6e6;
+  }
+  #cwd-up:disabled, #ssh-cwd-up:disabled { opacity: 0.35; }
+
+  #view-chat { display: none; flex-direction: column; flex: 1; min-height: 0; }
+  #chat-header { display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1rem; background: #131a22; }
+  #chat-header button.back { background: none; border: none; color: #9aa5b1; font-size: 1.2rem; }
+  /* A bit bigger than the visible 8px dot so a long-press has a realistic
+     target to land on (2026-08-16, replacing the old dedicated 停止
+     button -- see the long-press handler in app.js). */
+  #chat-header .dot { padding: 0.5rem; margin: -0.5rem 0 -0.5rem -0.1rem; }
+  /* margin-left: auto here is what pushes the screen/share/reload cluster
+     to the right edge, regardless of how much sits before it (back button
+     + dot + label). 🤖 and 💾 used to live here too, but as the header grew
+     to 5+ icons they were relocated (2026-08-28, at the user's request):
+     🤖 now floats over #screen-pane (only meaningful once a pane is open,
+     see #screen-wrap below) and 💾 moved inside #share-pane (see
+     .share-save below). */
+  /* .active/.shared are backgrounds, not text `color`, on every emoji icon
+     button below (screen/share/agents) -- a color-presentation emoji glyph
+     (🖥️/👥/🤖) is drawn from its own fixed-color bitmap/vector art and
+     ignores CSS `color` entirely, so the highlight has to come from
+     something else. Confirmed 2026-08-28 after the user reported the
+     share-btn "always looks purple" no matter what -- that was just 👥's
+     own native color showing through a `color:` rule that was never having
+     any effect. border-radius here (rather than only on the modifier
+     classes) keeps the button's own hit-box shape stable whether or not a
+     background is currently showing. */
+  #chat-header button.screen-btn { margin-left: auto; background: none; border: none; color: #9aa5b1; font-size: 1.1rem; padding: 0.2rem 0.4rem; border-radius: 6px; }
+  #chat-header button.screen-btn.active { background: rgba(66,133,244,0.28); }
+  #chat-header button.share-btn { background: none; border: none; color: #9aa5b1; font-size: 1.1rem; padding: 0.2rem 0.4rem; border-radius: 6px; }
+  /* .shared = "this session is currently shared with someone", independent
+     of whether the panel is open right now (2026-08-28, at the user's
+     request, to tell the two states apart at a glance). .active (panel
+     open) is listed after so it still wins when both classes are present. */
+  #chat-header button.share-btn.shared { background: rgba(52,168,83,0.28); }
+  #chat-header button.share-btn.active { background: rgba(66,133,244,0.28); }
+  #chat-header .owner-badge { color: #9aa5b1; font-size: 0.75rem; }
+  /* Wraps #screen-pane purely so the floating 🤖 button below has something
+     to anchor to with position:absolute -- #screen-pane's own content is
+     replaced wholesale via .textContent in applyScreen(), so the button
+     cannot be a child of #screen-pane itself (it would get wiped). Visibility
+     lives here now instead of on #screen-pane directly. */
+  #screen-wrap { display: none; position: relative; flex-shrink: 0; }
+  #screen-wrap.visible { display: block; }
+  /* The live pane. Scrolls on its own axis in both directions so a wide TUI
+     never widens the page, and is capped so the chat stays visible under it. */
+  #screen-pane {
+    margin: 0; padding: 0.6rem 0.8rem; background: #0b0f14; color: #d7dde5;
+    font-family: ui-monospace, monospace; font-size: 0.7rem; line-height: 1.25;
+    white-space: pre; overflow: auto; max-height: 45vh;
+    border-bottom: 1px solid #2a3542;
+  }
+  /* Floats over the pane's top-right corner rather than sitting in
+     #chat-header (2026-08-28, at the user's request, to declutter the
+     header) -- only reachable while the screen pane itself is open, since
+     it's now physically anchored to it (see setScreenVisible in app.js,
+     which also force-closes the agents pane when the screen pane closes). */
+  #screen-wrap button.agents-btn {
+    position: absolute; top: 0.5rem; right: 0.6rem; background: rgba(19,26,34,0.85);
+    border: 1px solid #2a3542; border-radius: 8px; color: #9aa5b1; font-size: 1.1rem;
+    padding: 0.2rem 0.4rem;
+  }
+  /* Background, not `color` -- see the comment above #chat-header
+     button.screen-btn for why (🤖 is a color-presentation emoji too). */
+  #screen-wrap button.agents-btn.active { background: rgba(66,133,244,0.45); }
+  /* Shown only while the panel is displaying a one-shot history fetch
+     instead of the live tail (2026-09-01, see
+     screenAtLive in app.js). Not just a status indicator: it is the
+     *guaranteed* way back to live, because the gesture that got here
+     (dragging/scrolling up past the live tail) has no dual in the other
+     direction once the live tail no longer overflows the panel -- see that
+     same design note for why a plain "scroll back down" cannot be relied
+     on to return here on its own. Opposite corner from agents-btn so
+     opening 🤖 (which force-shows over this same pane) never covers it. */
+  #screen-wrap button.live-btn {
+    display: none; position: absolute; top: 0.5rem; left: 0.6rem;
+    background: rgba(217,119,6,0.85); border: 1px solid #b45309; border-radius: 8px;
+    color: #fff7ed; font-size: 0.75rem; padding: 0.25rem 0.55rem;
+  }
+  #screen-wrap button.live-btn.visible { display: block; }
+  /* Claude Code's own Task-tool subagent logs (see list_subagents/
+     get_subagent_log in aigw-backend) -- a list of subagents the session's
+     current conversation has spawned, tap one to read its own transcript.
+     Same "own scrolling region, capped height" shape as #screen-pane. */
+  #agents-pane {
+    display: none; padding: 0.4rem 0; background: #0b0f14; color: #d7dde5;
+    overflow: auto; max-height: 45vh; flex-shrink: 0; border-bottom: 1px solid #2a3542;
+  }
+  #agents-pane.visible { display: block; }
+  #agents-pane .agents-empty { padding: 0.6rem 0.8rem; color: #9aa5b1; font-size: 0.85rem; }
+  #agents-pane .agent-row {
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    color: #d7dde5; padding: 0.5rem 0.8rem; font-size: 0.85rem; border-bottom: 1px solid #1c2531;
+  }
+  #agents-pane .agent-row .agent-type { color: #8ab4f8; font-size: 0.75rem; margin-right: 0.4rem; }
+  #agents-pane .agent-detail-header {
+    display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.8rem;
+    color: #9aa5b1; font-size: 0.8rem; border-bottom: 1px solid #1c2531;
+  }
+  #agents-pane .agent-detail-header button {
+    background: none; border: none; color: #8ab4f8; font-size: 0.85rem; padding: 0;
+  }
+  #agents-pane .agent-detail-body {
+    padding: 0.6rem 0.8rem; font-family: ui-monospace, monospace; font-size: 0.7rem;
+    line-height: 1.3; white-space: pre-wrap; word-break: break-word;
+  }
+  /* Owner-only sharing panel. Same "own scrolling region"
+     shape as #screen-pane/#agents-pane. */
+  #share-pane {
+    display: none; padding: 0.7rem 0.8rem; background: #0b0f14; color: #d7dde5;
+    overflow: auto; max-height: 45vh; flex-shrink: 0; border-bottom: 1px solid #2a3542;
+    font-size: 0.85rem;
+  }
+  #share-pane.visible { display: block; }
+  /* 💾 relocated here from #chat-header (2026-08-28, at the user's request).
+     Shown to owner and shared viewer alike (download is not an owner-only
+     operation) -- unlike the sharing controls below it, which
+     stay owner-only. */
+  #share-pane .share-save { margin-bottom: 0.6rem; padding-bottom: 0.6rem; border-bottom: 1px solid #1c2531; }
+  #share-pane .share-save button {
+    padding: 0.4rem 0.8rem; border-radius: 8px; border: 1px solid #2a3542;
+    background: #1c2531; color: #e6e6e6;
+  }
+  #share-pane .share-warn { color: #f2c078; font-size: 0.8rem; margin-bottom: 0.5rem; }
+  #share-pane .share-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.3rem 0; border-bottom: 1px solid #1c2531;
+  }
+  #share-pane .share-row button {
+    background: none; border: none; color: #f28b82; font-size: 0.8rem;
+  }
+  #share-pane .share-add { display: flex; gap: 0.4rem; margin-top: 0.6rem; }
+  #share-pane .share-add input {
+    flex: 1; padding: 0.4rem 0.6rem; border-radius: 6px; border: 1px solid #2a3542;
+    background: #131a22; color: #e6e6e6;
+  }
+  #share-pane .share-add button {
+    padding: 0.4rem 0.8rem; border-radius: 6px; border: none; background: #4285F4; color: white;
+  }
+  #share-pane .share-empty { color: #9aa5b1; }
+  #messages { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: 0.6rem; }
+  /* Always the first child of #messages (see connectSessionEvents/
+     loadOlderHistory in app.js) -- empty and collapsed to nothing until
+     there's something to say ("読み込み中…" / "ここが会話の最初です"). */
+  .history-top { display: none; text-align: center; color: #9aa5b1; font-size: 0.75rem; padding: 0.3rem 0; }
+  /* See the comment on #unlock-notice itself for what this is. Amber, not
+     the header badge's plain text, because this one needs to be *noticed*,
+     not merely available on request. */
+  /* :not([hidden]), not a bare #unlock-notice rule: an ID selector's
+     specificity would otherwise beat the UA stylesheet's [hidden]{display:
+     none} and defeat `unlockNoticeEl.hidden = true` in app.js entirely. */
+  #unlock-notice:not([hidden]) {
+    display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+    background: #3a2e15; color: #f2c14e; font-size: 0.8rem;
+    padding: 0.5rem 1rem;
+  }
+  #unlock-notice button {
+    padding: 0.3rem 0.7rem; border-radius: 6px; border: none;
+    background: #f2c14e; color: #1c1608; font-size: 0.8rem; flex-shrink: 0;
+  }
+  .bubble { max-width: 92%; padding: 0.6rem 0.9rem; border-radius: 12px; white-space: pre-wrap; word-break: break-word; }
+  .bubble.user { align-self: flex-end; background: #4285F4; color: white; }
+  /* Sent with 送信: the characters are in the pane but no Enter followed. */
+  .bubble.user .nosubmit { margin-left: 0.5rem; font-size: 0.7rem; opacity: 0.75; white-space: nowrap; }
+  .bubble.user .from { font-weight: 700; opacity: 0.85; }
+  .bubble.agent { align-self: flex-start; background: #1c2531; font-family: ui-monospace, monospace; font-size: 0.85rem; }
+  .bubble.system { align-self: center; background: none; color: #9aa5b1; font-size: 0.75rem; }
+  /* Links inside agent output (see setTextWithLinks) -- a login URL is long
+     and must wrap rather than widen the bubble past the screen. */
+  .bubble a { color: #8ab4f8; overflow-wrap: anywhere; }
+  .bubble.thinking { font-style: italic; color: #9aa5b1; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+  .bubble img { max-width: 100%; border-radius: 8px; display: block; cursor: pointer; }
+  /* A non-image outbox attachment (a 3D model, or anything else
+     outbox_attachment_kind doesn't recognize) -- see renderAttachment().
+     A tappable card rather than an inline preview, since there is nothing
+     to preview inline with. */
+  .attachment-card {
+    display: flex; align-items: center; gap: 0.5rem; background: #263140; color: #d7dde5;
+    border: none; border-radius: 8px; padding: 0.6rem 0.8rem; font-size: 0.85rem;
+    text-decoration: none; cursor: pointer; max-width: 100%;
+  }
+  .attachment-icon { font-size: 1.3rem; flex-shrink: 0; }
+  .attachment-name { overflow-wrap: anywhere; }
+  /* Still-updating tail line of an "attach"-preset session (see live_tail
+     event handling in app.js) -- a thin accent border marks it as
+     provisional, distinct from a settled, permanent bubble. */
+  .bubble.agent.live { border-left: 2px solid #4285F4; }
+
+  #tmux-sessions-section { margin-top: 1.2rem; }
+  #tmux-sessions-section h2 { font-size: 0.85rem; color: #9aa5b1; font-weight: 600; margin: 0 0 0.5rem; }
+  .tmux-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.7rem 1rem; background: #131a22; border-radius: 10px; margin-bottom: 0.6rem;
+  }
+  .tmux-row .name { font-family: ui-monospace, monospace; }
+  .tmux-row button {
+    padding: 0.4rem 0.8rem; border-radius: 8px; border: none; background: #4285F4; color: white; font-weight: 600;
+  }
+
+  /* Its own full page (view-auth), same shape as view-chat: a fixed header
+     plus a scrolling content area below it. Moved off the session list
+     (2026-08-15) once it grew to 5 rows (container/host/root/winbox-a/
+     winbox-b) and made the list page too long on a phone. */
+  #view-auth { display: none; flex-direction: column; flex: 1; min-height: 0; }
+  #auth-header { display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1rem; background: #131a22; }
+  #auth-header span { flex: 1; font-size: 0.95rem; font-weight: 600; }
+  /* One ⟳ for the whole panel (it re-reads every scope in one request), so
+     it lives in the page header rather than on any one row. */
+  #auth-header button#auth-refresh {
+    padding: 0.15rem 0.5rem; border-radius: 8px; border: 1px solid #2a3542;
+    background: #1c2531; color: #e6e6e6; font-size: 0.8rem;
+  }
+  #claude-auth-section { padding: 1rem; overflow-y: auto; flex: 1; min-height: 0; }
+  /* Stacked, not one line: at phone width a label + an email + two buttons
+     cannot share a row without wrapping into an unreadable jumble. Status on
+     top, actions right-aligned underneath, so every row has the same shape
+     whether or not it has buttons. */
+  .auth-row {
+    display: flex; flex-direction: column; gap: 0.45rem;
+    padding: 0.6rem 0.8rem; background: #131a22; border-radius: 10px;
+  }
+  .auth-row + .auth-row { margin-top: 0.5rem; }
+  .auth-line { display: flex; align-items: baseline; gap: 0.5rem; }
+  .auth-row .auth-status-text { flex: 1; font-size: 0.8rem; color: #9aa5b1; word-break: break-all; }
+  .auth-row .auth-status-text.in { color: #e6e6e6; }
+  .auth-row .auth-status-text.out { color: #fbbc04; }
+  .auth-row .auth-status-text.err { color: #ea4335; }
+  .auth-row .auth-label { flex-shrink: 0; font-size: 0.75rem; color: #6b7684; min-width: 5.5rem; }
+  .auth-actions { display: flex; gap: 0.4rem; justify-content: flex-end; }
+  .auth-row button, .auth-row a.auth-link {
+    flex-shrink: 0; padding: 0.4rem 0.8rem; border-radius: 8px; border: 1px solid #2a3542;
+    background: #1c2531; color: #e6e6e6; font-size: 0.8rem;
+  }
+  .auth-row a.auth-link { text-decoration: none; display: inline-block; }
+  .auth-row button.auth-login { background: #4285F4; border-color: #4285F4; color: white; font-weight: 600; }
+  .auth-row button:disabled { opacity: 0.5; }
+  /* Hidden unless this user has root-shell access at all (see
+     applyCapabilities() in app.js) -- same gate as the preset option. */
+  #auth-row-root { display: none; }
+  #auth-row-root.visible { display: flex; }
+  /* Same gate as #auth-row-root above, just one button instead of a whole
+     row: any user can kill their own Chrome, only root-shell users get the
+     "everyone" button too. */
+  #chrome-kill-all-btn { display: none; }
+  #chrome-kill-all-btn.visible { display: inline-block; }
+
+  #key-toolbar { display: none; flex-direction: column; background: #131a22; flex-shrink: 0; }
+  #key-toolbar.visible { display: flex; }
+  #key-toolbar button {
+    flex-shrink: 0; padding: 0.4rem 0.7rem; border-radius: 8px; border: 1px solid #2a3542;
+    background: #1c2531; color: #e6e6e6; font-family: ui-monospace, monospace; font-size: 0.85rem;
+  }
+  #key-toolbar button:active { background: #2a3542; }
+  #key-modrow { display: flex; gap: 0.4rem; padding: 0.5rem 0.7rem 0; overflow-x: auto; }
+  #key-modrow button.mod { font-family: inherit; font-weight: 600; }
+  #key-modrow button.mod.active { background: #4285F4; border-color: #4285F4; color: white; }
+  #key-grid {
+    display: none; flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 0.7rem 0;
+    max-height: 30vh; overflow-y: auto;
+  }
+  #key-grid.visible { display: flex; }
+  #key-grid button { width: 2.4rem; text-align: center; }
+  #composer { display: flex; gap: 0.5rem; padding: 0.7rem; background: #131a22; flex-shrink: 0; }
+  #composer textarea {
+    flex: 1; resize: none; border-radius: 10px; border: 1px solid #2a3542; background: #1c2531;
+    color: #e6e6e6; padding: 0.6rem; font-size: 1rem; min-height: 2.6rem; max-height: 8rem;
+    /* Grows with content up to max-height (see autoResizeTextarea in
+       app.js); overflow-y is explicit rather than relying on a browser's
+       own textarea default, since past max-height a normal internal
+       scrollbar is exactly what should take over. */
+    overflow-y: auto;
+  }
+  /* 実行 (text + Enter) is the everyday action and stays the blue primary;
+     送信 (text only, no Enter) is deliberately quieter and narrower. It is
+     hidden for headless presets, which have no pane to type into. */
+  #composer button { padding: 0 0.9rem; border-radius: 10px; border: none; background: #4285F4; color: white; font-weight: 600; }
+  #composer button#send-btn {
+    background: #1c2531; color: #e6e6e6; border: 1px solid #2a3542; font-weight: 500; padding: 0 0.7rem;
+  }
+  #composer button#send-btn.hidden { display: none; }
+</style>
+</head>
+<body>
+  <!-- Hidden while a session is open (openSession()/closeSession()) -- a
+       chat has its own #chat-header instead, and #reload-btn moves there
+       too (next to the download button) so reloading stays reachable
+       without this bar (2026-08-15, at the user's request: this bar plus
+       the chat's own header was too much stacked at the top of a phone
+       screen while chatting). -->
+  <header id="top-header">
+    <div class="header-left">
+      <h1>aigw</h1>
+      <!-- Populated in applyCapabilities() with this host's own short name
+           (e.g. "example", not a fixed "このホスト" -- ambiguous if this
+           same file is ever served from more than one host, 2026-08-17)
+           plus one option per GET /capabilities' ssh_machines.
+           Selecting a machine filters both the session list and the "接続"
+           candidate list to that machine only -- see applyMachineFilter().
+           Also how "Claude 認証" is left again once open:
+           there is no back button there any more, picking any real machine
+           here is the only way back, same as picking "Claude 認証" is the
+           only way in. -->
+      <select id="machine-select" title="操作対象のマシン"></select>
+    </div>
+    <div class="header-right">
+      <!-- Tap to log out (with a confirm dialog) instead of a separate
+           always-visible link -- see app.js. -->
+      <span class="who" id="who" title="タップでログアウト"></span>
+      <!-- Extension point (see site-extras.js): a deployment can add its
+           own extra header link(s) here (an internal docs viewer, ...).
+           Left empty if no site-extras.js is present. -->
+      <span id="site-extra-header-links"></span>
+      <button id="top-reload-btn" title="再読み込み">⟳</button>
+    </div>
+  </header>
+
+  <div id="view-list">
+    <div id="new-session-bar">
+      <!-- "Claude" is the interactive TUI preset ("claude-tui"). The headless
+           "claude" preset is deliberately absent: the TUI does everything it
+           did and also has selection menus and Remote Control. Existing
+           headless sessions keep working, they just can't be created here.
+           "host-shell" is a shell on the host itself, outside the sandbox
+           container (same host-side tmux server the "attach" preset can
+           already reach). Labelled explicitly so it is never picked by
+           accident: it is not sandboxed. A further option, "root-shell", is
+           appended at runtime by app.js's applyCapabilities() -- only for
+           users the backend reports as able to become root.
+           (A "Codewhale" option lived here until 2026-08-01.) -->
+      <div class="nsb-row">
+        <select id="preset"><option value="claude-tui">Claude</option><option value="shell">Shell (sandbox内)</option><option value="host-shell">Shell (sandbox外・ホスト)</option></select>
+        <input id="label" placeholder="名前(任意)">
+        <button id="create-btn">開始</button>
+      </div>
+      <!-- Headless-claude-only knobs (see aigw-backend's create_session):
+           which directory under ~/sandhome `claude -p` runs in, and which
+           existing Claude Code conversation in that directory to continue
+           with `--resume`. Hidden for the tmux presets, which take their
+           directory from the pane itself and have no prior conversation. -->
+      <div id="claude-opts">
+        <!-- The directory is walked one level at a time (breadcrumb + "open
+             a subfolder"), not chosen from a flattened list of the whole
+             tree: any depth is reachable, and each dropdown stays short. -->
+        <div class="nsb-row">
+          <span class="nsb-icon" title="作業ディレクトリ">📁</span>
+          <span id="cwd-crumb" title="作業ディレクトリ">sandhome</span>
+          <button id="cwd-up" title="上のフォルダへ">↑</button>
+        </div>
+        <div class="nsb-row">
+          <select id="cwd-child"><option value="">サブフォルダを開く…</option></select>
+        </div>
+        <div class="nsb-row">
+          <span class="nsb-icon" title="続きから">⏱</span>
+          <select id="resume"><option value="">新規</option></select>
+        </div>
+        <!-- claude-tui only (see aigw-backend's create_session): whether the
+             launched `claude` gets --dangerously-skip-permissions. Defaults
+             on; unchecking gets the normal confirm-in-screen-panel behavior
+             this preset had before this option existed. -->
+        <div class="nsb-row">
+          <label style="display:flex; align-items:center; gap:0.4rem; font-size:0.85rem;">
+            <input type="checkbox" id="skip-permissions" checked>
+            権限確認をスキップ(--dangerously-skip-permissions)
+          </label>
+        </div>
+      </div>
+      <!-- Drive/folder picker for a drives-capable ssh machine's Claude
+           preset -- Windows machines only, shown
+           instead of #claude-opts, which is ~/sandhome-relative and
+           meaningless on a machine sharing no filesystem with this host.
+           No resume row: Claude Code's own conversation history for these
+           lives on the remote machine's filesystem, not listable from here
+           (see aigw-backend's create_session). Same one-level-at-a-time
+           navigation as #claude-opts, just rooted at "pick a drive" instead
+           of sandhome. -->
+      <div id="ssh-cwd-opts">
+        <div class="nsb-row">
+          <span class="nsb-icon" title="作業ドライブ/フォルダ">📁</span>
+          <span id="ssh-cwd-crumb" title="作業ドライブ/フォルダ">ドライブを選択…</span>
+          <button id="ssh-cwd-up" title="上のフォルダへ">↑</button>
+        </div>
+        <div class="nsb-row">
+          <select id="ssh-cwd-child"><option value="">ドライブを選ぶ…</option></select>
+        </div>
+      </div>
+    </div>
+    <div id="sessions"></div>
+    <!-- Closed by default, opened by tapping the
+         button -- see renderArchivedSection()/archiveToggleBtn in app.js. -->
+    <button id="archive-toggle-btn" type="button">🗄 アーカイブを開く</button>
+    <div id="archived-list" hidden></div>
+    <div id="tmux-sessions-section">
+      <h2>既存のtmuxセッション</h2>
+      <div id="tmux-sessions"></div>
+    </div>
+  </div>
+
+  <div id="view-auth">
+    <!-- No back button (2026-08-15, at the user's request): #top-header
+         (with the machine selector) stays visible here, unlike on a chat
+         page, so picking any real machine there is how you leave -- see
+         applyMachineFilter(). Renamed "Claude 認証" -> "設定" (2026-08-18)
+         once it grew a second, unrelated concern (Kill Chrome) -- ids/classes
+         below still say auth-* since Claude auth is still most of the page,
+         only the visible title changed. -->
+    <div id="auth-header">
+      <span>設定</span>
+      <button id="auth-refresh" title="全部再確認">⟳</button>
+    </div>
+    <!-- Whether Claude Code is signed in, in each of the places one can be:
+         inside devbox-<user> (what the "claude"/"claude-tui"/"shell" presets
+         use), on the host as this same user (host-shell's own environment),
+         as root (root-shell's, shown only if that is granted at all), and on
+         each reachable ssh:<machine> (rows added at
+         runtime by addSshAuthRow()). Every row is actionable: "ログイン" opens
+         a normal chat session running `claude auth login` in that same place
+         (the claude-login* presets), since that flow is a URL plus a pasted
+         code rather than a one-shot command; "ログアウト" is one command and
+         answers inline. data-scope is what each button sends to
+         /claude-auth/{login,logout}. Its own page (not part of view-list)
+         since 2026-08-15 -- five rows made the session list too long. -->
+    <div id="claude-auth-section">
+      <!-- Cleans up headful-Chrome debug instances (the deployment notes)
+           left running from CDP-driven browser testing/automation --
+           otherwise only reaped automatically after 30 minutes idle. Always
+           first row (2026-08-18, at the user's request). "全員" only ever
+           shown to users with root-shell access (applyCapabilities()), same
+           gate as #auth-row-root below -- see kill_all_chrome in
+           aigw-backend. -->
+      <div class="auth-row" id="chrome-kill-row">
+        <div class="auth-line">
+          <span class="auth-label">Chrome</span>
+          <span id="chrome-kill-status" class="auth-status-text"></span>
+        </div>
+        <div class="auth-actions">
+          <button id="chrome-kill-own-btn">Kill Chrome</button>
+          <button id="chrome-kill-all-btn">Kill Chrome(全員)</button>
+        </div>
+      </div>
+      <div class="auth-row">
+        <div class="auth-line">
+          <span class="auth-label">sandbox内</span>
+          <span id="auth-status" class="auth-status-text">確認中…</span>
+        </div>
+        <div class="auth-actions">
+          <button class="auth-login" data-scope="container">ログイン</button>
+          <button class="auth-logout" data-scope="container">ログアウト</button>
+        </div>
+      </div>
+      <!-- This host, as this same user's real $HOME (not sandhome). -->
+      <div class="auth-row" id="auth-row-host">
+        <div class="auth-line">
+          <span class="auth-label">sandbox外(host)</span>
+          <span id="auth-status-host" class="auth-status-text">確認中…</span>
+        </div>
+        <div class="auth-actions">
+          <button class="auth-login" data-scope="host">ログイン</button>
+          <button class="auth-logout" data-scope="host">ログアウト</button>
+        </div>
+      </div>
+      <!-- Hidden entirely unless GET /capabilities says root_shell -- same
+           gate as the "root-shell" preset option (applyCapabilities()). -->
+      <div class="auth-row" id="auth-row-root">
+        <div class="auth-line">
+          <span class="auth-label">root</span>
+          <span id="auth-status-root" class="auth-status-text">確認中…</span>
+        </div>
+        <div class="auth-actions">
+          <button class="auth-login" data-scope="root">ログイン</button>
+          <button class="auth-logout" data-scope="root">ログアウト</button>
+        </div>
+      </div>
+      <!-- Extension point (see site-extras.js at the bottom of this file):
+           a deployment can add its own extra auth-row(s) here without
+           touching this core file. Left empty and untouched if no
+           site-extras.js is present. -->
+      <div id="site-extra-auth-rows"></div>
+    </div>
+  </div>
+
+  <div id="view-chat">
+    <div id="chat-header">
+      <!-- A session that has actually ended is now detected automatically
+           (remain-on-exit/dead-pane, see aigw-backend) -- so the ← here is
+           just "go look at something else", never "end this". Restored
+           2026-08-16 (at the user's request) in the slot the now-removed
+           停止 button used to occupy; swipe-right still also works
+           see the swipe-back handler in app.js. -->
+      <button class="back" id="back-btn">←</button>
+      <!-- Force-stopping a still-*running* session (not something auto-
+           detection can ever replace -- there is nothing to detect until
+           it actually stops) is now a long-press on this dot rather than
+           its own always-visible button, specifically so it takes a
+           deliberate, confirmed gesture instead of an ordinary tap
+           (2026-08-16, at the user's request). See the long-press handler
+           in app.js. -->
+      <span class="dot" id="chat-dot" title="長押しで強制終了"></span>
+      <span id="chat-label"></span>
+      <!-- Someone else's session shared with me. -->
+      <span id="chat-owner-badge" class="owner-badge"></span>
+      <!-- Shows the pane exactly as tmux renders it right now. The chat log
+           is append-only and cannot represent an in-place redraw, which is
+           what Claude Code's selection menus are — see _latest_screen in
+           aigw-backend. Hidden for the headless preset, which has no pane. -->
+      <button class="screen-btn" id="screen-btn" title="画面">🖥️</button>
+      <!-- Both save (💾) and sharing management live in this one panel now
+           (2026-08-28, at the user's request) -- save is available to owner
+           and shared viewer alike; the sharing controls rendered inside stay
+           owner-only (see renderSharePane() in app.js). Button itself is
+           always shown, unlike before, since a shared viewer needs it too. -->
+      <button class="share-btn" id="share-btn" title="共有">🧑‍🤝‍🧑</button>
+      <!-- Moved here from the (now-hidden-while-chatting) top #top-header
+           bar at the user's request (2026-08-15) -- same element, same
+           click handler, just relocated in the DOM. -->
+      <button id="reload-btn" title="再読み込み">⟳</button>
+    </div>
+    <!-- 2026-09-11, at the user's request: a running host/root session whose
+         passkey unlock window has since closed keeps its tmux pane alive
+         ("sever access, don't kill the server" is deliberate), but
+         this backend can no longer read that pane for new output until
+         someone unlocks again -- reading itself was never gated, so nothing
+         else here says so. Previously the only sign was the small header
+         badge disappearing; a user watching new messages seemingly stop
+         arriving after a page reload had no prompt telling them why. Shown/
+         hidden by updateUnlockNotice() in app.js, driven by the same
+         unlock-status poll that already drives the header badge. -->
+    <div id="unlock-notice" hidden>
+      <span>🔒 root/hostのロックが閉じているため、新着メッセージを取得できません</span>
+      <button id="unlock-notice-btn" type="button">🔓 解錠する</button>
+    </div>
+    <!-- #screen-wrap exists only so the floating 🤖 button has a
+         position:relative parent to anchor to -- see the CSS comment above. -->
+    <div id="screen-wrap">
+      <pre id="screen-pane"></pre>
+      <!-- 2026-09-01: shown only while
+           screenAtLive is false -- see the CSS comment on button.live-btn
+           for why this is a required escape hatch, not just a nicety. -->
+      <button class="live-btn" id="screen-live-btn" title="ライブ表示に戻る">● ライブに戻る</button>
+      <!-- Relocated from #chat-header (2026-08-28, at the user's request):
+           floats over this pane's top-right corner instead, so it's only
+           reachable while the pane itself is open. -->
+      <button class="agents-btn" id="agents-btn" title="サブエージェント">🤖</button>
+    </div>
+    <div id="agents-pane"></div>
+    <div id="share-pane"></div>
+    <div id="messages"></div>
+    <div id="key-toolbar">
+      <div id="key-grid"></div>
+      <div id="key-modrow"></div>
+    </div>
+    <div id="composer">
+      <!-- A phone keyboard's autocorrect/autocapitalisation is wrong for
+           everything this box is used for: shell command lines, and pasted
+           OAuth codes where one changed character is an unexplained failure. -->
+      <textarea id="text" placeholder="メッセージを入力..." rows="1"
+                autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false"></textarea>
+      <!-- 送信: the literal characters and nothing else. 実行: the same plus
+           Enter, and with an empty box, Enter alone. Two buttons rather than
+           one because "type" and "submit" are different acts on a terminal,
+           and merging them makes the composer unusable whenever the pane is
+           not sitting at a text prompt). -->
+      <button id="send-btn" title="Enterを送らずに文字だけ送る">送信</button>
+      <button id="run-btn" title="文字を送ってEnter(空ならEnterだけ)">実行</button>
+    </div>
+    <!-- Hidden, triggered by the 📎 button #key-toolbar builds (app.js) --
+         not visible itself, only its native file picker is. -->
+    <input type="file" id="attach-file-input" accept="image/*" hidden>
+  </div>
+
+<!-- Optional, deployment-supplied (see the two "Extension point" comments
+     above and app.js's own initSiteExtras()) -- loaded before app.js so
+     its registration is in place by the time app.js's own init() runs.
+     A deployment that has no such file just gets a harmless 404 here;
+     window.aigwSiteExtras stays undefined and every call site checks for
+     that with `?.`. -->
+<script src="/agents/site-extras.js"></script>
+<script src="/agents/app.js"></script>
+</body>
+</html>

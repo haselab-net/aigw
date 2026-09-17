@@ -1,0 +1,46 @@
+[Unit]
+Description=AF_UNIX listener for per-user aigw backend proxy, port %i
+
+[Socket]
+# the deployment notes (2026-08-30, revision 2): this used to be
+# ListenStream=127.0.0.1:%i -- a loopback TCP port, reachable by ANY local
+# user on this host (Linux has no per-uid access control on loopback TCP),
+# not just aigw-gateway, which is the actual hole this whole migration
+# closes. %i is still the historical 21000-21099 port-shaped key
+# aigw-gateway derives from a uid (see aigw-gateway's
+# backend_socket_path_for) -- only the address type changed, not what it
+# means or how it's chosen, so aigw-self-signup and every already-enabled
+# `aigw-backend-proxy@<port>.socket` instance needs no changes at all.
+#
+# SocketUser=/SocketMode= are what actually close the hole: without them
+# this AF_UNIX socket file would default to root:root 0666-ish (whatever
+# umask applies), i.e. just as reachable by anyone as the TCP port was.
+# Owner "aigw", mode 0600 (no SocketGroup= -- group bits are moot at 0600
+# anyway) means only aigw-gateway (or root) can ever connect at all --
+# unix(7): connecting requires *write* permission on the socket file.
+ListenStream=/run/aigw-backend/%i.sock
+SocketUser=aigw
+SocketMode=0600
+Accept=yes
+# One connection == one activated service instance, and the PWA opens a
+# session by fetching every attachment on it at once, so a single page load
+# can be a burst of well over a hundred connections. systemd's default
+# trigger limit (200 within 2s) put this *listening* socket into a permanent
+# failed state when that happened -- after which every request got
+# ECONNREFUSED until an admin restarted it by hand (the deployment notes).
+# aigw-gateway now pools its connections so bursts this size should no longer
+# reach here, but the limit stays generous: hitting it costs the whole
+# service, while the thing it protects against (a runaway reconnect loop) is
+# just wasted CPU.
+TriggerLimitIntervalSec=10s
+TriggerLimitBurst=3000
+# Same burst, second systemd default in the way: past 64 *simultaneous*
+# connections ("Too many incoming connections (64), dropping connection")
+# systemd drops the rest, which reaches aigw-gateway as ECONNREFUSED and shows
+# up in the PWA as "backend unreachable" -- indistinguishable from the trigger
+# limit above, but transient rather than permanent. Measured: 150 concurrent
+# requests lost 52 of them at the default.
+MaxConnections=256
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,52 @@
+#!/bin/bash
+# Stops any per-user aigw-backend@ instance whose port hasn't been touched
+# (via aigw-proxy-handler) in over IDLE_SECONDS -- UNLESS it still has
+# something actively going on: a live tmux session inside that user's
+# devbox-<user> container, or an in-flight headless `claude -p` turn (marked
+# by a `busy` file under that session's directory -- see
+# _run_claude_headless_turn). Stopping the backend mid-turn would SIGKILL its
+# whole cgroup, including that `sandbox exec -- claude ...` child process,
+# abruptly killing a possibly-long-running turn. Conversation logs/tmux
+# sessions themselves live in the container/sandhome independent of this
+# relay process either way, so a reap never loses history -- this check only
+# avoids interrupting something still actively running.
+set -euo pipefail
+
+IDLE_SECONDS=$((30 * 60))
+NOW=$(date +%s)
+
+systemctl list-units 'aigw-backend@*.service' --all --no-legend --plain \
+  | awk '{print $1}' \
+  | while read -r unit; do
+      [ -z "$unit" ] && continue
+      username="${unit#aigw-backend@}"
+      username="${username%.service}"
+      stamp="/var/lib/aigw/last-used/${username}"
+      last=0
+      [ -f "$stamp" ] && last=$(stat -c %Y "$stamp")
+      if [ $((NOW - last)) -gt "$IDLE_SECONDS" ]; then
+        if docker exec "devbox-${username}" tmux list-sessions >/dev/null 2>&1; then
+          continue  # a tmux session is still running -- leave it be
+        fi
+        if sudo -u "$username" tmux list-sessions >/dev/null 2>&1; then
+          # Same, for that user's *host-level* tmux server: the "host-shell"
+          # preset and host-side "attach" sessions both live there. This
+          # matters more than the container case: a host tmux server that
+          # aigw itself started (rather than one already running from the
+          # user's SSH login) sits in aigw-backend@<user>.service's own
+          # cgroup, so stopping the unit would take the pane down with it.
+          continue
+        fi
+        real_home="$(getent passwd "$username" | cut -d: -f6)"
+        if [ -n "$real_home" ] && compgen -G "${real_home}/sandhome/.aigw/*/busy" >/dev/null 2>&1; then
+          continue  # a headless claude turn is still in flight -- leave it be
+        fi
+        # Not `is-active --quiet && stop`: for an already stopped instance
+        # is-active exits 3, and as the loop body's last command that status
+        # would trip `set -e` and abandon every later user in the list. Same
+        # bug as chromedbg-reap-idle had (see that script).
+        if systemctl is-active --quiet "$unit"; then
+          systemctl stop "$unit"
+        fi
+      fi
+    done

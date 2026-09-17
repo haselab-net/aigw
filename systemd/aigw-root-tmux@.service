@@ -1,0 +1,54 @@
+[Unit]
+# A root tmux server dedicated to one aigw user's "root-shell" panes.
+# Instance name = the Unix user allowed to drive it.
+#
+# This is what the aigw phone UI's root-shell preset talks to. Deliberately
+# NOT a sudo wrapper: there is no root-side program the user passes arguments
+# to at all. This unit starts a plain tmux server as root, and
+# aigw-root-tmux-grant then gives exactly one named user access to it (tmux's
+# own `server-access` ACL, plus 0700/0600 filesystem permissions). The user's
+# aigw-backend then drives it with an ordinary `tmux -S <socket>` client
+# running as that user; every pane the server creates runs as root.
+#
+# Enabling this unit for a user IS the act of granting them passwordless
+# root, so it is enabled per user on purpose (`systemctl enable --now
+# aigw-root-tmux@<user>`) rather than following from group membership.
+# See the "root-shell" section of the deployment notes.
+Description=Root tmux server for %i's aigw root-shell panes
+Documentation=file://the deployment notes
+
+[Service]
+Type=simple
+# -D keeps the server in the foreground, so *this unit's main process is the
+# tmux server itself*: it gets its own cgroup, independent of the per-user
+# aigw-backend@%i.service that drives it (a backend restart or an
+# aigw-reap-idle stop can therefore never take a root pane down with it).
+# -D also turns exit-empty off, so the server -- and its socket -- survive
+# the last pane being closed.
+# The parent must be traversable (0755) or the owning user cannot reach their
+# own socket inside it; the per-user directory below is what actually keeps
+# everyone else out.
+ExecStartPre=/usr/bin/install -d -m 0755 -o root -g root /run/aigw-root-tmux
+ExecStartPre=/usr/bin/install -d -m 0700 -o %i -g %i /run/aigw-root-tmux/%i
+ExecStart=/usr/bin/tmux -D -S /run/aigw-root-tmux/%i/sock
+ExecStartPost=/usr/local/sbin/aigw-root-tmux-grant %i
+# Mirrors the grant off when this unit stops/is disabled, including the
+# read-only /root/.claude/projects ACL bridge aigw-root-tmux-grant adds (see
+# its own comment) -- so "disable --now" keeps its documented property of
+# closing every access path for that user in one command (the deployment notes).
+ExecStopPost=/usr/local/sbin/aigw-root-tmux-grant %i --revoke
+# 2026-08-31 のセキュリティ監査で発見。窓を閉じてもこのユニットを止めなくなった
+# (`the deployment notes`)結果、ロック中に tmux サーバーが
+# 異常終了(OOM kill、クラッシュ、root ペインに残ったプロセスからの kill -9)する
+# と systemd が再起動し、ExecStartPost の aigw-root-tmux-grant が *解錠窓が
+# 開いていないのに* ソケット所有権・tmux の server-access・/root/.claude の
+# ACL を再付与してしまう。しかも aigw-unlockd の _unlocks にその窓は存在しない
+# ので sweeper は永久に剥奪せず、次に誰かが lock/解錠/unlockd 再起動をするまで
+# アクセスが開きっぱなしになる(監査ログにも残らない)。正当な次の解錠では
+# aigw-unlockd の _start_unit() が systemctl start するので、自動再起動が
+# 無くて困ることはない。サーバーが死んだ時点で中のペインは失われているため、
+# 自動再起動が保全していたものも実際には無い。
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

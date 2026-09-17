@@ -1,0 +1,11 @@
+# Install as /etc/sudoers.d/aigw (mode 440, validate with `visudo -c -f`).
+#
+# Lets any member of the group below run bin/aigw-set-email as root without a
+# password -- needed because GECOS is root-owned but aigw-set-email must be
+# self-service (see that script's own comments for why `chfn -o` doesn't work
+# here). The script hardcodes its target to $SUDO_USER, so this grants no
+# ability to touch any account but the invoking user's own.
+#
+# Replace "sandboxusers" with whatever group your own deployment uses for
+# people allowed to use aigw -- it isn't a name this repo requires.
+%sandboxusers ALL=(root) NOPASSWD: /usr/local/bin/aigw-set-email

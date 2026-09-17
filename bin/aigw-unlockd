@@ -1,0 +1,1789 @@
+#!/opt/aigw/venv/bin/python3
+"""
+aigw-unlockd -- the trust anchor for root-shell passkey unlock.
+
+See this project's README for the full design background this module
+docstring assumes (the WebAuthn/SO_PEERCRED trust boundary, the two-tier
+credential model, why a NOPASSWD sudo wrapper was rejected in favor of this).
+
+WHAT THIS PROCESS IS FOR
+-------------------------
+Take a user "alice" who is allowed to become root on this host: once
+`aigw-root-tmux@alice.service` is enabled permanently, the socket at
+/run/aigw-root-tmux/alice/sock exists at all times, chowned to alice, 0600.
+Being able to open that socket at all IS passwordless root -- there is
+deliberately no root-side program a caller passes arguments to. That design
+is *correct* (a NOPASSWD sudo wrapper has the same problem one layer up), but
+it means the only thing standing between "any process running as alice" and
+root is a Unix permission bit that is always open.
+
+This daemon turns that into something that is only open for 15 minutes after
+a WebAuthn passkey ceremony (extendable by activity up to a 2-hour absolute
+cap -- see UNLOCK_ABSOLUTE_MAX below), by owning the one action that
+actually confers root: starting/stopping aigw-root-tmux@<user>.service
+itself.
+
+TRUST BOUNDARY -- READ THIS BEFORE TOUCHING aigw-gateway/aigw-backend
+----------------------------------------------------------------------
+This process runs as root. aigw-gateway is the only network-facing process
+and runs as the unprivileged `aigw` user; aigw-backend runs as the requesting
+Unix user. Both of those are reachable, directly or indirectly, from a phone
+browser over the internet. **Neither of them is trusted to decide whether a
+WebAuthn assertion is valid.** They may only relay opaque JSON blobs (the
+`options` this daemon issues, and the `credential` the browser's
+navigator.credentials.* produced) between the browser and this socket.
+
+Why: if the verdict were computed in aigw-gateway or aigw-backend, then
+compromising either of those processes (a bug, a dependency CVE, a stolen
+Cookie combined with an app-layer flaw) would let an attacker fabricate a
+"yes, the passkey checked out" verdict and get root -- exactly the outcome
+a physical hardware/biometric authenticator is supposed to make impossible.
+By doing the actual `Fido2Server.authenticate_complete()` call here, in a
+process web-exposed code can only ever *ask* things of (never instruct), a
+web-tier compromise alone cannot forge an unlock: the authenticator's
+private key, which never leaves the user's device/secure enclave, still has
+to produce a valid signature.
+
+SOCKET PERMISSIONS ARE NOT THE SECURITY BOUNDARY HERE
+-------------------------------------------------------
+/run/aigw-unlockd.sock is deliberately mode 0666 (any local user may
+connect). This is intentional, not an oversight: the socket only lets a
+caller *ask* ("here is a credential response, is it good?"); the WebAuthn
+signature is what authorizes anything. Every verb that can change state for
+a given <user> additionally checks, via SO_PEERCRED, that the connecting
+process's uid is either that user's own uid (i.e. it is that user's own
+aigw-backend@<user>, the only thing that ever legitimately proxies WebAuthn
+traffic for them) or uid 0 (root, i.e. aigw-passkey). This is defense in
+depth on top of the cryptographic check, not a replacement for it.
+
+Restart= ON aigw-root-tmux@.service (2026-08-31 UPDATE: on-failure -> no)
+-------------------------------------------------------------------------
+The unit's ExecStart is a foreground `tmux -D -S ...` server. It originally
+ran with `Restart=on-failure`, on the reasoning that a `RuntimeMaxSec=`
+timeout would count as a failure to systemd and trigger a restart, silently
+defeating any TTL -- except this daemon does NOT rely on RuntimeMaxSec= at
+all (it tracks the 15-minute window itself, see _unlocks/_sweeper below),
+and an expired window's own `systemctl stop` is a clean, requested
+termination that does not trip Restart=on-failure (that only fires on an
+unclean exit code or an actual timeout condition), so the two were thought
+to never interact.
+
+That reasoning stopped holding the moment "SEVER ACCESS, DON'T KILL THE
+SERVER" (below) shipped: an ordinary window close no longer stops the unit
+at all, it only revokes access and leaves the tmux server running,
+potentially for a long time, with nothing left in this file that will ever
+stop it just because time passed. If that now-long-lived server crashes (an
+UNCLEAN exit, not a requested stop) while locked, `Restart=on-failure` would
+bring it straight back up, and the unit's ExecStartPost
+(`aigw-root-tmux-grant <user>`) would re-grant access to the fresh
+instance -- with no passkey ceremony involved and no entry in `_unlocks` for
+`_sweeper` to ever find and revoke, since as far as this daemon is concerned
+that user's window was already closed. The server would then sit open
+indefinitely with access, with nothing in this file ever closing it again.
+So a separate change sets `Restart=no` on aigw-root-tmux@.service: a crash
+while locked now just leaves the server dead (same as any other unattended
+root process crashing), never silently reopened. This daemon still tracks
+its own 15-minute window rather than relying on RuntimeMaxSec= -- that part
+of the original reasoning is unchanged; only the Restart= line and the
+justification for it are.
+
+CREDENTIAL STORE
+-----------------
+/etc/aigw/passkeys/<user>.json, root:root 0600, owned and written only by
+this process (aigw-passkey never touches it directly -- see that file's own
+docstring for why). Fail-closed throughout: any parse error, unknown user,
+missing/expired/reused token, or missing credential denies the request; it
+never falls back to "allow".
+
+TWO-TIER CREDENTIALS AND WINDOWS (2026-08-30)
+------------------------------------------------
+Originally there was exactly one kind of credential and one kind of window,
+and `_start_unit()` (i.e. `systemctl start aigw-root-tmux@<user>`) ran for
+ANY successful assertion. That was fine while the only person who could
+ever enrol a passkey at all was the admin, "alice" (mint-registration-token's
+root-only check made that true), but it stops being fine the moment other
+users ("bob", "carol") are given passkeys for `host`-location shell access
+only: if only alice may ever become root on this host, a credential that
+merely proves "this is bob, on their own device" must never be able to
+reach _start_unit().
+
+The fix is a `tier` on both the credential and the window it opens, "host"
+or "root":
+
+  * A credential's tier is decided once, at enrolment, by
+    verb_mint_registration_token -- see that function for the exact rule
+    (root tier: peer uid must be 0; host tier: peer uid must be 0 or the
+    target user's own uid). It is never re-decided later; a credential
+    that was minted as "host" cannot be silently upgraded by anything in
+    this file.
+  * A credential record with NO tier field (every credential enrolled
+    before this change, including alice's existing one) is treated as
+    "host" -- see _credential_tier() below. This is a fail-SAFE default,
+    not a guess: the alternative (defaulting missing-tier to "root") would
+    silently hand root to every credential enrolled under the old
+    single-tier design the instant this code is deployed -- never silently
+    promote an existing credential to root. alice's pre-existing credential
+    keeps working for host actions under this default and is expected to be
+    re-enrolled as root-tier by a human afterwards.
+  * A window's tier is fixed to the tier of the credential that opened it,
+    at verb_finish_assertion time, and `touch` (see below) is explicitly
+    forbidden from changing it -- a window cannot be "upgraded" by idling.
+  * `_tier_satisfies(window_tier, required_tier)` is the one place that
+    encodes the authorization table: a root-tier window satisfies both
+    "root" and "host" requests; a host-tier window satisfies only "host".
+    _start_unit() is called ONLY when the credential that just verified is
+    root tier (see the `if credential_tier == "root":` guard in
+    verb_finish_assertion) -- this is the single most important line in the
+    whole two-tier design: it is what stops a host passkey from
+    ever producing a root shell, no matter what the window bookkeeping
+    above says.
+  * verb_begin_assertion filters `allowCredentials` down to only the
+    credentials that COULD satisfy the requested tier (root request: root
+    credentials only; host request: all of them, since a root credential is
+    a superset of what a host request needs) -- both so a user holding both
+    kinds is prompted for the right key, and,
+    more importantly, so that the set of credentials verb_finish_assertion
+    is willing to cryptographically match against for THIS challenge is
+    already narrowed to that same tier-appropriate set. WebAuthn's
+    allowCredentials is only a hint to the client/authenticator -- nothing
+    stops a browser (buggy, compromised, or simply a platform that ignores
+    it for resident keys) from returning an assertion for some OTHER
+    credential registered for this RP. verb_finish_assertion re-derives the
+    same tier-filtered candidate list from the tier that was recorded in
+    _assert_states at begin-assertion time (never from anything the client
+    sends at finish) and passes only THAT list into
+    Fido2Server.authenticate_complete(), so a credential outside the
+    requested tier cannot verify even if a client tried to substitute one.
+
+WHY `touch` HAS AN ABSOLUTE CAP, NOT JUST AN IDLE EXTENSION
+--------------------------------------------------------------
+`touch` (see verb_touch) resets the window to a fresh UNLOCK_TTL every time
+it is called, capped at `unlocked_at + UNLOCK_ABSOLUTE_MAX`. Without that
+cap, `touch` would have no ceiling at all: SO_PEERCRED only requires the
+caller's uid to match the unlocked user, so *any* process running as that
+user -- not just the legitimate one -- could keep a hijacked window open
+forever simply by calling `touch` more often than UNLOCK_TTL. This is an
+accepted residual risk, on the strength of keeping the TTL short (15
+minutes) as the mitigation; an unbounded idle extension would quietly
+repeal that mitigation the first time it mattered. This mirrors a common
+idle+absolute-cap pattern for session cookies, applied here to the unlock
+window itself.
+
+A WINDOW MERELY BEING OPEN NOW COUNTS AS ACTIVITY (2026-08-31)
+--------------------------------------------------------------
+`_sweeper()` used to only ever delete expired entries. It now also slides
+every still-open window's `expires_at` forward on each sweep pass (same
+`min(now + UNLOCK_TTL, unlocked_at + UNLOCK_ABSOLUTE_MAX)` formula as
+`verb_touch`) -- requested behavior change: a root-shell pane can sit idle
+for long stretches while the agent running inside it works unattended, with
+no `send_message`/`send_key`/... ever reaching `require_unlock_if_outside_
+sandbox`, and the window should not be yanked out from under it just because
+nobody happened to type in that particular 15-minute slice. So "open" is now
+itself the activity signal, not a proxy for it. UNLOCK_ABSOLUTE_MAX is what
+this decision leans on for its safety, more than before -- it is now the
+*only* thing standing between a hijacked window (see the paragraph above)
+and it staying open indefinitely, since idle time no longer closes anything
+on its own. Do not remove that cap to "simplify" this; it is the whole
+mitigation now. `verb_touch` itself is unchanged (still called from
+`require_unlock_if_outside_sandbox`, still useful for pushing a real action's
+window past what the sweeper alone would have reached this tick), it is just
+no longer the only thing keeping an in-use window alive.
+
+SEVER ACCESS, DON'T KILL THE SERVER (2026-08-31)
+--------------------------------------------------------
+An ordinary window close (sweeper expiry, `verb_lock`) used to be
+`_stop_unit()`, i.e. `systemctl stop aigw-root-tmux@<user>` -- which kills
+the tmux server and, with it, every pane inside it (a root-shell `claude`
+mid-task included). Requested change, on the reasoning that the 15-minute
+/ 2-hour limits exist to bound how long an unauthenticated-since-last-touch
+WEB SESSION may reach this user's root shell, not to bound how long a
+legitimate root process may run once nothing web-facing can reach it any
+more: with the socket chowned back to root:root 0600 (NOT unlinked -- see
+below) and the user pulled off the tmux server's own `server-access` list
+(both are what `aigw-root-tmux-grant --revoke` does, see that script), no
+aigw-backend, no browser tab, no passkey replay can get back in without a
+fresh passkey ceremony -- the server continuing to run is then no
+different, security-wise, from any other already-running root process on
+this host that nobody happens to be attached to right now.
+
+(2026-08-31 bugfix: --revoke used to `rm` the socket outright. An AF_UNIX
+socket, once unlinked, can never be connect()ed to again even by the very
+process that still has it bound -- so unlinking a live server's socket
+didn't just deny outsiders, it permanently orphaned that server: no future
+`aigw-root-tmux-grant <user>` re-grant could ever open a usable path to it
+again, only `systemctl start` on a fresh instance could. --revoke now only
+unlinks the socket when the tmux server itself is confirmed not running --
+in every other case it chowns/chmods the existing socket back to root and
+leaves it in place, so a later re-grant onto the same still-running server
+works. `_revoke_access()` below verifies exactly this post-condition
+rather than trusting the script's exit code -- see that function.)
+
+So `_revoke_access()` (severs access, does not touch the systemd unit) is
+what an ordinary window close does now; `_stop_unit()` (kills the server)
+survives only for `verb_revoke_credential`, whose whole point IS "there is
+no legitimate way left for this user to ever get back in, so tear it down"
+-- see that verb's own comment. `_start_unit()` correspondingly checks
+whether the unit is already running before deciding whether `systemctl
+start` (fresh server, runs ExecStartPost itself) or `_grant_access()`
+(re-grant onto an already-running one, since `systemctl start` on an
+already-active unit is a no-op that would never re-run ExecStartPost) is
+the right way to reopen access on the next unlock.
+
+One consequence worth being explicit about: a root-shell tmux server can
+now stay running, unattended, indefinitely across any number of window
+opens and closes -- there is no longer anything in this file that ever
+stops it just because time passed. Nothing currently sweeps up a
+long-forgotten idle server at the tmux level (only a human `systemctl stop
+aigw-root-tmux@<user>` for real, or a host reboot, ends one) -- accepted for
+now on the same reasoning as above (an idle root process with no reachable
+access path is not itself the risk this system defends against), but a
+future cleanup policy for that is a legitimate thing to revisit if it ever
+becomes one.
+
+RECONCILE ON STARTUP -- DO NOT FAIL OPEN ON A RESTART
+--------------------------------------------------------
+`_unlocks` is in-memory only (see the state block below), so it is always
+empty the instant this process starts -- including after a crash, a
+`systemctl restart aigw-unlockd`, or a routine deploy, all of which are
+ordinary operational events, not edge cases. If a window happened to be open
+at that moment, aigw-root-tmux@<user>.service is left running with nothing
+left that is tracking it or will ever revoke its access: the sweeper only
+acts on entries present in `_unlocks`. A daemon whose entire design is "fail
+closed" would fail open on its single most routine operational event, and
+`status` would report "locked" the whole time because it too only consults
+`_unlocks`. `_reconcile_orphaned_units()` closes this gap: before the
+listening socket is even opened, it asks systemd for every currently-running
+`aigw-root-tmux@*` unit and revokes access to each (see "SEVER ACCESS, DON'T
+KILL THE SERVER" above for why this is a revoke, not a stop, since
+2026-08-31). Finding one running here is always unconditionally worth
+revoking, never just heuristically safe: at the moment this process starts,
+by definition no unlock window is yet being tracked by it, so any such
+unit's access cannot have been (re-)authorized by this process instance --
+whether or not the unit itself was legitimately left running on purpose.
+
+fido2 LIBRARY
+--------------
+Uses `fido2` 2.2.1 (Yubico, BSD-2-Clause), e.g. `pip install fido2==2.2.1`
+into whatever venv runs this. Not the Debian `python3-fido2` 0.9.1 package,
+whose API is materially different. Every fido2 call and class used below
+was checked against the actual 2.2.1 wheel's source (server.py, webauthn.py,
+cose.py, utils.py) rather than guessed from older docs -- nothing here was
+run against a real authenticator or browser, for lack of one in the
+environment this was originally written in; a human/integration-test
+double-check against a live authenticator is worth doing before relying on
+this in production.
+"""
+
+import base64
+import json
+import os
+import pwd
+import secrets
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+from fido2.server import Fido2Server
+from fido2.utils import websafe_encode
+from fido2.webauthn import (
+    AttestedCredentialData,
+    AuthenticationResponse,
+    PublicKeyCredentialRpEntity,
+    PublicKeyCredentialUserEntity,
+    UserVerificationRequirement,
+)
+
+SOCK_PATH = "/run/aigw-unlockd.sock"
+CRED_DIR = Path("/etc/aigw/passkeys")
+WEBAUTHN_CONFIG_PATH = Path("/etc/aigw/webauthn.json")
+
+# Fixed, not derived from Host headers or anything else a
+# web-tier bug could influence -- these two constants ARE the phishing
+# resistance this whole project buys. A stored credential is bound to RP ID
+# at registration time (fido2 hashes and checks it internally); the origin
+# check below is this daemon's own, stricter than fido2's default (which
+# would also accept subdomains of the RP ID).
+#
+# Deployment-specific, so they live in a config file (site's own domain, not
+# something this project can default sensibly) rather than being hardcoded --
+# loaded once at import time and never silently defaulted: a missing/wrong
+# RP ID does not fail loudly at the point of use (fido2 just rejects every
+# assertion against credentials registered under a different one), so
+# refusing to start at all here is the only place this can be caught early.
+def _load_webauthn_config():
+    try:
+        raw = WEBAUTHN_CONFIG_PATH.read_text()
+    except OSError as e:
+        sys.exit(f"{WEBAUTHN_CONFIG_PATH}: {e} (expected JSON with rp_id/rp_name/origin)")
+    try:
+        cfg = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"{WEBAUTHN_CONFIG_PATH}: invalid JSON: {e}")
+    missing = [k for k in ("rp_id", "rp_name", "origin") if not cfg.get(k)]
+    if missing:
+        sys.exit(f"{WEBAUTHN_CONFIG_PATH}: missing required key(s): {', '.join(missing)}")
+    return cfg["rp_id"], cfg["rp_name"], cfg["origin"]
+
+
+RP_ID, RP_NAME, ORIGIN = _load_webauthn_config()
+
+CHALLENGE_TTL = 60  # seconds -- how long an assertion challenge stays valid
+REG_TOKEN_TTL = 300  # seconds -- how long a registration token stays valid
+UNLOCK_TTL = 15 * 60  # seconds -- the unlock window itself (kept extended by `touch`
+# and, since 2026-08-31, by the sweeper itself for as long as the window stays open -- see the
+# module docstring's "A WINDOW MERELY BEING OPEN NOW COUNTS AS ACTIVITY" section)
+# Absolute ceiling on how long repeated `touch` calls can keep a single
+# unlock alive, independent of how often it is touched -- see the module
+# docstring's "WHY `touch` HAS AN ABSOLUTE CAP" section for why an
+# idle-only extension is not safe on its own. 2 hours is a judgment call:
+# long enough that a real multi-hour root maintenance session is not
+# interrupted mid-task, short enough that a walked-away or hijacked window
+# cannot ride the same authentication all day. If this tradeoff should
+# move, change this constant and update this comment with the new
+# reasoning -- don't just delete the cap.
+UNLOCK_ABSOLUTE_MAX = 2 * 60 * 60  # seconds
+SWEEP_INTERVAL = 5  # seconds -- how often the background expiry check runs
+
+
+def log(msg):
+    print(f"[aigw-unlockd] {msg}", file=sys.stderr, flush=True)
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _audit(event, user, outcome, **fields):
+    # The audit trail: who, when, outcome, for every unlock/lock/registration
+    # event -- with a hard rule of "no secrets in logs". Never pass a token,
+    # credential, signature, or raw stored blob
+    # into `fields` -- only ids, uids, reasons and timestamps.
+    extra = " ".join(f"{k}={v}" for k, v in fields.items())
+    log(f"AUDIT event={event} user={user} outcome={outcome} ts={_now_iso()} {extra}".rstrip())
+
+
+# ---------------------------------------------------------------------------
+# fido2 server instance
+# ---------------------------------------------------------------------------
+# verify_origin overrides fido2's default (which is verify_rp_id() from
+# fido2.rpid -- permissive about subdomains of RP_ID). This project wants
+# an exact match against a single known origin instead, so we do that.
+_fido_server = Fido2Server(
+    PublicKeyCredentialRpEntity(id=RP_ID, name=RP_NAME),
+    verify_origin=lambda origin: origin == ORIGIN,
+)
+
+# ---------------------------------------------------------------------------
+# In-memory state. All of it is intentionally volatile: a daemon restart
+# during a 5-minute registration window or a 60-second assertion challenge
+# simply requires the user to retry. An open
+# 15-minute unlock window does NOT survive a restart either -- by itself
+# that would fail *open* (the root-tmux unit is left running with nothing
+# left tracking it), which is why main() calls _reconcile_orphaned_units()
+# before it ever opens the listening socket: see the module docstring's
+# "RECONCILE ON STARTUP" section. With that in place, a restart is once
+# again fail-closed: any window that was open is unconditionally closed,
+# and the user must re-authenticate.
+# ---------------------------------------------------------------------------
+_lock = threading.RLock()
+_reg_tokens = {}  # token -> {"user": str, "expires_at": float, "used": bool}
+_reg_states = {}  # token -> fido2 internal state dict, from register_begin()
+_assert_states = {}  # user -> (fido2 internal state dict, expires_at float)
+_unlocks = {}  # user -> (unlocked_at, expires_at, tier) tuple; presence = unlocked.
+# `tier` ("host" or "root") is fixed at verb_finish_assertion time to the
+# tier of the credential that opened the window and `touch` never changes
+# it -- see the module docstring's "TWO-TIER CREDENTIALS AND WINDOWS"
+# section. Indices 0/1 (unlocked_at, expires_at) keep their original
+# meaning and position so every pre-existing `entry[0]`/`entry[1]` read
+# below still means what it always did; only code that needs to know the
+# tier reads entry[2].
+
+
+class BadRequest(Exception):
+    """Malformed request -- distinct from PermissionError so the client gets
+    a useful (but not internals-leaking) message instead of a bare denial."""
+
+
+def _field(req, name):
+    if name not in req or req[name] in (None, ""):
+        raise BadRequest(f"missing field: {name}")
+    return req[name]
+
+
+def _resolve_uid(user):
+    """Fail closed on anything that isn't a real local account.
+
+    This doubles as the injection guard for _cred_path()/_unit() below:
+    pwd.getpwnam() only matches a literal existing account name, which on
+    Linux can never contain '/', NUL, or anything else that would matter for
+    a path or a systemd instance name. A request naming a nonexistent user
+    is rejected here before it ever reaches a filesystem path or an argv.
+    """
+    try:
+        return pwd.getpwnam(user).pw_uid
+    except KeyError:
+        raise BadRequest("unknown user") from None
+
+
+def _require_peer_is_user_or_root(peer_uid, user):
+    """SO_PEERCRED check: the connecting process must be root (aigw-passkey,
+    or a human debugging as root) or the named user's own process (in
+    practice, always that user's own aigw-backend@<user>, since it is the
+    only thing that ever proxies WebAuthn traffic for them). See the module
+    docstring's "SOCKET PERMISSIONS ARE NOT THE SECURITY BOUNDARY" section
+    for why this is defense in depth, not the actual authorization check."""
+    target_uid = _resolve_uid(user)
+    if peer_uid != 0 and peer_uid != target_uid:
+        raise PermissionError("uid mismatch")
+
+
+TIERS = ("host", "root")
+
+
+def _validate_tier(tier):
+    """Every wire request that carries a tier (mint-registration-token,
+    begin-assertion, and aigw-backend's touch calls) is validated through
+    here, once, so "unknown tier" and "missing tier" (BadRequest is raised
+    by _field before this even runs, for the missing case) fail the same
+    way a malformed request always does -- never silently coerced to
+    either tier. Fail closed (design brief: "Unknown tier ... → deny")."""
+    if tier not in TIERS:
+        raise BadRequest("tier must be 'host' or 'root'")
+    return tier
+
+
+def _credential_tier(cred_record):
+    """The fail-safe read side of the tier model (module docstring's
+    "TWO-TIER CREDENTIALS AND WINDOWS"): only the literal stored string
+    "root" is ever treated as a root-tier credential. A record with no
+    "tier" key at all (everything enrolled before this change), an empty
+    value, or any value that isn't exactly "root" (a future typo, a
+    corrupted store entry) is treated as "host". This is the one function
+    that decides that, so there is exactly one place to audit for "could
+    this ever accidentally read as root"."""
+    return "root" if cred_record.get("tier") == "root" else "host"
+
+
+def _creds_for_tier(credentials, tier):
+    """Which stored credential records can satisfy a request for `tier`,
+    per the authorization table in the module docstring: a "root" request
+    is satisfiable only by root-tier credentials; a "host" request is
+    satisfiable by ANY credential (a root-tier credential is strictly more
+    privileged than what a host request needs). Used both to build
+    begin-assertion's allowCredentials (so the right key gets prompted for)
+    and, more importantly, to build the exact candidate set
+    verb_finish_assertion cryptographically verifies against -- see the
+    module docstring for why both matter."""
+    if tier == "root":
+        return [c for c in credentials if _credential_tier(c) == "root"]
+    return list(credentials)
+
+
+def _tier_satisfies(window_tier, required_tier):
+    """Whether an already-open window at `window_tier` authorises an action
+    that needs `required_tier` -- the window-side half of the same table
+    _creds_for_tier encodes on the credential side. A root-tier window
+    authorises root and host; a host-tier window authorises host only.
+    Deliberately returns False (never raises) for any value it doesn't
+    recognize in either position: this sits on the hot path of every gated
+    action (verb_touch), and an uncaught exception here must never be
+    mistaken by a caller's broad `except Exception` for "allowed" -- see
+    _handle_conn's own top-level catch-all, which would otherwise turn a
+    bug in this function into a fail-open."""
+    if required_tier == "host":
+        return window_tier in TIERS  # both "host" and "root" satisfy a host request
+    if required_tier == "root":
+        return window_tier == "root"
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Credential store: /etc/aigw/passkeys/<user>.json, root:root 0600.
+# ---------------------------------------------------------------------------
+def _cred_path(user):
+    return CRED_DIR / f"{user}.json"
+
+
+def _load_creds(user):
+    path = _cred_path(user)
+    if not path.exists():
+        return {"user": user, "credentials": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("credential store is not a JSON object")
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        # Fail closed: an unreadable or corrupt store means "no credentials
+        # for this user", i.e. deny -- never "trust whatever we can salvage".
+        log(f"credential store for {user} is unreadable, treating as empty: {e!r}")
+        return {"user": user, "credentials": []}
+    data.setdefault("credentials", [])
+    data["user"] = user
+    return data
+
+
+def _save_creds(user, data):
+    CRED_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(CRED_DIR, 0o700)
+    fd, tmp_path = tempfile.mkstemp(dir=str(CRED_DIR), prefix=f".{user}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, _cred_path(user))  # atomic within /etc/aigw/passkeys
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _attested_list(credentials):
+    """Reconstruct fido2 AttestedCredentialData objects (aaguid + credential
+    id + COSE public key, all in one) from the base64 blobs we store. Each
+    blob is exactly `bytes(auth_data.credential_data)` as returned by a
+    prior register_complete() -- AttestedCredentialData is itself a `bytes`
+    subclass, so round-tripping it through base64 and back via
+    AttestedCredentialData(raw_bytes) is the same constructor the library
+    uses internally (see fido2/webauthn.py AttestedCredentialData.create()).
+
+    Takes a plain list of credential record dicts, not a whole store, so
+    callers that need a tier-filtered subset (verb_begin_assertion,
+    verb_finish_assertion -- see _creds_for_tier) can pass that subset
+    straight through instead of this function re-deriving it."""
+    out = []
+    for c in credentials:
+        try:
+            out.append(AttestedCredentialData(base64.b64decode(c["attested_credential_data"])))
+        except Exception as e:
+            log(f"skipping unparseable stored credential {c.get('id')!r}: {e!r}")
+    return out
+
+
+# WebAuthn AuthenticatorTransport values we are willing to pass back to a
+# browser. An authenticator reports its own transports at registration time
+# and we store them verbatim, so this list exists only to keep an unexpected
+# string out of the descriptors we hand navigator.credentials.* -- an
+# unknown transport makes some browsers reject the whole descriptor.
+# "cable" is the pre-L3 name for "hybrid"; still emitted by some stacks.
+KNOWN_TRANSPORTS = frozenset(
+    {"usb", "nfc", "ble", "smart-card", "hybrid", "internal", "cable"}
+)
+
+# What we claim for a credential enrolled BEFORE transports were recorded
+# (i.e. any credential in the store as of 2026-09-17). It is only ever used
+# for excludeCredentials, never for allowCredentials -- see
+# _annotate_transports for why those two directions are not symmetric.
+LEGACY_EXCLUDE_TRANSPORTS = ["internal"]
+
+
+def _sanitize_transports(value):
+    """A stored/reported transports list -> the subset we will put on the
+    wire, order preserved and de-duplicated. Anything that is not a list of
+    known transport strings yields [] (treated as "unknown", never as an
+    error): transports are a hint, and a malformed one must not be able to
+    break a registration or an assertion."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for t in value:
+        if isinstance(t, str) and t in KNOWN_TRANSPORTS and t not in out:
+            out.append(t)
+    return out
+
+
+def _norm_cred_id(s):
+    """base64url ids as they appear on the wire vs. as we store them. Both
+    sides go through fido2's websafe_encode (unpadded), so these already
+    match today; normalizing anyway means a future padded encoder on either
+    side cannot silently turn every lookup below into a miss -- which would
+    fail by quietly dropping the transports hint again, i.e. exactly the bug
+    this code exists to fix, with no error anywhere to notice it by."""
+    return s.rstrip("=") if isinstance(s, str) else s
+
+
+def _transports_by_id(credentials):
+    return {
+        _norm_cred_id(c.get("id")): _sanitize_transports(c.get("transports"))
+        for c in credentials
+    }
+
+
+def _annotate_transports(descriptors, credentials, default=None):
+    """Add a `transports` hint to each PublicKeyCredentialDescriptor in the
+    wire options, taken from what the authenticator itself reported when it
+    enrolled.
+
+    Why this matters (2026-09-17, Android Chrome, registration): a descriptor
+    carrying only `id` gives the browser no way to know WHERE the matching
+    credential might live, so Chrome on Android assumes it might be on
+    another device and quietly opens the cross-device (hybrid/QR/Bluetooth)
+    channel to go looking for it -- and waits. The registration prompt never
+    appears and navigator.credentials.create() just hangs until the timeout.
+    Naming the transports lets it check only the relevant ones and go
+    straight to the local prompt.
+
+    `default` is applied to credentials whose transports we never recorded.
+    Callers pass one ONLY for excludeCredentials, where a wrong guess is
+    harmless: the worst case is that the browser fails to notice an already
+    registered authenticator and the user re-enrols it, which
+    verb_finish_registration de-dups by credential id anyway. It is
+    deliberately NOT passed for allowCredentials, where the same wrong guess
+    would hide the user's only working credential from the browser and lock
+    them out; there, an un-annotated descriptor keeps today's behaviour
+    (browser tries everything), which is slower but always correct."""
+    by_id = _transports_by_id(credentials)
+    for d in descriptors:
+        transports = by_id.get(_norm_cred_id(d.get("id"))) or default
+        if transports:
+            d["transports"] = list(transports)
+    return descriptors
+
+
+def _peer_sudo_user(pid):
+    """Best-effort only, used purely for friendlier audit log lines (never
+    for an authorization decision -- that is _require_peer_is_user_or_root's
+    job, via SO_PEERCRED uid, which cannot be spoofed by the caller). Reads
+    SUDO_USER out of the calling process's own environment the same way any
+    sudo-wrapped self-service tool would."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+        for part in raw.split(b"\0"):
+            if part.startswith(b"SUDO_USER="):
+                return part.split(b"=", 1)[1].decode(errors="replace")
+    except OSError:
+        pass
+    return None
+
+
+def _unit(user):
+    return f"aigw-root-tmux@{user}.service"
+
+
+GRANT_SCRIPT = "/usr/local/sbin/aigw-root-tmux-grant"
+
+
+def _grant_access(user):
+    # Re-applies the read-only-ACL-plus-socket-ownership grant to an ALREADY
+    # RUNNING tmux server -- see _start_unit's own comment for when this,
+    # rather than `systemctl start`, is the right call.
+    r = subprocess.run([GRANT_SCRIPT, user], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"{GRANT_SCRIPT} {user} failed (rc={r.returncode}): {r.stderr.strip()}")
+
+
+def _access_revoked(user):
+    # Ground truth for "did --revoke actually take effect", checked
+    # independently of aigw-root-tmux-grant's own exit code -- see
+    # _revoke_access below for why the exit code alone can't be trusted.
+    # The socket at /run/aigw-root-tmux/<user>/sock is the one piece of
+    # on-disk state --revoke is supposed to leave in a specific shape:
+    #
+    #   * gone entirely (os.stat() raises FileNotFoundError) -- the tmux
+    #     server itself isn't running, so there is nothing left to have
+    #     access to. Revoked, trivially.
+    #   * present, owned by uid 0, mode exactly 0600 -- exactly what
+    #     `chown root:root` + `chmod 600` leave behind on a still-running
+    #     server's socket (module docstring's "SEVER ACCESS, DON'T KILL THE
+    #     SERVER": the socket is deliberately NOT unlinked while the server
+    #     is alive, only re-owned).
+    #
+    # Anything else -- still owned by `user`, some other mode, or an
+    # os.stat() failure that ISN'T "no such file" (e.g. a permissions
+    # problem walking /run/aigw-root-tmux/<user>/) -- means we could not
+    # confirm access was actually stripped, and this returns False for all
+    # of those cases alike. Fail closed: _revoke_access() below treats
+    # "couldn't confirm" the same as "confirmed still open".
+    sock_path = f"/run/aigw-root-tmux/{user}/sock"
+    try:
+        st = os.stat(sock_path)
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        log(f"_access_revoked({user}): could not stat {sock_path}, treating as not revoked: {e!r}")
+        return False
+    return st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o600
+
+
+def _revoke_access(user):
+    """THE "close the window without touching the tmux server" half of
+    2026-08-31's "SEVER ACCESS, DON'T KILL THE SERVER" decision (module
+    docstring). Runs aigw-root-tmux-grant --revoke, which -- for a
+    still-running tmux server -- chowns its socket back to root:root 0600
+    and pulls `user` off the server's own `server-access` list WITHOUT
+    unlinking the socket (unlinking a live server's socket would
+    permanently orphan it -- see the module docstring's 2026-08-31 bugfix
+    note under "SEVER ACCESS, DON'T KILL THE SERVER"); the socket is only
+    ever unlinked when the server itself has already stopped, in which case
+    there is nothing left to revoke access to anyway.
+
+    aigw-root-tmux-grant runs under `set -euo pipefail`, so ANY of its
+    intermediate steps failing (a `chown` hitting a filesystem hiccup, a
+    `tmux server-access -d` racing a server that exits mid-call, ...)
+    aborts the script wherever it happens to be, possibly BEFORE it reaches
+    the steps that actually strip access. A nonzero exit code is one signal
+    of that, but a zero exit code is not proof of the opposite either --
+    this function therefore never trusts the exit code alone. Instead it
+    re-checks the actual socket ownership/mode via _access_revoked() after
+    every attempt, retries once (short sleep in between) on either kind of
+    failure, and -- if access still cannot be confirmed revoked after
+    that -- falls back to _stop_unit(), which unconditionally ends the tmux
+    server and therefore ends access to it too, confirmed or not. That
+    fallback sacrifices a potentially-legitimate long-running root process
+    in exchange for never leaving this daemon believing a window is closed
+    while the socket says otherwise -- availability loses to safety here,
+    deliberately.
+
+    Idempotent either way (aigw-root-tmux-grant's own --revoke path already
+    tolerates "nothing to revoke", and _stop_unit() tolerates a unit that
+    isn't running).
+
+    Returns True if access was confirmed revoked (server, if any, left
+    running); False if it had to fall back to stopping the unit instead."""
+    for attempt in range(2):
+        r = subprocess.run([GRANT_SCRIPT, user, "--revoke"], capture_output=True, text=True)
+        if r.returncode != 0:
+            log(f"{GRANT_SCRIPT} {user} --revoke failed (rc={r.returncode}): {r.stderr.strip()}")
+        if _access_revoked(user):
+            return True
+        if attempt == 0:
+            time.sleep(0.5)
+    log(
+        f"_revoke_access({user}): could not confirm access was revoked after "
+        f"one retry, falling back to stopping the unit to close the window "
+        f"for certain"
+    )
+    _stop_unit(user)
+    return False
+
+
+def _start_unit(user):
+    # If the unit is already active -- which, since 2026-08-31, is the normal
+    # state of affairs for a user re-unlocking after their previous window's
+    # access was merely revoked rather than the server being stopped --
+    # `systemctl start` on an already-active unit is a documented no-op: it
+    # returns success without re-running ExecStartPost, so the grant script
+    # would never run again and the newly-reopened window would have no
+    # access to the server it's supposedly unlocking. Re-grant directly
+    # instead. Only fall through to an actual `systemctl start` (which runs
+    # ExecStart + ExecStartPost itself) when nothing is running yet -- the
+    # first-ever unlock, or after a host reboot.
+    if subprocess.run(["systemctl", "is-active", "--quiet", _unit(user)]).returncode == 0:
+        _grant_access(user)
+        return
+    r = subprocess.run(["systemctl", "start", _unit(user)], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"systemctl start {_unit(user)} failed (rc={r.returncode}): {r.stderr.strip()}")
+
+
+def _stop_unit(user):
+    # See module docstring's "Restart= ON aigw-root-tmux@.service" section:
+    # this unit runs with Restart=no (changed from on-failure specifically
+    # because of the SEVER-not-KILL design below), so an explicit `stop`
+    # here just ends the server -- there is no Restart=on-failure left to
+    # worry about tripping. Called from two places: verb_revoke_credential's
+    # own "kick them out and tear the server down right now" (an ordinary
+    # window close -- sweeper expiry, verb_lock -- uses _revoke_access
+    # instead and leaves the server running; see module docstring's "SEVER
+    # ACCESS, DON'T KILL THE SERVER"), and _revoke_access() itself, as the
+    # fail-safe fallback when it cannot confirm access was actually revoked.
+    r = subprocess.run(["systemctl", "stop", _unit(user)], capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"systemctl stop {_unit(user)} failed (rc={r.returncode}): {r.stderr.strip()}")
+
+
+# ---------------------------------------------------------------------------
+# Verbs
+# ---------------------------------------------------------------------------
+def verb_mint_registration_token(uid, pid, req):
+    """Required to make `aigw-passkey register <user>` work at all: the
+    token it prints has to come from somewhere, and the rule "only root can
+    authorize a passkey registration" is enforced
+    twice over for the "root" tier -- aigw-passkey's own cmd_register
+    refuses a non-root caller who asks for --tier root, and this verb
+    independently refuses any caller whose SO_PEERCRED uid isn't 0, so a
+    compromised aigw-backend (or a bug in aigw-passkey's own client-side
+    check, see that file's module docstring) can never mint a root-tier
+    registration token no matter what it sends over this socket. This is
+    the ONE verb where "who is allowed to call this at all" is no longer a
+    single answer -- see the tier-by-tier breakdown below.
+
+    Two-tier update: `tier` ("host" or "root") is now
+    required, and WHO may authorize minting a token depends on it --
+
+      * tier "root": peer uid must be 0. Exactly the original,
+        unconditional "only root can authorize a passkey
+        registration" rule, unchanged for this
+        tier, because root is what this whole system exists to gate.
+      * tier "host": peer uid must be 0 OR the target user's own uid. The
+        intended flow is the user themselves, having SSHed in, running
+        `aigw-passkey register <self> --tier host` -- SO_PEERCRED's uid
+        comes from the kernel at connect() time, so it is exactly the
+        proof a stolen web session cannot forge (a hijacked Cookie can
+        drive this user's aigw-backend over the web, but it cannot make
+        aigw-backend's Unix socket peer uid be anything other than what it
+        already is). Root may also mint a host-tier token for someone
+        else, same as it always could for the (then only) tier.
+
+    The tier is stored on the token record now, not supplied again later:
+    verb_finish_registration reads it back from here, never from anything
+    a caller sends at finish time -- see that function and the module
+    docstring's "TWO-TIER CREDENTIALS AND WINDOWS" section for why trusting
+    a client-supplied tier at finish would let a lower-privileged caller
+    mint their own token as "host" and then simply claim "root" when they
+    complete it."""
+    user = _field(req, "user")
+    tier = _validate_tier(_field(req, "tier"))
+    target_uid = _resolve_uid(user)
+    if tier == "root":
+        if uid != 0:
+            _audit("mint-registration-token", user, "denied", reason="not-root-for-root-tier", tier=tier, pid=pid)
+            raise PermissionError("root required to mint a root-tier registration token")
+    else:
+        if uid != 0 and uid != target_uid:
+            _audit("mint-registration-token", user, "denied", reason="not-root-or-self-for-host-tier", tier=tier, pid=pid)
+            raise PermissionError("root or the target user's own session is required to mint a host-tier registration token")
+    token = secrets.token_urlsafe(32)
+    expires_at = time.time() + REG_TOKEN_TTL
+    with _lock:
+        _reg_tokens[token] = {"user": user, "tier": tier, "expires_at": expires_at, "used": False}
+    invoked_by = _peer_sudo_user(pid) or f"uid:{uid}"
+    _audit("mint-registration-token", user, "ok", tier=tier, invoked_by=invoked_by, pid=pid)
+    return {"ok": True, "token": token, "tier": tier, "expires_at": int(expires_at)}
+
+
+def verb_begin_registration(uid, pid, req):
+    user = _field(req, "user")
+    token = _field(req, "token")
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+    with _lock:
+        rec = _reg_tokens.get(token)
+        valid = bool(
+            rec is not None
+            and not rec["used"]
+            and rec["user"] == user
+            and rec["expires_at"] > time.time()
+        )
+    if not valid:
+        _audit("begin-registration", user, "denied", reason="invalid-or-expired-token", pid=pid)
+        return {"ok": False, "error": "invalid or expired token"}
+    store = _load_creds(user)
+    # Full store, not tier-filtered: exclude_credentials exists so the same
+    # physical authenticator can't double-register, which applies equally
+    # regardless of which tier either registration is/was for.
+    existing = _attested_list(store["credentials"])
+    # id is the Unix username's own bytes, not a random opaque handle as
+    # strict WebAuthn best practice recommends -- acceptable simplification
+    # here because this whole system is already organized around Unix
+    # usernames end to end (GECOS-matched Google logins, per-user sockets,
+    # etc.), so there is no additional privacy exposure from using it as the
+    # WebAuthn user handle too.
+    user_entity = PublicKeyCredentialUserEntity(name=user, id=user.encode("utf-8"), display_name=user)
+    options, state = _fido_server.register_begin(
+        user_entity,
+        credentials=existing,  # -> exclude_credentials, so the same authenticator can't double-register
+        user_verification=UserVerificationRequirement.REQUIRED,
+        # Deliberately NOT restricted by authenticator_attachment.
+        #
+        # This was set to PLATFORM on 2026-08-30 to keep synced,
+        # password-manager-style passkeys out, after one enrolled fine (UV is
+        # enforced here by register_complete, and its registration really did
+        # report flags=0x5d with UV set) and then returned flags=0x19 --
+        # UP|BE|BS, UV *clear* -- on every single assertion, making it a
+        # credential that could never unlock anything.
+        #
+        # The restriction did not work, and the reason is worth recording:
+        # Windows surfaces a third-party/synced passkey provider through its
+        # own plugin-authenticator interface, so it is reported as "platform"
+        # too. Enrolling again after picking "Windows Hello" produced the
+        # exact same AAGUID (d3452668-01fd-4c12-926c-83a4204853aa, which is
+        # not the classic device-bound Windows Hello 08987058-...) and the
+        # same UV-less assertions -- even though the user was prompted for,
+        # and entered, a passphrase. That prompt unlocks the provider's own
+        # credential store; it is not signalled as WebAuthn user
+        # verification. So PLATFORM bought nothing here while ruling out the
+        # authenticators most likely to actually work (a phone over the
+        # cross-device/QR flow, or a PIN-protected security key).
+        #
+        # UV stays REQUIRED, here and in verb_finish_assertion, which is what
+        # actually keeps a presence-only authenticator out. That check is the
+        # security boundary; attachment never was.
+    )
+    with _lock:
+        _reg_states[token] = state
+    _audit("begin-registration", user, "ok", pid=pid)
+    options_dict = dict(options)
+    # Same fix as verb_begin_assertion's own
+    # (the deployment notes): this fido2 version never sets
+    # PublicKeyCredentialCreationOptions.timeout, so a stuck platform
+    # authenticator prompt would otherwise leave navigator.credentials.
+    # create() pending forever. 120s here rather than REG_TOKEN_TTL's full
+    # 5 minutes -- the token itself may sit unused for a while after the
+    # link is opened, but once the user actually starts the ceremony there
+    # is no reason to wait longer than a normal WebAuthn UX bound for it to
+    # settle one way or the other.
+    options_dict["publicKey"]["timeout"] = 120000
+    # fido2 builds excludeCredentials out of AttestedCredentialData, which
+    # carries no transports, so every descriptor it emits has `id` and
+    # nothing else -- the shape that hangs Android Chrome. Fill them in from
+    # the store (see _annotate_transports for the full failure mode).
+    _annotate_transports(
+        options_dict["publicKey"].get("excludeCredentials") or [],
+        store["credentials"],
+        default=LEGACY_EXCLUDE_TRANSPORTS,
+    )
+    return {"ok": True, "options": options_dict}
+
+
+def verb_finish_registration(uid, pid, req):
+    user = _field(req, "user")
+    token = _field(req, "token")
+    credential = _field(req, "credential")
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+
+    with _lock:
+        rec = _reg_tokens.get(token)
+        ok_token = bool(
+            rec is not None
+            and not rec["used"]
+            and rec["user"] == user
+            and rec["expires_at"] > time.time()
+        )
+        if rec is not None:
+            # Single-use: burn it now, before verification, regardless of
+            # outcome. A failed attempt must not leave the token usable for
+            # a second try -- that would turn "5-minute, single-use token"
+            # into "5-minute token, unlimited guesses".
+            rec["used"] = True
+        state = _reg_states.pop(token, None)
+
+    if not ok_token or state is None:
+        _audit("finish-registration", user, "denied", reason="invalid-or-expired-token", pid=pid)
+        return {"ok": False, "error": "invalid or expired token"}
+    # The tier this credential is enrolled as comes ONLY from the token
+    # record minted by verb_mint_registration_token -- never from anything
+    # in `req` -- so there is no field here a caller could set to claim a
+    # higher tier than mint-registration-token's own uid check already
+    # decided. `rec` is guaranteed non-None here because ok_token is True.
+    tier = rec["tier"]
+
+    try:
+        auth_data = _fido_server.register_complete(state, credential)
+        if not auth_data.is_user_verified():
+            # Belt and suspenders: Fido2Server.register_complete() already
+            # enforces this internally because we passed
+            # user_verification=REQUIRED into register_begin()'s state, but
+            # we re-check explicitly here too so this file stays auditable
+            # on its own (user-verification is required, mirrored in
+            # finish-assertion below).
+            raise ValueError("user verification flag not set")
+    except Exception as e:
+        _audit(
+            "finish-registration", user, "denied",
+            reason=f"verify-failed:{type(e).__name__}", pid=pid,
+        )
+        return {"ok": False, "error": "registration verification failed"}
+
+    cred_data = auth_data.credential_data
+    cred_id_str = websafe_encode(cred_data.credential_id)
+    store = _load_creds(user)
+    # Defensive de-dup in case the same credential id somehow reappears
+    # (shouldn't happen -- authenticators generate fresh ids -- but storing
+    # it twice would make _attested_list()/revoke ambiguous).
+    store["credentials"] = [c for c in store["credentials"] if c["id"] != cred_id_str]
+    store["credentials"].append(
+        {
+            "id": cred_id_str,
+            "attested_credential_data": base64.b64encode(bytes(cred_data)).decode("ascii"),
+            "aaguid": str(cred_data.aaguid),
+            "sign_count": auth_data.counter,
+            # BE (0x08), recorded at enrolment because it is the single best
+            # early warning that a credential may turn out to be unusable
+            # here. Set means backup-eligible, i.e. synced across a vendor
+            # account rather than bound to this device. Every credential that
+            # has so far enrolled cleanly and then failed every assertion
+            # with UV clear (2026-08-30) had it set. It is NOT a reliable
+            # rejection rule on its own -- a phone passkey used over the
+            # cross-device/QR flow is also backup-eligible and does perform
+            # user verification properly -- so this is surfaced in
+            # `aigw-passkey list` for a human to weigh, not enforced.
+            "backup_eligible": bool(int(auth_data.flags) & 0x08),
+            # What the authenticator said about how it can be reached
+            # (WebAuthn's getTransports(), carried in the registration
+            # response JSON). Stored so begin-registration can put it back
+            # on the excludeCredentials descriptors it hands the browser --
+            # without it, Android Chrome waits on the cross-device channel
+            # instead of prompting locally (_annotate_transports). Absent
+            # on anything enrolled before 2026-09-17; [] if the browser
+            # reported nothing usable.
+            "transports": _sanitize_transports(
+                (credential.get("response") or {}).get("transports")
+                if isinstance(credential, dict)
+                else None
+            ),
+            "created_at": _now_iso(),
+            # "host" or "root" -- see verb_mint_registration_token for who
+            # was allowed to pick this, and _credential_tier() for how a
+            # record that somehow lacked this field would be read (as
+            # "host", never "root"). Always present on a credential
+            # enrolled through this code path; only ever absent on a
+            # credential enrolled before this change.
+            "tier": tier,
+        }
+    )
+    _save_creds(user, store)
+    # Record the same flags byte verb_finish_assertion logs on a UV denial,
+    # so the two are directly comparable. On 2026-08-30 a provider registered
+    # cleanly here (fido2's register_complete enforces UV, so UV really was
+    # set at this moment) and then returned flags=0x19 -- UP|BE|BS, UV clear
+    # -- on every subsequent assertion, leaving a credential that could never
+    # unlock anything. Without the registration-side flags there is no way to
+    # tell that apart from "the user just declined the prompt this time".
+    #
+    # BE (0x08) is the one worth watching: it means a backup-eligible, i.e.
+    # synced, credential, which is also the class this went wrong in. It is
+    # deliberately NOT a hard refusal yet -- on current Windows even a real
+    # Windows Hello credential may be synced to a Microsoft account, so
+    # rejecting BE outright could leave a user with no way to enrol at all.
+    # Log it, see what genuine Windows Hello / Touch ID enrolments actually
+    # report here, then decide.
+    _audit(
+        "finish-registration", user, "ok", credential_id=cred_id_str, tier=tier,
+        flags=f"0x{int(auth_data.flags):02x}",
+        uv=auth_data.is_user_verified(), backup_eligible=bool(int(auth_data.flags) & 0x08),
+        aaguid=str(cred_data.aaguid), pid=pid,
+    )
+    return {"ok": True, "credential_id": cred_id_str, "tier": tier}
+
+
+def verb_begin_assertion(uid, pid, req):
+    """`tier` says what the caller is trying to unlock
+    for -- "root" (wants a root-tier window) or "host" (host-tier is
+    enough). allowCredentials is filtered to exactly the credentials that
+    COULD satisfy that tier (_creds_for_tier: root-tier only for a "root"
+    request, everything for a "host" request), for two reasons: so a user
+    holding both kinds is prompted with the right key instead of a
+    confusing "wrong credential" failure, and so the SAME filtered set,
+    remembered here in _assert_states, is what verb_finish_assertion
+    cryptographically verifies against -- see the module docstring's
+    "TWO-TIER CREDENTIALS AND WINDOWS" section for why that second part is
+    the one that actually matters for security, not just UX."""
+    user = _field(req, "user")
+    tier = _validate_tier(_field(req, "tier"))
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+    store = _load_creds(user)
+    candidates = _creds_for_tier(store["credentials"], tier)
+    existing = _attested_list(candidates)
+    if not existing:
+        _audit("begin-assertion", user, "denied", reason="no-credentials-for-tier", tier=tier, pid=pid)
+        return {"ok": False, "error": f"no {tier}-tier credential registered for this user"}
+    options, state = _fido_server.authenticate_begin(
+        credentials=existing,
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    with _lock:
+        _assert_states[user] = (state, time.time() + CHALLENGE_TTL, tier)
+    _audit("begin-assertion", user, "ok", tier=tier, pid=pid)
+    options_dict = dict(options)
+    # This installed fido2 version's Fido2Server hardcodes self.timeout =
+    # None (no constructor knob for it), so authenticate_begin() never sets
+    # PublicKeyCredentialRequestOptions.timeout -- the wire "options" here
+    # has no "timeout" key at all, and navigator.credentials.get() falls
+    # back to the browser's own (unspecified, observed effectively
+    # unbounded on at least one real device) default. Reported live
+    # 2026-09-17: a stuck platform-authenticator prompt left that call
+    # permanently pending, so every retry's own credentials.get() failed
+    # with "OperationError: A request is already pending" instead of ever
+    # reaching finish-assertion. Setting an explicit bound (milliseconds,
+    # matching CHALLENGE_TTL so the browser and this file's own state both
+    # give up around the same time) makes the browser eventually settle the
+    # promise on its own instead of hanging forever.
+    options_dict["publicKey"]["timeout"] = CHALLENGE_TTL * 1000
+    # Same missing-transports hint as begin-registration's, on the
+    # allowCredentials side. Still no flat `default=` here -- for an
+    # assertion a wrong guess locks the user out rather than merely costing
+    # a duplicate enrolment (_annotate_transports' docstring). But a
+    # credential recorded with backup_eligible=False (WebAuthn's BE flag,
+    # captured at registration in verb_finish_registration) is KNOWN, not
+    # guessed, to be device-bound -- there is no roaming/hybrid path it
+    # could be hiding, so annotating it "internal" carries none of that
+    # risk. Only fills in credentials that recorded no transports of their
+    # own AND are confirmed device-bound this way; a synced credential
+    # (backup_eligible True) or one whose BE flag was never recorded
+    # (older than that too) still gets no guess and keeps today's
+    # try-everything fallback. Reported live 2026-09-17: even after the
+    # registration-side fix, an existing device-bound credential's own
+    # assertion could still hang the same way, since allowCredentials had
+    # no transports hint for anything enrolled before this file recorded
+    # them.
+    annotated_candidates = [
+        {**c, "transports": c.get("transports") or ["internal"]}
+        if c.get("backup_eligible") is False and not c.get("transports")
+        else c
+        for c in candidates
+    ]
+    _annotate_transports(
+        options_dict["publicKey"].get("allowCredentials") or [],
+        annotated_candidates,
+    )
+    return {"ok": True, "options": options_dict}
+
+
+def verb_finish_assertion(uid, pid, req):
+    user = _field(req, "user")
+    credential = _field(req, "credential")
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+
+    with _lock:
+        entry = _assert_states.pop(user, None)
+    if entry is None:
+        _audit("finish-assertion", user, "denied", reason="no-pending-challenge", pid=pid)
+        return {"ok": False, "error": "no pending assertion"}
+    state, expires_at, requested_tier = entry
+    if time.time() > expires_at:
+        _audit("finish-assertion", user, "denied", reason="challenge-expired", pid=pid)
+        return {"ok": False, "error": "challenge expired"}
+
+    store = _load_creds(user)
+    # The SAME tier-filtered candidate set verb_begin_assertion computed and
+    # remembered for this challenge (`requested_tier`, from _assert_states --
+    # never anything this request itself carries). This is what actually
+    # enforces "an assertion must not cross tiers":
+    # allowCredentials in the options sent to the browser is only ever a
+    # hint the client is trusted to honor, so if this file re-read the tier
+    # from `req` here, or re-derived "all credentials" instead of the
+    # tier-filtered set, a client that ignored allowCredentials (or a bug/
+    # compromise in the web tier relaying this call) could get a host-tier
+    # credential accepted for a root-tier request. Restricting the actual
+    # cryptographic candidate list passed to authenticate_complete() below
+    # to exactly what was authorized at begin-assertion time closes that.
+    candidates = _creds_for_tier(store["credentials"], requested_tier)
+    existing = _attested_list(candidates)
+    if not existing:
+        _audit("finish-assertion", user, "denied", reason="no-credentials-for-tier", tier=requested_tier, pid=pid)
+        return {"ok": False, "error": f"no {requested_tier}-tier credential registered for this user"}
+
+    try:
+        parsed = AuthenticationResponse.from_dict(credential)
+    except Exception:
+        _audit("finish-assertion", user, "denied", reason="malformed-credential", pid=pid)
+        return {"ok": False, "error": "malformed credential"}
+
+    ad = parsed.response.authenticator_data
+    # Explicit, code-visible UV check: asking the client
+    # for userVerification="required" is not enough on its own -- a buggy or
+    # compromised web tier could relay a credential.get() result where the
+    # authenticator only asserted presence, not verification. We check the
+    # authData flag ourselves here, in addition to Fido2Server verifying the
+    # same flag again internally in authenticate_complete() below (because
+    # we pass user_verification=REQUIRED into authenticate_begin()'s state).
+    # Confirmed against fido2 2.2.1's actual source (webauthn.py
+    # AuthenticatorData.is_user_verified(), server.py authenticate_complete).
+    if not ad.is_user_verified():
+        # Record the raw flags byte, not just "UV was missing". These flags
+        # are the only evidence of what the authenticator actually did, they
+        # are not secret (they ride in every assertion in the clear), and
+        # without them a denial here is indistinguishable between "the user
+        # dismissed the biometric prompt", "this authenticator never does UV",
+        # and "we are looking at the wrong bytes". UP=0x01 UV=0x04 BE=0x08
+        # BS=0x10 AT=0x40 ED=0x80; a synced platform passkey that verified
+        # normally reads 0x1d (UP|UV|BE|BS).
+        # Which credential answered matters as much as the flags. This check
+        # runs before authenticate_complete(), so nothing has yet confirmed
+        # the assertion even came from a credential we know about -- and a
+        # device typically still holds passkeys for this RP that were revoked
+        # server-side (revoking here cannot delete anything from the
+        # authenticator). Logging the id presented is what distinguishes "the
+        # credential we just enrolled does not do UV on get()" from "the
+        # browser offered a stale passkey instead of the new one", which are
+        # the same message to the user and completely different problems.
+        try:
+            presented = websafe_encode(parsed.raw_id)
+        except Exception:
+            presented = "<unreadable>"
+        known = [c["id"] for c in store["credentials"]]
+        _audit(
+            "finish-assertion", user, "denied", reason="uv-flag-not-set",
+            flags=f"0x{int(ad.flags):02x}", up=ad.is_user_present(),
+            presented_credential=presented,
+            is_enrolled=presented in known, enrolled_count=len(known), pid=pid,
+        )
+        return {"ok": False, "error": "user verification flag not set"}
+
+    try:
+        matched = _fido_server.authenticate_complete(state, existing, credential)
+    except Exception as e:
+        _audit(
+            "finish-assertion", user, "denied",
+            reason=f"verify-failed:{type(e).__name__}", pid=pid,
+        )
+        return {"ok": False, "error": "assertion verification failed"}
+
+    cred_id_str = websafe_encode(matched.credential_id)
+    new_count = ad.counter
+    stored_entry = next((c for c in store["credentials"] if c["id"] == cred_id_str), None)
+    if stored_entry is None:
+        # Shouldn't happen -- `matched` came from `existing`, which came
+        # from `store` a few lines up -- but fail closed rather than assume.
+        _audit("finish-assertion", user, "denied", reason="credential-vanished", pid=pid)
+        return {"ok": False, "error": "internal error"}
+
+    old_count = stored_entry.get("sign_count", 0)
+    # signCount regression check: a counter that goes
+    # backwards, or repeats a nonzero value, means either a replayed
+    # authenticator response or a cloned authenticator secret -- reject.
+    # Many platform authenticators (Touch ID, Windows Hello, and most phone
+    # passkey implementations) always report 0 and never increment it;
+    # treat 0-vs-0 as "this authenticator doesn't use a counter" rather than
+    # a regression, or every such passkey would become permanently unusable
+    # after its very first successful assertion.
+    if not (new_count == 0 and old_count == 0) and new_count <= old_count:
+        _audit(
+            "finish-assertion", user, "denied",
+            reason=f"signcount-regression:{old_count}->{new_count}",
+            credential_id=cred_id_str, pid=pid,
+        )
+        return {"ok": False, "error": "signature counter regression"}
+
+    stored_entry["sign_count"] = new_count
+    _save_creds(user, store)
+
+    # The window's tier is the tier of the credential that ACTUALLY
+    # verified -- read from the stored record, never from the client's
+    # request -- not `requested_tier`. Those
+    # agree whenever requested_tier was "root" (only root-tier credentials
+    # were ever candidates), but for a "host" request `existing` included
+    # every credential, so a user who happens to authenticate with their
+    # root-tier credential to satisfy a mere host-tier request gets the
+    # root-tier window their credential actually proves they hold, not a
+    # host-tier window that would understate it.
+    credential_tier = _credential_tier(stored_entry)
+
+    window_start = time.time()
+    window_expires_at = window_start + UNLOCK_TTL
+    with _lock:
+        _unlocks[user] = (window_start, window_expires_at, credential_tier)
+    # THE single most important line in this whole daemon: a
+    # root shell is granted -- systemctl start aigw-root-tmux@<user> -- if
+    # and only if the credential that just verified is root tier. A
+    # host-tier assertion opens its window (above) exactly like before, but
+    # never reaches this call, so it can never produce a root pane no
+    # matter what location a compromised or buggy caller later claims.
+    if credential_tier == "root":
+        _start_unit(user)
+    _audit(
+        "finish-assertion", user, "ok", tier=credential_tier,
+        credential_id=cred_id_str, expires_at=int(window_expires_at), pid=pid,
+    )
+    return {"ok": True, "expires_at": int(window_expires_at), "tier": credential_tier}
+
+
+def verb_status(uid, pid, req):
+    """Read-only: does NOT extend the unlock window (see `touch` for that).
+    Safe for a UI to poll every few seconds to show a countdown of the
+    window's remaining time without that polling itself
+    keeping the window open forever."""
+    user = _field(req, "user")
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+    now = time.time()
+    with _lock:
+        entry = _unlocks.get(user)
+    unlocked = entry is not None and entry[1] > now
+    # `enrolled` (any tier) is what lets a UI offer a sandbox-outside action
+    # while the window is *closed*. Without it the frontend has only
+    # root_shell_allowed() -- "does the root tmux socket exist right now" --
+    # which after this design is true only while unlocked, so the
+    # host/root-shell presets would be hidden exactly when the user needs
+    # to tap one to start an unlock, and could never be reached at all
+    # (observed 2026-08-30: the option simply never appeared). Deliberately
+    # a plain boolean, not the credential list: a UI needs "could this
+    # person unlock" and nothing more.
+    #
+    # `enrolled_root` is the two-tier addition: the UI
+    # must tell "enrolled for host" apart from "enrolled for root", because
+    # only the latter should ever cause the root-shell menu entry (and the
+    # root Claude-auth row, and Kill Chrome) to appear at all -- offering
+    # root-shell to someone who can only ever open a host-tier window would
+    # show a button that begin-assertion(tier=root) will always refuse for
+    # ("no root-tier credential registered for this user"), or worse, would
+    # be the only place left where a maximally strict reading of the tier
+    # boundary is enforced solely by the frontend rather than surfaced by
+    # this daemon's own answer.
+    store = _load_creds(user)
+    enrolled = bool(_attested_list(store["credentials"]))
+    enrolled_root = bool(_attested_list(_creds_for_tier(store["credentials"], "root")))
+    return {
+        "ok": True,
+        "unlocked": unlocked,
+        "expires_at": int(entry[1]) if unlocked else None,
+        # The open window's own tier, or None while locked -- lets a UI
+        # that cares (e.g. distinguishing "unlocked for host only" from
+        # "unlocked for root") do so without a second round trip. Backend/
+        # frontend code that doesn't care can simply ignore this field, same
+        # as it already ignores fields it doesn't use elsewhere in this
+        # reply.
+        "tier": entry[2] if unlocked else None,
+        "enrolled": enrolled,
+        "enrolled_root": enrolled_root,
+    }
+
+
+def verb_touch(uid, pid, req):
+    """The "idle-extending" half of the 15-minute window. A dedicated verb
+    rather than extend-on-status, so that passively polling `status` for a
+    UI countdown can never itself keep a window open. The intended caller
+    is aigw-backend, once per actual sandbox-outside action (send_message,
+    send_key, claude_auth_*, chrome_kill, ... -- whatever single choke
+    point a caller uses to gate those actions on an open unlock window),
+    not a timer.
+
+    `_sweeper()` separately re-extends every open window on its own timer
+    now too (2026-08-31, module docstring's "A WINDOW MERELY BEING OPEN NOW
+    COUNTS AS ACTIVITY") -- that does not make this verb redundant, it is
+    still what lets a real action push a window's `expires_at` further out
+    than the sweeper's own last tick would have.
+
+    Extension is capped at `unlocked_at + UNLOCK_ABSOLUTE_MAX`, never just
+    "now + UNLOCK_TTL" unconditionally -- see the module docstring's "WHY
+    `touch` HAS AN ABSOLUTE CAP" section for why an uncapped idle extension
+    would let any process running as this user keep a hijacked window open
+    indefinitely.
+
+    `tier` is the tier the caller's action actually
+    needs -- aigw-backend's require_unlock_if_outside_sandbox() derives it
+    from `location` ("root" -> "root", "host" -> "host", anything else that
+    reaches this point -> "root", fail closed) and sends it on every touch
+    call. A window whose own tier does not satisfy the requested tier
+    (_tier_satisfies) is treated exactly like "not unlocked" for THIS
+    request -- denied, and, just as importantly, left completely alone:
+    neither extended nor revoked. Extending a host-tier window because a
+    root-tier action was attempted against it would let a lesser credential
+    ride along on a root action's occurrence; revoking it would let a mere
+    attempt at the wrong tier end a legitimately open, correctly-scoped
+    host session out from under whoever is using it for host actions
+    elsewhere. Denying this one request and changing nothing else is the
+    only option that is safe in both directions. `touch` must not
+    change a window's tier: a satisfied check never
+    changes the stored tier either, whether or not it was the tier that
+    happened to satisfy the request."""
+    user = _field(req, "user")
+    tier = _validate_tier(_field(req, "tier"))
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+    now = time.time()
+    deny_reason = None
+    with _lock:
+        entry = _unlocks.get(user)
+        if entry is None or entry[1] <= now:
+            deny_reason = "not-unlocked"
+        elif not _tier_satisfies(entry[2], tier):
+            deny_reason = "insufficient-tier"
+        else:
+            unlocked_at, _current_expires_at, window_tier = entry
+            new_expires_at = min(now + UNLOCK_TTL, unlocked_at + UNLOCK_ABSOLUTE_MAX)
+            if new_expires_at <= now:
+                # The absolute cap has already been reached even though the
+                # short TTL hadn't yet ticked over. Shouldn't happen given
+                # the invariant this function maintains (new_expires_at is
+                # always <= unlocked_at + UNLOCK_ABSOLUTE_MAX), but fail
+                # closed and drop the window rather than assume.
+                del _unlocks[user]
+                deny_reason = "absolute-max-reached"
+            else:
+                # `window_tier`, unchanged -- see this function's own
+                # docstring for why touch must never alter it.
+                _unlocks[user] = (unlocked_at, new_expires_at, window_tier)
+    if deny_reason:
+        _audit("touch", user, "denied", reason=deny_reason, tier=tier, pid=pid)
+        error = {
+            "not-unlocked": "not unlocked",
+            "insufficient-tier": f"unlocked, but not for {tier} -- re-authenticate with a {tier}-tier passkey",
+            "absolute-max-reached": "unlock window's absolute lifetime reached -- re-authenticate",
+        }[deny_reason]
+        return {"ok": False, "error": error}
+    with _lock:
+        new_expires_at = _unlocks[user][1]
+    _audit("touch", user, "ok", tier=tier, expires_at=int(new_expires_at), pid=pid)
+    return {"ok": True, "expires_at": int(new_expires_at)}
+
+
+def verb_lock(uid, pid, req):
+    user = _field(req, "user")
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+    with _lock:
+        was_unlocked = _unlocks.pop(user, None) is not None
+    # Revokes access, does not stop the tmux server -- see module docstring's
+    # "SEVER ACCESS, DON'T KILL THE SERVER". Idempotent even if access was
+    # already revoked. `revoked` is False only if _revoke_access() could not
+    # confirm the revoke and had to fall back to _stop_unit() -- the window
+    # is closed either way, but the audit trail needs to say which path it
+    # took rather than always claiming the clean one.
+    revoked = _revoke_access(user)
+    if revoked:
+        _audit("lock", user, "ok", was_unlocked=was_unlocked, pid=pid)
+    else:
+        _audit(
+            "lock", user, "failed", was_unlocked=was_unlocked, pid=pid,
+            reason="revoke-unverified-stopped-unit",
+        )
+    # Always {"ok": True} regardless of which path closed the window: from
+    # the caller's point of view this always succeeds -- either the
+    # ordinary revoke was confirmed, or _revoke_access() already fell back
+    # to stopping the unit outright. Either way the window is closed by the
+    # time this returns; the "failed" outcome above is for the audit trail,
+    # not the caller.
+    return {"ok": True}
+
+
+def verb_list_credentials(uid, pid, req):
+    """`aigw-passkey list [<user>]`, from root OR
+    ("non-root may operate on themselves only") the named user's own
+    session. Listing a SPECIFIC user's credentials is exactly what
+    _require_peer_is_user_or_root already exists for -- root, or that
+    user's own uid; listing EVERY user (no "user" field given at all) stays
+    root-only regardless, since that is not "operating on yourself" for
+    anyone but root itself. Never echoes the stored
+    attested_credential_data blob back over the wire -- it isn't secret
+    (it's a public key), but there is no reason to move it around beyond
+    where it's actually needed."""
+    user = req.get("user")
+    if user:
+        _resolve_uid(user)
+        _require_peer_is_user_or_root(uid, user)
+        users = [user]
+    else:
+        if uid != 0:
+            raise PermissionError("root required to list all users")
+        users = sorted(p.stem for p in CRED_DIR.glob("*.json")) if CRED_DIR.exists() else []
+    out = {}
+    for u in users:
+        store = _load_creds(u)
+        out[u] = [
+            {
+                "id": c["id"],
+                "aaguid": c.get("aaguid"),
+                "created_at": c.get("created_at"),
+                "sign_count": c.get("sign_count", 0),
+                # Absent (-> None, shown as "?") for anything enrolled before
+                # this was recorded; aigw-passkey renders all three states.
+                "backup_eligible": c.get("backup_eligible"),
+                # Absent (-> None) for a pre-2026-09-17 credential, [] for
+                # one whose browser reported nothing -- worth telling apart
+                # when a registration hangs on Android.
+                "transports": c.get("transports"),
+                # _credential_tier(), not the raw c.get("tier") -- a listing
+                # must show exactly the tier this credential is actually
+                # treated as (fail-safe "host" default and all), not the
+                # raw stored field, or a human reading `aigw-passkey list`
+                # could be misled by a record that happens to have no tier
+                # key into thinking it shows nothing / is broken, rather
+                # than "this is a pre-two-tier credential, currently host".
+                "tier": _credential_tier(c),
+            }
+            for c in store.get("credentials", [])
+        ]
+    return {"ok": True, "credentials": out}
+
+
+def verb_revoke_credential(uid, pid, req):
+    """`aigw-passkey revoke <user> <cred-id>`, from root or
+    that user's own session -- same _require_peer_is_user_or_root
+    rule as list/status/lock/touch. Revoking your OWN credential, of
+    whichever tier, is self-management, not a privilege grant, so this is
+    deliberately not root-only the way minting a root-tier registration
+    token is (verb_mint_registration_token) -- there is no way revoking a
+    credential you already hold could ever grant you anything you don't
+    already have."""
+    user = _field(req, "user")
+    credential_id = _field(req, "credential_id")
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+    store = _load_creds(user)
+    before = len(store["credentials"])
+    store["credentials"] = [c for c in store["credentials"] if c["id"] != credential_id]
+    if len(store["credentials"]) == before:
+        _audit(
+            "revoke-credential", user, "denied",
+            reason="no-such-credential", credential_id=credential_id, pid=pid,
+        )
+        return {"ok": False, "error": "no such credential"}
+    _save_creds(user, store)
+    # Revoking a credential is a "kick them out and tear it down right now"
+    # action -- unlike an ordinary window close (sweeper expiry, verb_lock;
+    # see module docstring's "SEVER ACCESS, DON'T KILL THE SERVER"), this one
+    # really does stop the tmux server, not just revoke access to it: the
+    # credential that could have re-authorized this user is itself gone, so
+    # there is no legitimate way left for them to reopen this window, and no
+    # reason to let whatever was running in it keep running unattended.
+    with _lock:
+        was_unlocked = _unlocks.pop(user, None) is not None
+    _stop_unit(user)
+    invoked_by = _peer_sudo_user(pid) or f"uid:{uid}"
+    _audit(
+        "revoke-credential", user, "ok", credential_id=credential_id,
+        invoked_by=invoked_by, also_locked=was_unlocked, pid=pid,
+    )
+    return {"ok": True}
+
+
+_VERBS = {
+    "mint-registration-token": verb_mint_registration_token,
+    "begin-registration": verb_begin_registration,
+    "finish-registration": verb_finish_registration,
+    "begin-assertion": verb_begin_assertion,
+    "finish-assertion": verb_finish_assertion,
+    "status": verb_status,
+    "touch": verb_touch,
+    "lock": verb_lock,
+    "list-credentials": verb_list_credentials,
+    "revoke-credential": verb_revoke_credential,
+}
+
+
+# ---------------------------------------------------------------------------
+# Background sweeper: closes unlock windows whose TTL has elapsed, and (since
+# 2026-08-31, see the module docstring's "A WINDOW MERELY BEING OPEN NOW
+# COUNTS AS ACTIVITY" section) slides every other still-open window's TTL
+# forward first -- being open is itself now the activity signal, `touch`
+# calls from real actions are no longer the only thing keeping one alive.
+# Closing an expired window is still done by this daemon managing its own
+# timer, chosen over RuntimeMaxSec=
+# specifically so a TTL expiry is an explicit `systemctl stop` (see module
+# docstring) rather than something systemd itself times out and treats as a
+# failure.
+# ---------------------------------------------------------------------------
+def _sweeper():
+    while True:
+        time.sleep(SWEEP_INTERVAL)
+        now = time.time()
+        expired = []
+        with _lock:
+            for user, entry in list(_unlocks.items()):
+                unlocked_at, expires_at, tier = entry
+                if expires_at <= now:
+                    del _unlocks[user]
+                    expired.append(user)
+                    continue
+                # Same formula verb_touch uses, still capped at the absolute
+                # ceiling -- once that ceiling is behind `now`, this stops
+                # extending and a later sweep's `expires_at <= now` check
+                # above closes the window like any other expiry.
+                new_expires_at = min(now + UNLOCK_TTL, unlocked_at + UNLOCK_ABSOLUTE_MAX)
+                if new_expires_at > expires_at:
+                    _unlocks[user] = (unlocked_at, new_expires_at, tier)
+        for user in expired:
+            # See verb_lock's own comment on the same pattern: `revoked` is
+            # False only when _revoke_access() had to fall back to
+            # _stop_unit() because it could not confirm the ordinary revoke
+            # took effect -- reflect that in the audit trail rather than
+            # always logging "ok".
+            revoked = _revoke_access(user)
+            if revoked:
+                _audit("expire", user, "ok")
+            else:
+                _audit("expire", user, "failed", reason="revoke-unverified-stopped-unit")
+
+
+# ---------------------------------------------------------------------------
+# Startup reconciliation -- see the module docstring's "RECONCILE ON
+# STARTUP" section for why this must run before the listening socket opens.
+# ---------------------------------------------------------------------------
+def _reconcile_orphaned_units():
+    """_unlocks is always empty the instant this process starts (in-memory
+    only). Any aigw-root-tmux@<user>.service that is already running at
+    that moment cannot have been started by, or be tracked by, this process
+    instance -- by definition it is orphaned, almost certainly because
+    aigw-unlockd itself was restarted (crash, `systemctl restart`, a
+    deploy) while a window was open, OR (2026-08-31 onward, the normal case
+    now) because a previous window's access was revoked without stopping the
+    server, and it has simply kept running since. Revoke access to every one
+    of them before this daemon starts accepting requests, so a restart --
+    an ordinary operational event, not an edge case -- cannot silently leave
+    root open with nothing left enforcing the TTL.
+
+    Deliberately revoke, not stop (module docstring's "SEVER ACCESS, DON'T
+    KILL THE SERVER"): a unit found running here is, under the current
+    design, expected to still be running whether or not it currently has
+    live access granted, so treating "found running at startup" as grounds
+    to kill it would defeat the entire point of that decision on every
+    aigw-unlockd restart. Revoking is idempotent and safe to call
+    unconditionally either way -- if access was already revoked, this is a
+    no-op; if a window was open when this process died, this closes exactly
+    the gap the old `stop` used to close, without the collateral damage.
+    _revoke_access() itself still verifies the revoke actually took (see
+    that function) and falls back to stopping the unit if it can't confirm
+    that -- so even here, "revoke" only stays a revoke as long as it can be
+    proven to have worked.
+    """
+    try:
+        r = subprocess.run(
+            [
+                "systemctl", "list-units",
+                "--type=service",
+                # "running" alone misses a unit that is currently
+                # "activating (auto-restart)" -- systemd's state while it is
+                # sitting in a RestartSec= backoff waiting to relaunch after
+                # a crash, before the process is actually up again. A unit
+                # in that state is invisible to this scan; if its restart
+                # then completes (ExecStartPost re-running
+                # aigw-root-tmux-grant) in the gap between this scan and the
+                # daemon opening its listening socket, it grants access with
+                # no unlock window behind it and this reconcile pass never
+                # sees it to revoke. "active,activating" covers both states.
+                "--state=active,activating",
+                "--no-legend", "--plain", "aigw-root-tmux@*.service",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        # Can't ask systemd right now -- log loudly rather than silently
+        # skip reconciliation, but don't block startup on it either (a
+        # human can always run `aigw-passkey lock <user>` by hand).
+        log(f"reconcile: could not list running aigw-root-tmux@ units, continuing without reconciling: {e!r}")
+        return
+    if r.returncode != 0:
+        log(f"reconcile: systemctl list-units exited {r.returncode}: {r.stderr.strip()}")
+        # Fall through anyway: a nonzero exit with no matching units is a
+        # normal outcome for some systemctl versions when the glob matches
+        # nothing. r.stdout is inspected below regardless.
+
+    for line in r.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        unit = fields[0]
+        if not (unit.startswith("aigw-root-tmux@") and unit.endswith(".service")):
+            continue
+        user = unit[len("aigw-root-tmux@"):-len(".service")] or "?"
+        # See verb_lock's own comment on the same pattern: `revoked` is
+        # False only when _revoke_access() had to fall back to
+        # _stop_unit() because it could not confirm the ordinary revoke
+        # took effect -- reflect that in the audit trail rather than
+        # always logging "ok".
+        revoked = _revoke_access(user)
+        if revoked:
+            _audit(
+                "reconcile", user, "ok",
+                reason="orphaned-unit-found-running-at-startup",
+            )
+        else:
+            _audit(
+                "reconcile", user, "failed",
+                reason="orphaned-unit-found-running-at-startup-revoke-unverified-stopped-unit",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Unix socket server
+# ---------------------------------------------------------------------------
+def _peer_creds(conn):
+    data = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    pid, uid, gid = struct.unpack("3i", data)
+    return pid, uid, gid
+
+
+def _respond(f, resp):
+    f.write((json.dumps(resp) + "\n").encode("utf-8"))
+    f.flush()
+
+
+def _handle_conn(conn):
+    try:
+        pid, uid, _gid = _peer_creds(conn)
+    except OSError as e:
+        log(f"could not read SO_PEERCRED, dropping connection: {e!r}")
+        conn.close()
+        return
+
+    f = conn.makefile("rwb")
+    try:
+        while True:
+            raw = f.readline()
+            if not raw:
+                break
+            raw = raw.strip()
+            if not raw:
+                continue
+
+            try:
+                req = json.loads(raw)
+                if not isinstance(req, dict):
+                    raise BadRequest("request must be a JSON object")
+                verb = req.get("verb")
+                if not isinstance(verb, str) or verb not in _VERBS:
+                    raise BadRequest("unknown verb")
+            except json.JSONDecodeError:
+                _respond(f, {"ok": False, "error": "malformed request"})
+                continue
+            except BadRequest as e:
+                _respond(f, {"ok": False, "error": str(e)})
+                continue
+
+            try:
+                resp = _VERBS[verb](uid, pid, req)
+            except PermissionError:
+                resp = {"ok": False, "error": "permission denied"}
+            except BadRequest as e:
+                resp = {"ok": False, "error": str(e)}
+            except Exception as e:
+                # Fail closed, and never leak internals (a stack trace, a
+                # library exception message that might embed a path or a
+                # partial secret) back over the wire -- only into the local
+                # journal via log().
+                log(f"unhandled error handling verb={verb!r}: {e!r}")
+                resp = {"ok": False, "error": "internal error"}
+
+            _respond(f, resp)
+    finally:
+        conn.close()
+
+
+def main():
+    if os.geteuid() != 0:
+        log("must run as root (it starts/stops aigw-root-tmux@<user>.service and owns /etc/aigw/passkeys)")
+        sys.exit(1)
+
+    CRED_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(CRED_DIR, 0o700)
+
+    # Must run before the socket below is opened -- see module docstring's
+    # "RECONCILE ON STARTUP": until this returns, _unlocks is empty, so any
+    # aigw-root-tmux@<user> unit found running here is unconditionally
+    # orphaned and gets stopped.
+    _reconcile_orphaned_units()
+
+    if os.path.exists(SOCK_PATH):
+        os.unlink(SOCK_PATH)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK_PATH)
+    # 0666 is deliberate, not a bug -- see the module docstring's "SOCKET
+    # PERMISSIONS ARE NOT THE SECURITY BOUNDARY HERE" section.
+    os.chmod(SOCK_PATH, 0o666)
+    srv.listen(16)
+
+    threading.Thread(target=_sweeper, daemon=True).start()
+    log(f"listening on {SOCK_PATH}, rp_id={RP_ID}, origin={ORIGIN}")
+
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=_handle_conn, args=(conn,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+[Unit]
+Description=Per-user aigw backend for %i (AF_UNIX socket, mobile AI control panel)
+
+[Service]
+Type=simple
+User=%i
+# Shared SSH ControlMaster socket dir for the ssh:<machine> locations (see
+# the deployment notes) -- 1777 like /tmp because every aigw-backend@
+# <user> (a different Unix user each) needs to create its own socket here.
+# "+" runs this one line as root regardless of User= above.
+ExecStartPre=+/usr/bin/install -d -m 1777 -o root -g root /run/aigw-ssh-mux
+# /run/aigw-backend/ (the deployment notes -- see aigw-backend's own
+# BACKEND_SOCKET_PATH comment for why a loopback TCP port became this)
+# holds every user's aigw-backend AF_UNIX socket AND
+# aigw-backend-proxy@.socket's own per-port activation sockets. It is
+# NOT created here: aigw-backend-proxy@<port>.socket binds its half at boot
+# (WantedBy=sockets.target), independently of whether any
+# aigw-backend@<user>.service has ever run, so an ExecStartPre on *this*
+# unit would not exist yet the first time that happens. See
+# /etc/tmpfiles.d/aigw-backend.conf instead, which systemd-tmpfiles creates
+# during early boot for exactly this reason (same reasoning as
+# aigw-root-tmux@.service's own ExecStartPre, just needed even earlier here).
+ExecStart=/usr/local/sbin/aigw-backend
+Restart=on-failure
+RestartSec=2

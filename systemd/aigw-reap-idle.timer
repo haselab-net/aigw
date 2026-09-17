@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically stop idle per-user aigw backend instances
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,81 @@
+#!/bin/bash
+# Invoked per-connection by aigw-backend-proxy@<conn>.socket (Accept=yes socket
+# activation), mirroring chromedbg-proxy-handler. The connected socket arrives
+# on fd 3; %i under Accept=yes is a per-connection descriptor, not the
+# original listening socket's own instance name -- confirmed 2026-08-30 by
+# watching a live instance name while this was still TCP:
+# "aigw-backend-proxy@37-127.0.0.1:21001-127.0.0.1:42278.service", a
+# connection tuple, not "21001" -- so we read the actual listening address
+# directly off fd 3 via getsockname() instead. That used to return a TCP
+# (host, port) tuple; now that the activation socket is AF_UNIX
+# (the deployment notes, 2026-08-30 revision 2: see aigw-backend-proxy@.socket), it
+# returns the filesystem path the listening socket was bound to instead --
+# /run/aigw-backend/<port-number>.sock, where <port-number> is still the
+# historical 21000-21099 key aigw-gateway derives from a uid (see
+# aigw-gateway's backend_socket_path_for), just spelled as a filename now
+# instead of carried as an actual network port. From that number we derive
+# which user it belongs to exactly as before, make sure their aigw-backend
+# is running (starting it on first use), record the access time for the
+# idle reaper, then pipe the connection through to it.
+set -euo pipefail
+
+PORT="$(python3 -c 'import socket, pathlib; print(pathlib.Path(socket.socket(fileno=3).getsockname()).stem)')"
+UID_NUM=$((PORT - 21000 + 1000))
+
+# Defense in depth (the deployment notes, 2026-08-30 revision 2): every
+# aigw-backend-proxy@<port>.socket instance that is ever enabled is in
+# 21000-21099 (uid 1000-1099) by construction, so UID_NUM below 1000 can't
+# actually happen via this script's own arithmetic today -- but a review of
+# an earlier draft of this fix caught a *different* path in the same
+# migration (aigw-gateway calling `systemctl start aigw-backend@<name>`
+# directly, with a caller-supplied name) that would have let "root" reach
+# `aigw-backend@root.service` -- a real root-privileged instance, since that
+# unit's `User=%i` has no allowlist of its own. This script can't hit that
+# specific bug (it only ever derives USERNAME from a uid that getent already
+# resolved), but the failure mode it's guarding against is exactly the same
+# one, so this check is cheap insurance against this arithmetic ever being
+# extended or copied somewhere it stops being true by construction.
+if [ "$UID_NUM" -lt 1000 ]; then
+  echo "aigw-proxy-handler: refusing system uid $UID_NUM (port $PORT)" >&2
+  exit 2
+fi
+
+USERNAME="$(getent passwd "$UID_NUM" | cut -d: -f1)"
+
+if [ -z "$USERNAME" ]; then
+  echo "aigw-proxy-handler: no user for uid $UID_NUM (port $PORT)" >&2
+  # 2, not 1: the unit maps exit 1 to success because that is what socat
+  # returns when either side hangs up mid-transfer (a phone navigating away),
+  # so a genuine failure like this one has to be told apart from it.
+  exit 2
+fi
+
+# aigw-backend itself binds a *different* socket than this proxy's own
+# activation socket, in the same directory (the deployment notes, 2026-08-30
+# revision 2 -- see aigw-backend's BACKEND_SOCKET_PATH). The "-backend"
+# suffix can never collide with this script's own "<port>.sock" names: a
+# port number is all digits, and a username must start with a letter or
+# underscore (see aigw-gateway's SIGNUP_USERNAME_RE).
+BACKEND_SOCK="/run/aigw-backend/${USERNAME}-backend.sock"
+
+systemctl start "aigw-backend@${USERNAME}.service"
+
+mkdir -p /var/lib/aigw/last-used
+touch "/var/lib/aigw/last-used/${USERNAME}"
+
+# aigw-backend takes a moment after process start to open its listening
+# socket. socat is already this script's own dependency (see the final exec
+# below), so it doubles as the readiness probe: `-u /dev/null` feeds the
+# connection immediate EOF, so a successful attempt connects, transfers
+# nothing, and exits 0; a backend that isn't listening yet fails the
+# connect and exits nonzero (measured 2026-08-30). This replaces the old
+# `(exec 4<>/dev/tcp/127.0.0.1/<port>)` poll -- that bash builtin only
+# understands TCP, there is no AF_UNIX equivalent of it.
+for _ in $(seq 1 40); do
+  if socat -u /dev/null UNIX-CONNECT:"$BACKEND_SOCK" 2>/dev/null; then
+    break
+  fi
+  sleep 0.25
+done
+
+exec /usr/bin/socat FD:3 UNIX-CONNECT:"$BACKEND_SOCK"

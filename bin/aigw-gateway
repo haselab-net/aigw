@@ -1,0 +1,1784 @@
+#!/opt/aigw/venv/bin/python3
+"""
+Shared front-door for the "aigw" mobile AI control panel.
+
+The only shared, always-on, network-facing process in this system. Runs as
+the dedicated unprivileged `aigw` system user (not root, not sandboxusers --
+it never touches Docker or any user's container directly). Its whole job is:
+
+  1. Serve the mobile PWA (static files under /opt/aigw/static/).
+  2. "Sign in with Google" (OIDC) and check the verified email against the
+     GECOS "Other" field of a local Unix account (see aigw-set-email) --
+     Google only proves identity, this step is what actually authorizes.
+  3. Once a phone is authenticated as a given Unix user, relay its API/SSE
+     traffic to that user's own aigw-backend@<user> instance over the
+     socket-activated AF_UNIX listener at /run/aigw-backend/<port>.sock,
+     which starts that instance on demand the first time it is needed --
+     see backend_socket_path_for.
+
+This process itself never runs a command inside anyone's container -- it only
+ever forwards already-authenticated bytes to the per-user backend that does,
+so a bug here can't grant access to another user's session.
+
+the deployment notes (2026-08-30): the per-user backend used to listen on loopback
+TCP (127.0.0.1:21000+(uid-1000), woken on demand by a socket-activated
+aigw-backend-proxy@<port> unit) -- reachable, since loopback TCP has no
+per-uid access control on Linux, by any local user on the host, not just
+this process. It is now a Unix-domain socket instead, mode 0660 group
+"aigw", so only this process (aigw runs in that group) and the backend's own
+owning user can connect at all -- see aigw-backend's own BACKEND_SOCKET_PATH
+comment for the other half of this. aigw-backend-proxy@.socket/.service and
+aigw-proxy-handler all stay, unchanged in shape: they are what turns an
+incoming connection into `systemctl start` from a root context, so keeping
+them means this web-exposed process needs no privilege of its own to wake a
+stopped backend (see the NOTE above backend_request for why the alternative
+was rejected). Only what they listen on changed -- an AF_UNIX socket that
+just this account can open, instead of a loopback TCP port every local user
+could. They still cost one aigw-backend-proxy@<conn>.service instance per
+*connection*, which is what makes aigw-gateway's own connection pool
+(see POOL_MAX_IDLE_PER_PORT below) necessary to avoid tripping systemd's
+trigger-limit/MaxConnections in the
+first place.
+"""
+import base64
+import contextlib
+import fcntl
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import pwd
+import re
+import secrets
+import socket
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs, urlencode
+
+STATIC_DIR = Path("/opt/aigw/static")
+OAUTH_CLIENT_FILE = "/etc/aigw/oauth_client.json"
+COOKIE_SECRET_FILE = "/etc/aigw/cookie_secret"
+VAPID_PUBLIC_FILE = "/etc/aigw/vapid_public.txt"
+
+BASE_PATH = "/agents"
+
+
+def _load_public_host():
+    """The public DNS name this OAuth redirect URI (and anything else that
+    needs to say "this host" to the outside world) should use. Deployment-
+    specific, so it comes from oauth_client.json's own optional
+    "public_host" key -- e.g. a deployment where the short hostname always
+    matches a fixed suffix under its own domain would set
+    "<short-hostname>.example.com" there, rather than hardcoding that
+    convention here. Falls back to socket.getfqdn(), a reasonable generic
+    default for a deployment that hasn't set this explicitly (correct
+    whenever the host's own FQDN really is its public name)."""
+    try:
+        client = json.loads(Path(OAUTH_CLIENT_FILE).read_text())
+    except (OSError, json.JSONDecodeError):
+        client = None
+    if client and client.get("public_host"):
+        return client["public_host"]
+    return socket.getfqdn()
+
+
+PUBLIC_HOST = _load_public_host()
+REDIRECT_URI = f"https://{PUBLIC_HOST}/agents/oauth2callback"
+GATEWAY_PORT = 8878
+
+SESSION_COOKIE = "aigw_session"
+OAUTH_STATE_COOKIE = "aigw_oauth_state"
+NEXT_COOKIE = "aigw_next"  # where to return to after login, e.g. a /sandbox/port<N> URL
+
+# ---- session lifetime (the deployment notes, the design notes Phase 3,
+# 2026-08-30) -----------------------------------------------------------------
+#
+# Until this date SESSION_TTL was a flat 30 days baked straight into a
+# self-contained signed cookie, with no server-side record of which cookies
+# were still supposed to be valid. That made /agents/logout purely
+# cosmetic (the design notes) -- it could clear the browser's copy but a
+# stolen copy of the same bytes stayed accepted for up to 30 days, and the
+# *only* way to revoke anything at all was rotating cookie_secret, which
+# logs out every user on the host at once. Below replaces that with a
+# server-side session store (SESSION_STORE_PATH) plus refresh-token-style
+# rotation + reuse detection (the design notes): each cookie now carries a
+# one-time `jti`, the store says which jti is currently the live tip of a
+# session, and presenting an already-superseded jti (outside a short grace
+# window -- SESSION_REUSE_GRACE) kills the whole chain instead of just
+# failing that one request. A 5-minute TTL *alone*, with no store, would
+# have been no improvement at all -- the old cookie would simply have
+# stayed valid up to its own `exp` regardless of how often a new one was
+# issued alongside it; see the design notes for why the store is
+# what actually makes rotation mean something.
+#
+# Three related but independent windows exist on this host after Phase 3
+# (a fourth, the idle timeout, was removed 2026-08-31 -- see below); keep
+# the numbers listed together here so nobody "harmonizes" them later by
+# mistake -- notably, the root-unlock window being *shorter* than the
+# session that carries it is deliberate, not a bug (root/host access sits
+# behind its own passkey gate that this session cookie does not grant on
+# its own -- the design notes):
+#
+#   window                       length              guards
+#   ---------------------------  ------------------  --------------------------
+#   SESSION_ROTATE_INTERVAL      5 min               reuse-detection grain
+#   SESSION_ABSOLUTE_TTL         48 hours            max lifetime of a stolen cookie
+#   root unlock window (the design notes)    absolute 2h only    host/root privilege
+#                                 (Phase 2a, aigw-unlockd; idle timeout
+#                                 removed there 2026-08-31,
+#                                 the deployment notes -- same
+#                                 shape of decision as the removal below,
+#                                 made a few hours earlier that day)
+#
+# absolute-only, 48h, is a deliberate product decision by the user (revised
+# twice on 2026-08-31, see both entries below), not a value this
+# implementation picked on its own.
+#
+# Original 2026-08-30 decision: earlier drafts of this file proposed idle
+# 30min / absolute 7 days as a "one weekly re-login" compromise, reasoning
+# that once Phase 2 lands a stolen cookie only reaches the sandbox (chat
+# history + sandbox work, not root -- the design notes) so a longer absolute cap would
+# mostly cost UX, not security. The user chose a tighter 6-hour absolute
+# cap instead once rotation+reuse-detection was explained, accepting the
+# corresponding UX cost explicitly.
+#
+# 2026-08-31 revision: the user asked to raise the 6-hour cap, since it
+# forced a real Google re-login well inside a single day's use. Revisited
+# the same trade-off explicitly before changing anything: reuse detection
+# (SESSION_REUSE_GRACE, above) only catches a stolen cookie used
+# *concurrently* with the legitimate one -- a copy used exclusively while
+# the real owner's phone is idle/backgrounded rides along undetected, and
+# SESSION_ABSOLUTE_TTL is the only backstop against that case (it is fixed
+# at the chain's original login and does NOT get pushed out by rotation --
+# see start_session/check_and_rotate_session). Raising it from 6h to 48h
+# widens that undetected-exclusive-use window 8x, but the blast radius it
+# bounds is still only sandbox access (the design notes) -- host/root are gated
+# separately by aigw-unlockd's own passkey ceremony regardless of this
+# value, so this trade-off never touches the tighter root/host boundary
+# that same review established (the deployment notes
+# and neighbors). 48h -- not 7 days -- was picked as a middle ground: it
+# still forces re-login after roughly two working days, rather than
+# effectively never during a week of daily use.
+#
+# 2026-08-31, second revision (idle timeout removed entirely): the user
+# asked whether SESSION_IDLE_TIMEOUT (30min -- "an abandoned/unlocked
+# phone" in the table above, as it then read) was still needed for
+# sandbox reach. Told explicitly what it alone guarded against (a device
+# left unlocked and physically reachable by someone else, distinct from
+# both reuse detection above and SESSION_ABSOLUTE_TTL, neither of which
+# fires on that scenario), the user's answer was that this threat does not
+# apply to this deployment: phones auto-lock on their own, and the fixed
+# PCs that use this gateway sit somewhere no one else can physically get
+# to. With that scenario out of scope, the idle window bought nothing here
+# but a spurious re-login on a phone that had merely gone to sleep in a
+# pocket, so it was removed outright rather than lengthened -- see
+# check_and_rotate_session and _session_touch below, and
+# the deployment notes for the earlier, structurally identical
+# call made the same day for the root-unlock window. SESSION_ABSOLUTE_TTL
+# (48h) is now the *only* backstop bounding sandbox reach; nothing here
+# raises or removes it, and the sandbox-only blast radius reasoning above
+# (host/root still gated separately by aigw-unlockd's own passkey
+# ceremony) is what makes that acceptable. The old idle-timeout constant's
+# 30-minute value lives on renamed as SESSION_PRUNE_GRACE -- purely a
+# housekeeping window now, not a live guard (see its own comment below).
+#
+# On a phone PWA this means a real Google re-login only once every 48
+# hours of actual chain lifetime, full stop -- no idle window to also
+# trip regardless of how long the app sits backgrounded. The 5-minute
+# rotation itself is invisible to the user either way -- it happens
+# silently on ordinary use, no re-auth prompt -- so it adds no UX cost of
+# its own; only SESSION_ABSOLUTE_TTL above ever forces a real login
+# screen now.
+SESSION_ROTATE_INTERVAL = 5 * 60
+SESSION_ABSOLUTE_TTL = 48 * 3600
+# How long an already-rotated-away jti is still accepted (as authenticated,
+# but never rotated from again -- see check_and_rotate_session) before its
+# reappearance is treated as reuse. This exists purely for two ordinary,
+# non-malicious races the design notes calls out by name (the design notes): a phone that
+# loses signal mid-rotation and retries with the jti it still has, and
+# several PWA tabs/windows open at once each independently deciding it is
+# their turn to rotate within the same few seconds. 30s comfortably covers
+# a mobile-network retry and any realistic multi-tab race without
+# meaningfully weakening reuse detection's actual purpose -- an attacker
+# who stole a cookie and starts using it *concurrently* with the legitimate
+# owner also gets this same 30s window before being caught, which is the
+# accepted trade-off the design notes names explicitly, not an oversight.
+SESSION_REUSE_GRACE = 30
+# Coarsens how often an unchanged, non-rotating session's last-seen time is
+# actually persisted to disk. /agents/api/sandbox-auth alone is hit by
+# nginx's auth_request subrequest on every single proxied request while a
+# /sandbox/port<N>/ tab is open (every asset, every XHR) -- without this,
+# an active session would mean a session-store rewrite per request.
+# last_seen no longer gates logout (idle timeout removed 2026-08-31, above)
+# -- it is kept purely as a diagnostic ("when was this session last used")
+# now, so a minute of imprecision on that value is free precision to give
+# up for the write-volume savings.
+SESSION_LAST_SEEN_WRITE_THROTTLE = 60
+# How long an expired session record (past its own absolute_exp) is kept
+# around before _session_store_prune deletes it, purely so a very-late
+# reuse replay of a long-expired jti still finds a record to recognize as
+# reuse instead of aging out into an indistinguishable "never existed".
+# Was SESSION_IDLE_TIMEOUT until 2026-08-31 (above), when idle timeout
+# stopped being a live logout guard and this became its only remaining
+# job; kept at the same 30-minute value since that question (how long a
+# stale record must be recognizable) is unrelated to the one just removed
+# (whether inactivity alone should end a session).
+SESSION_PRUNE_GRACE = 30 * 60
+
+# the deployment notes: /agents/api/shared/<owner>/<rest-of-aigw-backend's-own-path>
+# reaches a DIFFERENT user's backend (see _proxy_to_backend's target_username).
+# /agents/api/sessions/<id>/share|unshare stays on the normal own-backend path
+# but is special-cased to also update this gateway's own cross-user share
+# hint (SHARES_INDEX_PATH) when it succeeds.
+SHARED_PREFIX_RE = re.compile(rf"^{re.escape(BASE_PATH)}/api/shared/([^/]+)(/.*)$")
+SESSION_SHARE_RE = re.compile(rf"^{re.escape(BASE_PATH)}/api/sessions/([^/]+)/(share|unshare)$")
+
+# the deployment notes, the design review (2026-08-30, revision 2):
+# until this date, `SHARED_PREFIX_RE`'s captured group 2 (the "rest of
+# aigw-backend's own path") was forwarded to the target's backend completely
+# unchecked -- any path at all, not just something to do with a shared
+# session.
+#
+# The real bug was never "a shared collaborator can send a message / press
+# a key / stop / resize / rename the owner's session" -- aigw-backend's
+# resolve_session_access() already requires on_behalf_of to be in that
+# SPECIFIC session's own shared_with list before any of those routes do
+# anything, which is exactly the deployment notes' own README-documented
+# "共同作業" (collaboration, not view-only -- see the deployment notes). An
+# earlier revision of this allowlist got this wrong and restricted to
+# GET/read-only routes on the theory that this was inherently safer -- it
+# was not (resolve_session_access already enforces the real boundary) and
+# it broke that intended feature. Reverted.
+#
+# The actual bug: routes that call resolve_session_access() for NOBODY,
+# because they never look at shared_with in the first place -- POST
+# /push/subscribe (no check of any kind -- silently adds an attacker's
+# endpoint to the victim's push subscriptions, an SSRF too, since
+# pywebpush POSTs to whatever endpoint URL is given), POST
+# /sessions/<id>/notify (takes a session id but never calls
+# resolve_session_access), GET /capabilities, /workdirs, /tmux-sessions,
+# /claude-conversations, /project-docs/{roots,api} (runs a binary in the
+# victim's home as the victim), /claude-auth, /container-ip (no session id
+# at all), POST /sessions (creates a pane as the victim, root if they have
+# root-shell), /sessions/adopt, /claude-auth/{login,logout}, /chrome/kill.
+# Any logged-in aigw user could reach every one of those against ANY other
+# user, not just someone who had shared a session with them.
+#
+# So the dividing line is not GET vs POST -- it is exactly "does the target
+# backend route call resolve_session_access() (or, for the bare listing,
+# list_sessions(on_behalf_of), which does the equivalent shared_with
+# filtering) before doing anything". These two allowlists are checked below
+# in do_GET/do_POST before _proxy_to_backend is ever called for a
+# shared/<owner>/... path. Built from real evidence, not guesswork: every
+# session-scoped entry is a path app.js's sessionPath()/sessionApiUrl()
+# actually construct (grep app.js for `currentOwner` -- events, events/page,
+# screen, files/<name>, subagents, subagents/<id>, download, keys, resize,
+# stop, messages all get called with it set); `sessions` (bare, no id) is
+# also allowed even though no phone client ever requests it through this
+# prefix -- it exists only so _route_shared_with_me()'s internal per-owner
+# `_proxy_to_backend("GET", "/sessions", target_username=owner)` call keeps
+# working now that this same allowlist gates every cross-user proxy call,
+# not just the client-facing ones. `rename` is on the POST list even though
+# app.js does not currently call it with `currentOwner` set (it only ever
+# renames from the owner's own session list) -- aigw-backend's
+# resolve_session_access-gated route allows it for a collaborator regardless,
+# matching the deployment notes' documented list, so it is included for
+# forward compatibility with app.js rather than needlessly narrower than
+# what the backend already permits.
+#
+# Left OFF both lists, on purpose:
+#   - sessions/<id>/notify: session-scoped, and since 2026-09-17
+#     aigw-backend's route resolves the session and 403s any on_behalf_of
+#     of its own accord. Off this list because there is no legitimate
+#     reason for a viewer other than the owner to trigger a push
+#     notification, not because the backend fails to check.
+#   - sessions/<id>/{delete,share,unshare}: aigw-backend already 403s
+#     on_behalf_of explicitly for these -- destroying the owner's data, or
+#     re-sharing/un-sharing what the owner chose to share, are deliberately
+#     owner-only under the deployment notes regardless of shared_with. (share/unshare
+#     also never route through here at all -- see SESSION_SHARE_RE above.)
+#   - push/subscribe, sessions (POST create), sessions/adopt, and everything
+#     not under sessions/<id>/*: not session-scoped, so there is no
+#     shared_with to check and no legitimate on-behalf-of use case.
+#
+# aigw-backend carries the authoritative, independent copy of this same
+# pair of lists (_shared_get_path_allowed / _shared_post_path_allowed) --
+# see its comment for the full "why resolve_session_access is the right
+# boundary" reasoning. If this gateway list and that one ever disagree,
+# aigw-backend's is the one that actually holds.
+SHARED_ALLOWED_GET_RE = re.compile(
+    r"^/sessions$"
+    r"|^/sessions/[^/]+/events(/page)?$"
+    r"|^/sessions/[^/]+/screen$"
+    r"|^/sessions/[^/]+/files/[^/]+$"
+    r"|^/sessions/[^/]+/subagents(/[^/]+)?$"
+    r"|^/sessions/[^/]+/download$"
+)
+SHARED_ALLOWED_POST_RE = re.compile(
+    r"^/sessions/[^/]+/(messages|keys|stop|resize|rename)$"
+)
+
+# Self-signup (the deployment notes), the doc-tool viewer (the deployment notes),
+# and other deployment-specific routes all moved out to the optional
+# aigw_site_routes module below (the deployment notes) -- none of
+# them make sense in a generic published core. See that module's own
+# docstring for the constants/functions that used to be here.
+
+def log(msg):
+    print(f"[aigw-gateway] {msg}", file=sys.stderr, flush=True)
+
+
+def load_oauth_client():
+    if not os.path.exists(OAUTH_CLIENT_FILE):
+        return None
+    return json.loads(Path(OAUTH_CLIENT_FILE).read_text())
+
+
+def cookie_secret():
+    return Path(COOKIE_SECRET_FILE).read_bytes()
+
+
+def sign(value: str) -> str:
+    # Cookie values can't contain raw JSON (spaces, braces, quotes are all
+    # invalid per RFC 6265), so base64url-encode the payload before signing.
+    encoded = base64.urlsafe_b64encode(value.encode()).rstrip(b"=").decode()
+    mac = hmac.new(cookie_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{mac}"
+
+
+def unsign(signed: str):
+    try:
+        encoded, mac = signed.rsplit(".", 1)
+    except ValueError:
+        return None
+    expected = hmac.new(cookie_secret(), encoded.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        return None
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        return base64.urlsafe_b64decode(encoded + padding).decode()
+    except Exception:
+        return None
+
+
+# ---- server-side session store (the deployment notes, the design notes/Phase 3) ---------------
+#
+# NOT the same on-disk arrangement as SHARES_INDEX_PATH below, despite both
+# living under /var/lib/aigw/ -- and deliberately not, for a reason worth
+# spelling out so nobody "simplifies" this back to matching shares.json
+# later. shares.json is a lone *file*, pre-created as aigw:aigw 0600
+# directly inside /var/lib/aigw/ itself, which is root:root 0755: aigw can
+# open and rewrite that one file's contents (write_text()) but cannot
+# create any *new* file next to it -- there is no write bit for "other" on
+# that directory (verified: `sudo -u aigw touch /var/lib/aigw/x` ->
+# Permission denied). shares.json gets away with plain write_text() under
+# its own lock because it is a low-write-rate hint, not authoritative data
+# (see its own comment) -- an interrupted write at worst causes one extra
+# lookup that comes back empty.
+#
+# This store is different: it is written on effectively every authenticated
+# request (rotation, last-seen throttled updates, revocation), and it *is*
+# authoritative -- a reader (another thread, moments later) observing a
+# torn/half-written file here would fail every session closed (see
+# _session_store_read's fail-closed contract), which for one bad write
+# would mean logging out every user on the host, the exact blast radius
+# Phase 3 is trying to shrink. That calls for real temp-file + os.replace()
+# atomicity, which needs *directory* write permission -- so this lives in
+# its own subdirectory, pre-created (once, by a human, as part of
+# deployment -- see the design notes) as aigw:aigw **0700**, not inside
+# /var/lib/aigw/ directly:
+SESSION_STORE_PATH = Path("/var/lib/aigw/gateway-state/sessions.json")
+# A dedicated lock file rather than flock()-ing SESSION_STORE_PATH itself:
+# flock() applies to the *inode*, and os.replace() (below) always produces
+# a brand-new inode -- flocking the data file directly would only ever
+# protect against a second locker that happened to open the exact same
+# inode at the exact same moment, which os.replace() specifically defeats.
+# A separate, never-replaced file sidesteps that entirely.
+SESSION_STORE_LOCK_PATH = SESSION_STORE_PATH.with_name(".lock")
+# aigw-gateway is one ThreadingHTTPServer process (see main() below), but it
+# is NOT the only process that ever writes SESSION_STORE_PATH:
+# aigw-mint-session-cookie (see the aigw-mint-session-cookie change, the design notes)
+# runs as a separate, short-lived `sudo`-elevated process to mint a cookie
+# for headful-Chrome auto-login, and does its own read-modify-write of this
+# same file. threading.Lock is process-local -- it does nothing at all
+# against that second process, so on its own it would only stop this
+# process's *own* worker threads from colliding with each other while
+# leaving the actual cross-process race wide open. A race lost against
+# aigw-mint-session-cookie looks like this process's own in-flight rotation
+# silently vanishing (last-writer-wins on the whole file) -- a legitimate
+# user logged out for no visible reason, one of the worse failure modes to
+# have to debug. _session_store_locked() below is what actually closes
+# that: every read-modify-write cycle, in every process that touches this
+# store, must go through an flock(LOCK_EX) on SESSION_STORE_LOCK_PATH.
+# threading.Lock is kept nested *inside* it purely to avoid this process's
+# own worker threads doing a pointless flock() syscall round-trip to fight
+# over a lock only this process ever contends for internally -- it is an
+# optimization, not what makes concurrent access correct; flock is.
+_session_store_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _session_store_locked():
+    """Held for the full duration of any session-store read-modify-write
+    cycle -- see the comment above _session_store_lock for why this needs
+    to be an flock(), not just that in-process Lock. The open() below asks
+    for O_CREAT|O_RDWR, which DOES need real read+write permission on
+    whatever ends up owning this file -- unlike SESSION_STORE_PATH itself
+    (see the aigw-mint-session-cookie change's own chown()/chmod() fix for that
+    file), this lock file is never atomically replaced, so ownership set
+    the first time it is created sticks. If aigw-mint-session-cookie
+    happened to be the very first process ever to create it (root, mode
+    0600 by default) before this one ever ran, aigw-gateway's own open()
+    here would fail closed with EACCES from then on -- which, given
+    _session_store_read()'s fail-closed contract, would mean the entire
+    session store looking permanently broken, not just one race. This is
+    why deployment pre-creates this exact path as aigw:aigw 0700 up front
+    (see the design notes) -- so that question of "who creates it first" never
+    actually arises in practice, on either a fresh install or a redeploy."""
+    with _session_store_lock:
+        fd = os.open(SESSION_STORE_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _session_store_read():
+    """The store as a dict, or None if it is missing-but-should-exist,
+    unreadable, or malformed. None must propagate all the way out to "not
+    authenticated" (see check_and_rotate_session) -- fail closed. It must
+    NOT be treated as "empty store" and silently recreated: a store that
+    fails to parse could easily be a half-written file from a bug elsewhere
+    (os.replace() makes that unlikely, not impossible -- e.g. a full disk),
+    and treating unreadable-with-content the same as legitimately-empty
+    would mean every jti "not found", which is exactly what a jti that
+    genuinely was superseded looks like right after the store that recorded
+    that fact vanishes -- i.e. it would silently defeat reuse detection
+    instead of failing safe. Only a literally missing file (fresh install,
+    before deployment has run the one-time `touch` -- see the design notes) is
+    treated as "no sessions yet", since that state cannot yet contain any
+    jti this process itself issued."""
+    if not SESSION_STORE_PATH.exists():
+        return {"sessions": {}, "revoked_chains": {}}
+    try:
+        data = json.loads(SESSION_STORE_PATH.read_text())
+    except (OSError, ValueError) as e:
+        log(f"session store unreadable, failing closed (treating all cookies as invalid): {e}")
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("sessions"), dict) \
+            or not isinstance(data.get("revoked_chains"), dict):
+        log("session store malformed, failing closed (treating all cookies as invalid)")
+        return None
+    return data
+
+
+def _session_store_prune(data, now: int):
+    """Garbage-collects entries nothing will ever look up again. Never
+    itself a source of truth for whether a session is valid -- only cleanup
+    -- so it is safe to call opportunistically on every write rather than
+    on a timer. A session record is kept well past its own absolute_exp
+    (by a further SESSION_PRUNE_GRACE) purely so a very-late reuse replay
+    of a long-expired jti still finds a record to recognize as reuse
+    instead of aging out into an indistinguishable "never existed"; a
+    revoked_chains entry is kept for a full SESSION_ABSOLUTE_TTL after the
+    revocation for the same reason, which is also long enough that any
+    cookie whose own signed `exp` claim could still validate against it has
+    already failed that check on its own by the time it is pruned."""
+    sessions = data["sessions"]
+    for jti in [j for j, r in sessions.items()
+                if now > r["absolute_exp"] + SESSION_PRUNE_GRACE]:
+        del sessions[jti]
+    revoked = data["revoked_chains"]
+    for chain in [c for c, revoked_at in revoked.items()
+                  if now - revoked_at > SESSION_ABSOLUTE_TTL]:
+        del revoked[chain]
+
+
+def _session_store_save(data, now: int):
+    """Prune-then-atomically-replace -- the one function every write path
+    below funnels through, so pruning never has to be remembered separately
+    at each call site. Must be called while holding _session_store_lock."""
+    _session_store_prune(data, now)
+    tmp_path = SESSION_STORE_PATH.with_name(
+        f"{SESSION_STORE_PATH.name}.tmp.{os.getpid()}.{threading.get_ident()}")
+    tmp_path.write_text(json.dumps(data))
+    os.replace(tmp_path, SESSION_STORE_PATH)
+
+
+def _session_chain_tip(data, chain: str):
+    """The one non-superseded jti belonging to `chain`, or None if the
+    chain has none (fully revoked/pruned already). Store is small (one
+    entry per currently-live session across the whole host), so a linear
+    scan here is not worth indexing separately."""
+    for jti, record in data["sessions"].items():
+        if record["chain"] == chain and record["superseded_at"] is None:
+            return jti
+    return None
+
+
+def _session_set_cookie_header(value: str, absolute_exp: int) -> str:
+    """Builds the Set-Cookie header text for a freshly issued or rotated
+    session cookie. Max-Age counts down to the *chain's* fixed absolute_exp
+    (set once at login, carried unchanged through every rotation), not a
+    flat SESSION_ABSOLUTE_TTL reissued every 5 minutes -- a cookie that has
+    already been rotated many times over several hours must not tell the
+    browser it is good for another full SESSION_ABSOLUTE_TTL from now.
+
+    SameSite=Lax, NOT Strict. This was briefly Strict (the design notes asked
+    for it) and that broke login outright on 2026-08-30: the OAuth callback
+    itself works -- aigw_oauth_state is Lax, so state validation passes and
+    /agents/oauth2callback answers 302 with this Set-Cookie attached -- but
+    the browser then follows that 302 to /agents/ as a top-level navigation
+    whose *initiator* is accounts.google.com. A Strict cookie is withheld on
+    a cross-site-initiated navigation even when the destination is same-site,
+    so /agents/ saw no session, served login.html, and the user bounced
+    between Google and the login page forever. the design notes spotted this
+    hazard for the state cookie and missed that the session cookie is
+    delivered through the very same redirect chain.
+
+    Lax gives up almost nothing here. It still withholds this cookie from
+    every cross-site *unsafe* method, so no third-party page can POST as the
+    logged-in user. What Lax does allow is a cross-site top-level GET
+    carrying the cookie -- which is exactly why /agents/logout became
+    POST-only below rather than relying on the cookie attribute to stop
+    logout CSRF, and why no GET route here may ever change state.
+
+    Do NOT copy even Lax blindly to OAUTH_STATE_COOKIE/NEXT_COOKIE/
+    SIGNUP_COOKIE -- see each of their own Set-Cookie call sites."""
+    max_age = max(0, absolute_exp - int(time.time()))
+    return (f"{SESSION_COOKIE}={value}; Path=/; HttpOnly; Secure; "
+            f"SameSite=Lax; Max-Age={max_age}")
+
+
+def make_session_cookie(username: str):
+    """Starts a brand-new session chain and returns (signed_cookie_value,
+    absolute_exp) for its first jti. Only ever called at an actual login
+    (Google OAuth success, or the end of self-signup) -- every later cookie
+    for this chain comes from check_and_rotate_session's rotation branch
+    instead, which carries this same absolute_exp forward unchanged rather
+    than minting a new one."""
+    now = int(time.time())
+    jti = secrets.token_hex(16)
+    chain = secrets.token_hex(16)
+    absolute_exp = now + SESSION_ABSOLUTE_TTL
+    with _session_store_locked():
+        data = _session_store_read()
+        if data is None:
+            # Unlike verifying an old cookie, there is nothing safe to
+            # "fail closed" to here -- this call path is the login itself.
+            # Surface it loudly instead of silently minting a cookie the
+            # store can never validate (which fail-closed verification
+            # would then reject on the very next request anyway, just more
+            # confusingly, as an apparent instant logout).
+            raise RuntimeError("session store unreadable; refusing to start a new session")
+        data["sessions"][jti] = {
+            "u": username, "chain": chain, "issued": now, "last_seen": now,
+            "absolute_exp": absolute_exp, "superseded_at": None,
+        }
+        _session_store_save(data, now)
+    payload = json.dumps({"u": username, "jti": jti, "exp": absolute_exp})
+    return sign(payload), absolute_exp
+
+
+# Optional, deployment-supplied site routes (the deployment notes):
+# self-signup, the doc-tool viewer, and whatever else a given deployment
+# needs -- see aigw_site_routes.py's own docstring. A deployment with none
+# of these simply doesn't have that file; every call site below checks
+# `aigw_site_routes` for truthiness first and falls through to its own
+# generic behavior (usually a 404) when it's None.
+try:
+    import aigw_site_routes
+except ImportError:
+    aigw_site_routes = None
+
+
+class _SiteContext:
+    """What aigw_site_routes needs from this file, handed over explicitly
+    rather than imported back -- this file has no .py extension and isn't
+    meant to be imported. sign/unsign/make_session_cookie let a site route
+    mint cookies byte-compatible with the ones issued here."""
+
+    def __init__(self):
+        self.base_path = BASE_PATH
+        self.static_dir = STATIC_DIR
+        self.public_host = PUBLIC_HOST
+        self.sign = sign
+        self.unsign = unsign
+        self.make_session_cookie = make_session_cookie
+        self.session_set_cookie_header = _session_set_cookie_header
+
+
+SITE_CTX = _SiteContext()
+
+
+def _session_revoke_chain(data, chain: str, now: int):
+    data["revoked_chains"][chain] = now
+
+
+def check_and_rotate_session(signed: str):
+    """Verifies a session cookie against the server-side store and rotates
+    it if due (the deployment notes, the design notes). Returns
+    (username_or_None, new_cookie_header_or_None, current_jti_or_None) --
+    the second element is a ready-to-send Set-Cookie header string exactly
+    when the caller should re-issue the cookie (rotation, or nudging a
+    stale-but-in-grace tab back onto the chain's current tip), and is None
+    otherwise, including every "not authenticated" case. The third element
+    is the jti that is authoritative for this session *as of right now*
+    (post-rotation, if this call rotated) -- see _session_touch below for
+    why a long-lived SSE stream needs to hang onto this instead of just the
+    username. Deliberately does not distinguish *why* something failed to
+    its caller (_current_username) -- a guessed, expired, revoked, or
+    reuse-detected cookie should all look identical from the outside:
+    simply "not logged in"."""
+    value = unsign(signed)
+    if value is None:
+        return None, None, None
+    try:
+        payload = json.loads(value)
+    except ValueError:
+        return None, None, None
+    username = payload.get("u")
+    jti = payload.get("jti")
+    exp = payload.get("exp", 0)
+    # Cheap check before ever touching the store or the lock: exp is the
+    # chain's own absolute_exp, signed into the cookie at issuance, so this
+    # alone already bounds a forged-store or store-unavailable scenario to
+    # "no worse than the old flat-TTL cookie was" as defense in depth --
+    # the store below is what adds rotation/idle/reuse on top of it, not
+    # what this check depends on.
+    if not username or not jti or not isinstance(exp, int) or exp < time.time():
+        return None, None, None
+    try:
+        pwd.getpwnam(username)
+    except KeyError:
+        return None, None, None
+
+    now = int(time.time())
+    with _session_store_locked():
+        data = _session_store_read()
+        if data is None:
+            return None, None, None  # fail closed -- see _session_store_read's own comment
+
+        record = data["sessions"].get(jti)
+        if record is None or record["u"] != username:
+            # Either genuinely bogus, or a record that _session_store_prune
+            # already reaped long after it stopped mattering -- either way
+            # "not authenticated" is the only safe answer. This is NOT the
+            # reuse-detection case: a real reuse replay requires the record
+            # to still exist and be marked superseded (below), which a
+            # pruned-away record by definition no longer is.
+            return None, None, None
+
+        chain = record["chain"]
+        if chain in data["revoked_chains"]:
+            return None, None, None
+
+        # Idle timeout removed 2026-08-31 (see SESSION_ABSOLUTE_TTL's own
+        # comment above) -- absolute_exp is the only expiry check left.
+        if now > record["absolute_exp"]:
+            _session_revoke_chain(data, chain, now)
+            _session_store_save(data, now)
+            return None, None, None
+
+        if record["superseded_at"] is not None:
+            if now - record["superseded_at"] <= SESSION_REUSE_GRACE:
+                # Normal race, not an attack (the design notes): a phone that
+                # lost connectivity mid-rotation, or a second PWA tab that
+                # rotated a beat behind the first, retrying with the jti it
+                # still holds. Authenticate this request, but do not extend
+                # anything or rotate *from* an already-superseded jti --
+                # instead hand back the chain's current tip so this client
+                # converges onto it. This same window is available to an
+                # attacker racing the legitimate holder -- a deliberate
+                # trade for not logging out a flaky phone, not an oversight.
+                tip = _session_chain_tip(data, chain)
+                new_header = None
+                if tip is not None and tip != jti:
+                    tip_record = data["sessions"][tip]
+                    new_header = _session_set_cookie_header(
+                        sign(json.dumps({
+                            "u": username, "jti": tip, "exp": tip_record["absolute_exp"],
+                        })),
+                        tip_record["absolute_exp"],
+                    )
+                return username, new_header, (tip or jti)
+            # Outside the grace window: an already-invalidated jti coming
+            # back is exactly the "someone is using a copy" signal
+            # refresh-token reuse detection exists to catch. Kill the
+            # *whole* chain -- including whatever jti is the legitimate
+            # current tip right now -- and force a real re-login, per the
+            # design notes explicit instruction.
+            _session_revoke_chain(data, chain, now)
+            _session_store_save(data, now)
+            return None, None, None
+
+        # Ordinary case: this jti is the chain's current, non-superseded tip.
+        if now - record["issued"] >= SESSION_ROTATE_INTERVAL:
+            new_jti = secrets.token_hex(16)
+            data["sessions"][new_jti] = {
+                "u": username, "chain": chain, "issued": now, "last_seen": now,
+                "absolute_exp": record["absolute_exp"], "superseded_at": None,
+            }
+            record["superseded_at"] = now
+            _session_store_save(data, now)
+            new_header = _session_set_cookie_header(
+                sign(json.dumps({"u": username, "jti": new_jti, "exp": record["absolute_exp"]})),
+                record["absolute_exp"],
+            )
+            return username, new_header, new_jti
+
+        if now - record["last_seen"] < SESSION_LAST_SEEN_WRITE_THROTTLE:
+            # Not due for rotation, and last_seen was persisted too
+            # recently to be worth a rewrite -- see
+            # SESSION_LAST_SEEN_WRITE_THROTTLE's own comment.
+            return username, None, jti
+
+        record["last_seen"] = now
+        _session_store_save(data, now)
+        return username, None, jti
+
+
+def _session_touch(jti: str, username: str) -> bool:
+    """Refreshes last_seen (diagnostic only, see SESSION_LAST_SEEN_WRITE_
+    THROTTLE's own comment) and checks whether a session is still valid,
+    for a session whose HTTP response headers have already been flushed --
+    so check_and_rotate_session's normal "re-issue a fresh Set-Cookie" path
+    is not an option any more.
+
+    Why this exists (the deployment notes, Phase 3 review point 3, 2026-08-30):
+    the PWA's chat view holds one /agents/api/sessions/<id>/events SSE
+    connection open for as long as it is on screen (see app.js's
+    connectSessionEvents/EventSource), and aigw-backend deliberately keeps
+    that one connection alive indefinitely with a `: keep-alive` line every
+    20s (see aigw-backend's own events route) rather than ever closing it.
+    Originally this existed to keep such a long-open stream from tripping
+    the idle timeout with *no new HTTP request* ever reaching
+    _current_username() to refresh last_seen; idle timeout was removed
+    2026-08-31 (SESSION_ABSOLUTE_TTL's own comment above), so that specific
+    reason is gone, but the function still earns its keep: it is the only
+    thing that notices, mid-stream, that a long-open SSE connection's
+    session has hit its absolute_exp or been revoked, and cuts the stream
+    off accordingly rather than silently continuing to deliver chat
+    content past that point. _proxy_to_backend's SSE branch calls this
+    periodically (throttled by SESSION_LAST_SEEN_WRITE_THROTTLE, same as
+    the ordinary per-request path) for as long as the stream stays open.
+
+    Deliberately narrow: never rotates (a fresh jti would need a fresh
+    Set-Cookie, which cannot be sent once headers are already flushed) and
+    never resurrects a session that was already revoked/absolute-expired
+    by the time this is called. Returns whether the caller should keep
+    streaming; the caller must stop and close the connection on False, so
+    a session that becomes invalid while its SSE stream is open is
+    actually cut off instead of the stream silently continuing to deliver
+    chat content to a "logged out" session forever.
+
+    A superseded jti (the tab that opened this stream never picked up the
+    Set-Cookie from a later rotation, since headers here were already
+    flushed long before any rotation could happen) is NOT, on its own,
+    a reason to return False -- chain/absolute_exp are copied unchanged
+    onto every rotated jti in the same chain (see check_and_rotate_session),
+    so they remain accurate to check directly on this record even once it
+    is no longer the tip. Until 2026-09-01 this function returned False
+    here unconditionally, which -- for exactly the long-lived SSE
+    connection this function exists for -- forcibly disconnected a
+    perfectly valid, non-revoked, non-expired session purely because
+    SESSION_ROTATE_INTERVAL (5 min) had elapsed and *some other* request
+    on the same page had rotated the chain out from under it; the SSE
+    client is then left depending entirely on EventSource's own automatic
+    reconnect (no custom retry/backoff logic on the client's own end at
+    all -- see connectSessionEvents in app.js) to notice and recover,
+    invisibly to the user when it works
+    and looking exactly like "chat stopped updating until I reload" when
+    it does not -- measured 2026-09-01 on a live session as a recurring,
+    not one-off, failure. This was already the intended reasoning for
+    SESSION_REUSE_GRACE-based requests (check_and_rotate_session hands a
+    superseded-but-in-grace jti the current tip's fresh cookie instead of
+    treating it as reuse) -- this function just never got the same
+    treatment when idle-timeout removal that same day made last_seen
+    purely diagnostic and turned this into the only remaining reason an
+    SSE stream could still die here. last_seen itself is skipped for an
+    already-superseded record (nothing reads a non-tip record's last_seen
+    for anything, so there is no reason to write it)."""
+    now = int(time.time())
+    with _session_store_locked():
+        data = _session_store_read()
+        if data is None:
+            return False  # fail closed, same contract as check_and_rotate_session
+        record = data["sessions"].get(jti)
+        if record is None or record["u"] != username:
+            return False
+        if record["chain"] in data["revoked_chains"]:
+            return False
+        if now > record["absolute_exp"]:
+            _session_revoke_chain(data, record["chain"], now)
+            _session_store_save(data, now)
+            return False
+        if record["superseded_at"] is None and now - record["last_seen"] >= SESSION_LAST_SEEN_WRITE_THROTTLE:
+            record["last_seen"] = now
+            _session_store_save(data, now)
+        return True
+
+
+def _revoke_session_from_cookie(signed: str):
+    """Best-effort logout: identifies which chain the cookie belongs to and
+    revokes it, without going through check_and_rotate_session's full
+    verify-and-maybe-rotate path -- a logout has no reason to also issue a
+    fresh cookie for the session it is about to destroy. Silently does
+    nothing for anything unsigned, malformed, or already gone; the
+    browser-side Set-Cookie clear in _route_logout happens either way, so a
+    cookie this can't identify simply has nothing left to invalidate
+    server-side."""
+    value = unsign(signed)
+    if value is None:
+        return
+    try:
+        jti = json.loads(value).get("jti")
+    except ValueError:
+        return
+    if not jti:
+        return
+    now = int(time.time())
+    with _session_store_locked():
+        data = _session_store_read()
+        if data is None:
+            return
+        record = data["sessions"].get(jti)
+        if record is None:
+            return
+        _session_revoke_chain(data, record["chain"], now)
+        _session_store_save(data, now)
+
+
+def find_username_for_email(email: str):
+    """Reverse-lookup: scan local Unix accounts for one whose GECOS 'Other'
+    field (5th comma-separated subfield, set via aigw-set-email) matches the
+    verified email from Google. Google only proves identity -- this lookup is
+    what actually authorizes (self-service allowlist, no admin step)."""
+    email = email.strip().lower()
+    for entry in pwd.getpwall():
+        fields = entry.pw_gecos.split(",")
+        other = fields[4].strip().lower() if len(fields) > 4 else ""
+        if other and other == email:
+            return entry.pw_name
+    return None
+
+
+BACKEND_SOCKET_DIR = "/run/aigw-backend"
+# Ordinary local accounts start at 1000 (see /etc/login.defs' UID_MIN, and
+# aigw-backend's own historical PORT/NOTIFY_PORT formulas, both
+# 1000-relative) -- anything below that is a system account, root included.
+# The old TCP-port formula (21000 + (uid - 1000)) excluded those *by
+# accident*: root's uid 0 maps to port 20000, outside the 21000-21099 range
+# any aigw-backend-proxy@<port>.socket was ever enabled for, so connecting
+# there just failed. A path keyed on the username directly has no
+# equivalent accident to lean on. Naming "root" as a /shared/<owner>/...
+# target is an ordinary logged-in aigw user's own request, not a bug, so
+# without this check it would reach aigw-backend-proxy@20000.socket -- and
+# aigw-backend@.service's `User=%i` carries no allowlist of its own, so a
+# root-privileged backend really would be what came back. aigw-proxy-handler
+# refuses uid < 1000 for the same reason; two independent checks, because
+# the one that matters is the one in the root-side program, not this one.
+# This makes the exclusion explicit and intended instead of a side effect of
+# arithmetic that no longer exists.
+BACKEND_MIN_UID = 1000
+
+
+def backend_socket_path_for(username: str) -> str:
+    """Path of the socket-activated listener for <username>'s aigw-backend.
+    Raises KeyError -- same contract backend_port_for used to have, and every
+    caller already handles as "no such user" -- for an unknown name, and also
+    (see BACKEND_MIN_UID above) for any system account.
+
+    This is aigw-backend-proxy@<port>.socket's listener, *not* the backend's
+    own socket: connecting here is what makes systemd start a stopped backend
+    (the deployment notes). The instance name stays the old TCP port number rather
+    than the username, purely so the 100 already-enabled
+    aigw-backend-proxy@21000..21099 instances keep working untouched -- one
+    less thing for aigw-self-signup to have to remember for a new account.
+    The port number is only a key here; nothing listens on TCP any more."""
+    pw = pwd.getpwnam(username)
+    if pw.pw_uid < BACKEND_MIN_UID:
+        raise KeyError(username)
+    return f"{BACKEND_SOCKET_DIR}/{21000 + pw.pw_uid - 1000}.sock"
+
+
+# ---- session sharing (the deployment notes) -----------------------------------------
+#
+# aigw-gateway is the only process positioned to talk to more than one user's
+# aigw-backend at once, so it -- not any one user's backend -- holds the one
+# piece of state that has to be visible across users: a lightweight hint of
+# "who has shared something with me", used only to know which owners' own
+# backends to ask when building a viewer's "shared with me" list. It
+# deliberately holds no session ids or content: the real, authoritative
+# shared_with list lives in the owner's own meta.json and is what actually
+# gates every proxied request (see _proxy_to_backend's on_behalf_of param),
+# so a stale or even maliciously-wrong entry here can cause an extra lookup
+# that comes back empty, never an actual access-control decision.
+#
+# Pre-created on disk as aigw:aigw (this process's own user) -- /var/lib/aigw/
+# itself is root:root 755, so aigw-gateway can read/write this existing file's
+# contents but could not have created it there itself.
+SHARES_INDEX_PATH = Path("/var/lib/aigw/shares.json")
+_shares_index_lock = threading.Lock()
+
+
+def _load_shares_index():
+    with _shares_index_lock:
+        try:
+            return json.loads(SHARES_INDEX_PATH.read_text())
+        except (FileNotFoundError, ValueError):
+            return {}
+
+
+def _add_share_hint(owner: str, viewer: str):
+    with _shares_index_lock:
+        try:
+            data = json.loads(SHARES_INDEX_PATH.read_text())
+        except (FileNotFoundError, ValueError):
+            data = {}
+        owners = data.setdefault(viewer, [])
+        if owner not in owners:
+            owners.append(owner)
+        SHARES_INDEX_PATH.write_text(json.dumps(data))
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """http.client.HTTPConnection talks AF_INET by default (host, port);
+    pointing one at a filesystem path instead is just a matter of
+    overriding connect() to open an AF_UNIX socket there instead of the
+    inherited socket.create_connection() call -- the rest of HTTPConnection
+    (request framing, keep-alive, chunked/close-delimited responses) never
+    looks at what kind of socket self.sock actually is. The host string
+    handed to the base class's __init__ is cosmetic only: it becomes the
+    default Host: header, which aigw-backend never reads (it has exactly
+    one route namespace, not name-based virtual hosts), so any fixed
+    placeholder is fine."""
+
+    def __init__(self, sock_path, timeout=60):
+        super().__init__("localhost", timeout=timeout)
+        self._aigw_sock_path = sock_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if self.timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+            self.sock.settimeout(self.timeout)
+        self.sock.connect(self._aigw_sock_path)
+
+
+# NOTE: there is deliberately no _start_backend_and_wait() here, and
+# aigw-gateway holds no sudo rule of any kind.
+#
+# An earlier draft of the 2026-08-30 AF_UNIX change had aigw-gateway run
+# `sudo systemctl start aigw-backend@<user>.service` itself and retired the
+# socket-activation units entirely. That was rejected: `aigw` is the
+# web-exposed service account, and a NOPASSWD rule matching
+# `aigw-backend@*.service` also matches `aigw-backend@root.service` -- whose
+# `User=%i` would really start a root-privileged backend. The only thing
+# standing between the two would have been a uid check inside aigw-gateway,
+# i.e. the very process whose compromise the check is supposed to survive.
+# That inverts this host's standing rule that the authorization boundary
+# belongs *in* the privileged program and never in its caller
+# (the deployment notes), and the deployment notes' "never
+# NOPASSWD: ALL" for the same reason.
+#
+# None of it was necessary: aigw-backend-proxy@.service carries no `User=`,
+# so systemd already runs the handler as root and it has always been able to
+# `systemctl start` the backend with no sudo at all. Keeping socket
+# activation therefore closes the hole (the listener is now an AF_UNIX socket
+# with SocketUser=aigw, SocketMode=0600, so only this process can reach it)
+# while adding exactly zero new privilege. Connecting is the whole trigger --
+# systemd starts a stopped backend on our behalf, which is why the retry
+# below just reconnects and never runs a command.
+
+
+# ---- keep-alive connections to the per-user backends ------------------------
+#
+# aigw-backend used to be reachable only through a socket-activated
+# aigw-backend-proxy@<conn>.service instance -- bash + python + getent +
+# systemctl + socat, one of those per TCP connection. Opening one per
+# request turned a single PWA page load (which fetches every attachment on
+# the session at once) into a burst of hundreds of activations, and past
+# systemd's trigger limit the *listening* socket itself failed permanently,
+# so everything after that got ECONNREFUSED (the deployment notes).
+# Reusing HTTP/1.1 connections collapsed that onto a handful of long-lived
+# socat relays; now that aigw-gateway talks to aigw-backend's own socket
+# directly (the deployment notes, 2026-08-30 -- see backend_socket_path_for), reuse
+# just means fewer accept()/thread-spawns on that ThreadingHTTPServer, the
+# same reason any keep-alive pool exists. Kept for that reason even though
+# the *original* failure mode (systemd's per-connection trigger limit) no
+# longer applies at all now that there is no per-connection systemd unit in
+# the path anymore.
+#
+# Only responses with a Content-Length are ever handed back: the SSE stream is
+# deliberately close-delimited, so its connection is spent once used.
+POOL_MAX_IDLE_PER_PORT = 8
+# An idle entry is one open socket into a ThreadingHTTPServer worker thread,
+# and the idle reaper may stop the backend under us at any time -- so don't
+# trust one that has been sitting for a while, just open a fresh one.
+POOL_MAX_IDLE_SECONDS = 300
+# Pause before the one cold-start retry in backend_request(). The activation
+# handler already polls for the backend's own socket for ~10s before giving
+# up, so this is only to avoid racing straight back in on the rare occasion
+# it still lost -- not a second full startup budget.
+BACKEND_COLD_START_RETRY_DELAY = 0.5
+
+_pool_lock = threading.Lock()
+_pool = {}  # backend socket path -> list of (idle_since_monotonic, HTTPConnection)
+
+
+def _backend_conn_get(sock_path: str):
+    """(connection, reused) -- an idle keep-alive connection, or a new one."""
+    now = time.monotonic()
+    with _pool_lock:
+        entries = _pool.get(sock_path, [])
+        while entries:
+            idle_since, conn = entries.pop()
+            if now - idle_since <= POOL_MAX_IDLE_SECONDS:
+                return conn, True
+            conn.close()
+    return UnixHTTPConnection(sock_path), False
+
+
+def backend_conn_put(sock_path: str, conn) -> None:
+    """Hand a connection whose response was read to its end back for reuse."""
+    with _pool_lock:
+        entries = _pool.setdefault(sock_path, [])
+        if len(entries) >= POOL_MAX_IDLE_PER_PORT:
+            conn.close()
+            return
+        entries.append((time.monotonic(), conn))
+
+
+def backend_request(sock_path, method, path, body=None, headers=None, timeout=60):
+    """Send one request to a backend, over a pooled connection when there is
+    one. Returns (conn, response); the caller owns conn and must either
+    backend_conn_put() it after reading the body to its end, or close it.
+
+    A connection out of the pool can have been closed at the far end since it
+    was last used (backend restarted, idle reaper stopped it). That shows up
+    only when we try to use it, and the request never reached anyone, so it
+    is safe to discard it and try again -- each attempt drops one dead entry,
+    and once the pool is empty the failure is real and propagates.
+
+    A *fresh* connection failing is different: sock_path is the
+    socket-activated listener (see backend_socket_path_for), so systemd
+    accepts and starts a stopped aigw-backend for us. What can still fail is
+    the relay behind it -- aigw-proxy-handler gives a cold backend ~10s to
+    open its own socket and exits non-zero if it never does, which reaches us
+    as the connection closing before a response. Retrying once covers a
+    backend that was merely slow to come up (the normal case for a session
+    nobody has opened in a while -- see aigw-reap-idle); a second failure is
+    real and propagates."""
+    retried_cold_start = False
+    while True:
+        conn, reused = _backend_conn_get(sock_path)
+        # Applies to a fresh and a pooled connection alike: on a pooled one the
+        # socket already exists, so setting conn.timeout alone would not touch
+        # it.
+        conn.timeout = timeout
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            return conn, conn.getresponse()
+        except (http.client.HTTPException, OSError) as e:
+            conn.close()
+            if reused:
+                continue  # stale pooled connection -- drop it, try a fresh one
+            if not retried_cold_start:
+                # Give systemd's activation one more go: the first connect
+                # is what started the backend, and it may not have finished
+                # opening its own socket before the relay gave up.
+                retried_cold_start = True
+                time.sleep(BACKEND_COLD_START_RETRY_DELAY)
+                continue
+            raise
+
+
+def is_safe_next_path(path: str) -> bool:
+    """Only a same-site relative path is allowed for post-login redirect --
+    guards against this becoming an open redirect (e.g. `//evil.com/...` or
+    `https://evil.com/...` smuggled through the `next` query parameter)."""
+    if not path or not path.startswith("/") or path.startswith("//"):
+        return False
+    if "\\" in path or "\n" in path or "\r" in path:
+        return False
+    return len(path) < 2000
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        log(fmt % args)
+
+    def _cookies(self):
+        c = SimpleCookie()
+        c.load(self.headers.get("Cookie", ""))
+        return c
+
+    def _current_username(self):
+        """Who the caller is authenticated as, or None. As a side effect,
+        when the store says this cookie is due for rotation (or is a
+        just-superseded one still inside its grace window -- see
+        check_and_rotate_session), stashes the replacement Set-Cookie
+        header on self so every response-sending helper below
+        (_send_json/_send_html/_send_redirect/_send_file, and
+        _proxy_to_backend's own manual header-writing) can attach it
+        without every one of this method's ~10 call sites having to plumb
+        a new cookie value back through its own return value. Also stashes
+        the jti that is authoritative as of this call, for
+        _proxy_to_backend's SSE branch to keep extending via
+        _session_touch() for as long as that one stream stays open (see
+        _session_touch's own docstring for why that needs its own path).
+        Both are reset to None at the top of do_GET/do_POST so a rotation
+        from one keep-alive request on this connection can never leak onto
+        a later, unrelated request on the same connection."""
+        cookies = self._cookies()
+        if SESSION_COOKIE not in cookies:
+            return None
+        username, new_cookie_header, current_jti = check_and_rotate_session(cookies[SESSION_COOKIE].value)
+        if new_cookie_header is not None:
+            self._pending_session_cookie_header = new_cookie_header
+        if current_jti is not None:
+            self._pending_session_jti = current_jti
+        return username
+
+    def _send_extra_headers(self, extra_headers):
+        # A header key can map to a single value or a list -- Set-Cookie in
+        # particular legitimately needs multiple separate header lines in one
+        # response (list values must never be str()'d into one line).
+        for k, v in (extra_headers or {}).items():
+            for item in (v if isinstance(v, list) else [v]):
+                self.send_header(k, item)
+        # A rotated/re-issued session cookie from this same request's
+        # _current_username() call (see its own docstring) rides along on
+        # every response automatically -- callers that already pass an
+        # explicit Set-Cookie (login, logout, signup) never trigger
+        # rotation in the first place, since none of them read the OLD
+        # session cookie via _current_username() before issuing a new one.
+        pending = getattr(self, "_pending_session_cookie_header", None)
+        if pending is not None:
+            self.send_header("Set-Cookie", pending)
+
+    def _send_json(self, code, obj, extra_headers=None):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_extra_headers(extra_headers)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, code, html, extra_headers=None):
+        body = html.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_extra_headers(extra_headers)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_redirect(self, location, extra_headers=None):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self._send_extra_headers(extra_headers)
+        self.end_headers()
+
+    def _send_file(self, path: Path, content_type):
+        if not path.is_file():
+            return self._send_json(404, {"error": "not found"})
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        # Unlike _send_json/_send_html this never takes an extra_headers
+        # param (no caller has ever needed one), but _route_index and
+        # _route_docs_page both call _current_username() -- which can stash
+        # a rotated cookie (see its docstring) -- and then send a static
+        # file in response, so this needs the same pending-cookie check
+        # _send_extra_headers does, not the full extra_headers machinery.
+        pending = getattr(self, "_pending_session_cookie_header", None)
+        if pending is not None:
+            self.send_header("Set-Cookie", pending)
+        self.end_headers()
+        self.wfile.write(data)
+
+    # ---- routing -----------------------------------------------------
+
+    def do_GET(self):
+        # See _current_username()'s docstring: these must be cleared at the
+        # start of every request, not just when a cookie happens to be
+        # rotated, since HTTP/1.1 keep-alive means the same Handler
+        # instance (and therefore the same self) serves every request on
+        # this connection in turn.
+        self._pending_session_cookie_header = None
+        self._pending_session_jti = None
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+
+        if path in (BASE_PATH, BASE_PATH + "/"):
+            return self._route_index()
+        if path == f"{BASE_PATH}/login":
+            return self._route_login(qs)
+        if path == f"{BASE_PATH}/oauth2callback":
+            return self._route_oauth_callback(qs)
+        # /agents/logout moved to POST-only (the design notes Phase 3,
+        # 2026-08-30) -- it changes state (server-side session revocation),
+        # and a GET here used to mean any site could log a victim out via a
+        # plain top-level navigation/<img>/<a> (SameSite=Lax does not stop
+        # that -- Lax only withholds cookies from cross-site *subrequests*,
+        # not from a top-level GET navigation, which is exactly how a link
+        # or auto-submitting redirect works). See _route_logout below and
+        # the design notes for the matching app.js change (not made here -- app.js
+        # is owned by another task). A bare GET here now just falls through
+        # to the 404 at the bottom of this method, same as any other
+        # unrecognized path -- there is no reason to special-case a 405.
+        # Optional, deployment-supplied routes (the deployment notes
+        # split): self-signup, the doc-tool viewer, and other deployment-
+        # specific routes -- see aigw_site_routes.py and the SITE_CTX/
+        # aigw_site_routes import above. None of what this module used to
+        # hardcode here belong in a generic published core.
+        if aigw_site_routes and aigw_site_routes.handle_get(self, SITE_CTX, path, qs):
+            return
+        if path == f"{BASE_PATH}/manifest.json":
+            return self._send_file(STATIC_DIR / "manifest.json", "application/manifest+json")
+        if path == f"{BASE_PATH}/sw.js":
+            return self._send_file(STATIC_DIR / "sw.js", "application/javascript")
+        if path == f"{BASE_PATH}/app.js":
+            return self._send_file(STATIC_DIR / "app.js", "application/javascript")
+        # Optional, deployment-supplied extension for the two empty
+        # "site-extra-*" hook points in index.html (the deployment notes
+        # public-split's frontend follow-up) -- e.g. an internal docs-viewer
+        # header link, or whatever else a given deployment wants that the
+        # published core app.js/index.html deliberately don't bake in.
+        # _send_file already 404s cleanly if
+        # the file isn't there, which is the common case for anyone running
+        # just the published core. Unauthenticated like app.js/sw.js above --
+        # same reasoning: nothing session-specific belongs in a file loaded
+        # before login even happens.
+        if path == f"{BASE_PATH}/site-extras.js":
+            return self._send_file(STATIC_DIR / "site-extras.js", "application/javascript")
+        # A GLB/GLTF a session generated (media-cli's generators, via
+        # $AIGW_OUTBOX) has nothing in a plain browser that can show it --
+        # this and the vendored <model-viewer> script below are what a
+        # tapped "model3d" chat attachment opens in a new tab (see
+        # the deployment notes). Unauthenticated like app.js/sw.js:
+        # neither file has anything session-specific in it, only the `src`
+        # query param (an already-authenticated /api/sessions/.../files/...
+        # URL) does, and that URL still needs the real session cookie to
+        # actually return data.
+        if path == f"{BASE_PATH}/viewer3d.html":
+            return self._send_file(STATIC_DIR / "viewer3d.html", "text/html; charset=utf-8")
+        if path == f"{BASE_PATH}/vendor/model-viewer.min.js":
+            return self._send_file(STATIC_DIR / "vendor" / "model-viewer.min.js", "application/javascript")
+        # Passkey registration page (Phase 2b). `aigw-passkey register <user>`
+        # -- root-only, see the deployment notes' sibling section --
+        # prints exactly this URL with ?user=&token=, so the path is fixed by
+        # that CLI and must not be renamed without changing REGISTER_URL_BASE
+        # there too. Served from behind the normal login gate on purpose: the
+        # root-minted one-time token proves an administrator authorized *a*
+        # registration, and being logged in as the target user is what proves
+        # who it is for -- aigw-backend fills the "user" field of every
+        # unlockd call from its own Unix identity (getpass.getuser()), never
+        # from this page's query string, so a token minted for one user is
+        # unusable from anyone else's session even though the name is right
+        # there in the URL.
+        if path == f"{BASE_PATH}/passkey/register":
+            return self._send_file(STATIC_DIR / "passkey-register.html", "text/html; charset=utf-8")
+        if path == f"{BASE_PATH}/api/me":
+            return self._route_api_me()
+        if path == f"{BASE_PATH}/api/vapid-public-key":
+            return self._route_vapid_public_key()
+        if path == f"{BASE_PATH}/api/sandbox-auth":
+            return self._route_sandbox_auth()
+        if path == f"{BASE_PATH}/api/shared-with-me":
+            return self._route_shared_with_me()
+        m = SHARED_PREFIX_RE.match(path)
+        if m:
+            # the deployment notes, the design review: see
+            # SHARED_ALLOWED_GET_RE's own comment above -- this must reject
+            # before ever calling _proxy_to_backend, since that call is what
+            # actually reaches the OTHER user's backend.
+            if not SHARED_ALLOWED_GET_RE.match(m.group(2)):
+                return self._send_json(403, {"error": "not allowed for a shared session"})
+            return self._proxy_to_backend("GET", m.group(2), qs_raw=parsed.query, target_username=m.group(1))
+        if path.startswith(f"{BASE_PATH}/api/"):
+            return self._proxy_to_backend("GET", path[len(f"{BASE_PATH}/api"):], qs_raw=parsed.query)
+
+        self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        self._pending_session_cookie_header = None  # see do_GET's own comment
+        self._pending_session_jti = None
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == f"{BASE_PATH}/logout":
+            return self._route_logout()
+        if aigw_site_routes and aigw_site_routes.handle_post(self, SITE_CTX, path):
+            return
+        share_m = SESSION_SHARE_RE.match(path)
+        if share_m:
+            return self._route_share_or_unshare(share_m.group(1), share_m.group(2), parsed.query)
+        m = SHARED_PREFIX_RE.match(path)
+        if m:
+            # the deployment notes, the design review (revision 2):
+            # see SHARED_ALLOWED_POST_RE's own comment above
+            # SHARED_ALLOWED_GET_RE -- messages/keys/stop/resize/rename are
+            # allowed (aigw-backend's resolve_session_access already gates
+            # them correctly per-session); everything else -- notably
+            # push/subscribe, sessions (create), chrome/kill -- used to be
+            # exactly how those were reachable against an arbitrary target
+            # user at all. Reject before ever calling _proxy_to_backend.
+            if not SHARED_ALLOWED_POST_RE.match(m.group(2)):
+                return self._send_json(403, {"error": "not allowed for a shared session"})
+            return self._proxy_to_backend("POST", m.group(2), qs_raw=parsed.query, target_username=m.group(1))
+        if path.startswith(f"{BASE_PATH}/api/"):
+            return self._proxy_to_backend("POST", path[len(f"{BASE_PATH}/api"):], qs_raw=parsed.query)
+        self._send_json(404, {"error": "not found"})
+
+    # ---- routes --------------------------------------------------------
+
+    def _route_index(self):
+        username = self._current_username()
+        if username is None:
+            return self._send_file(STATIC_DIR / "login.html", "text/html; charset=utf-8")
+        return self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+
+    def _route_login(self, qs):
+        client = load_oauth_client()
+        if client is None:
+            return self._send_file(STATIC_DIR / "not_configured.html", "text/html; charset=utf-8")
+
+        state = secrets.token_urlsafe(24)
+        params = {
+            "client_id": client["client_id"],
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "prompt": "select_account",
+        }
+        url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+        headers = {}
+        state_cookie = f"{OAUTH_STATE_COOKIE}={state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600"
+        # Path=/ (not just BASE_PATH) since `next` can point outside /agents/
+        # (e.g. a /sandbox/port<N> URL sent here by the auth_request redirect).
+        next_path = qs.get("next", [None])[0]
+        if next_path and is_safe_next_path(next_path):
+            next_cookie = f"{NEXT_COOKIE}={next_path}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600"
+            self._send_redirect(url, {"Set-Cookie": [state_cookie, next_cookie]})
+        else:
+            self._send_redirect(url, {"Set-Cookie": state_cookie})
+
+    def _route_oauth_callback(self, qs):
+        client = load_oauth_client()
+        if client is None:
+            return self._send_file(STATIC_DIR / "not_configured.html", "text/html; charset=utf-8")
+
+        error = qs.get("error", [None])[0]
+        if error:
+            return self._send_json(400, {"error": error})
+
+        code = qs.get("code", [None])[0]
+        returned_state = qs.get("state", [None])[0]
+        cookies = self._cookies()
+        expected_state = cookies[OAUTH_STATE_COOKIE].value if OAUTH_STATE_COOKIE in cookies else None
+        if not code or not returned_state or returned_state != expected_state:
+            return self._send_json(400, {"error": "invalid oauth state"})
+
+        try:
+            claims = self._exchange_code_for_claims(client, code)
+        except Exception as e:
+            log(f"oauth exchange failed: {e}")
+            return self._send_json(502, {"error": "google token exchange failed"})
+
+        if not claims.get("email_verified"):
+            return self._send_json(403, {"error": "email not verified by google"})
+
+        email = claims["email"].strip().lower()
+        username = find_username_for_email(email)
+        if username is None:
+            # A deployment-supplied site route (the deployment notes
+            # split) can offer self-signup for its own fixed domain here --
+            # see aigw_site_routes.maybe_start_signup's own docstring for
+            # the "hd" claim check it does before ever writing a response.
+            # Everyone else (or any deployment with no such module at all)
+            # just gets not_registered.html, unchanged.
+            if aigw_site_routes and aigw_site_routes.maybe_start_signup(self, SITE_CTX, email, claims):
+                return
+            return self._send_file(STATIC_DIR / "not_registered.html", "text/html; charset=utf-8")
+
+        session_cookie, absolute_exp = make_session_cookie(username)
+        # Path=/ (not just BASE_PATH): the session cookie must also be sent
+        # for /sandbox/port<N> requests, since nginx's auth_request subrequest
+        # to /agents/api/sandbox-auth only ever sees whatever Cookie header
+        # the browser actually attached to the original request -- if this
+        # cookie were scoped to /agents, the browser would never attach it to
+        # a /sandbox/... request at all and the auth check would always fail.
+        #
+        # aigw_oauth_state stays SameSite=Lax (the design notes): this whole
+        # method only ever runs because Google just navigated the browser
+        # here as a cross-site top-level GET (accounts.google.com ->
+        # /agents/oauth2callback). Cookie-reading and SameSite are both
+        # decided per-request, at the moment a cookie would be attached --
+        # not per-cookie for its whole lifetime -- so aigw_oauth_state,
+        # read right above via self._cookies(), would simply never arrive
+        # on this exact request if it were Strict, and the state comparison
+        # a few lines up would fail on every single login, permanently.
+        # aigw_next below is read on this same cross-site request for the
+        # same reason and must stay Lax too.
+        clear_state = f"{OAUTH_STATE_COOKIE}=; Path=/; Max-Age=0"
+        set_session = _session_set_cookie_header(session_cookie, absolute_exp)
+        cookies = self._cookies()
+        next_path = cookies[NEXT_COOKIE].value if NEXT_COOKIE in cookies else None
+        redirect_to = next_path if (next_path and is_safe_next_path(next_path)) else BASE_PATH + "/"
+        clear_next = f"{NEXT_COOKIE}=; Path=/; Max-Age=0"
+
+        self.send_response(302)
+        self.send_header("Location", redirect_to)
+        self.send_header("Set-Cookie", clear_state)
+        self.send_header("Set-Cookie", clear_next)
+        self.send_header("Set-Cookie", set_session)
+        self.end_headers()
+
+    def _exchange_code_for_claims(self, client, code):
+        from google_auth_oauthlib.flow import Flow
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+
+        flow = Flow.from_client_config(
+            {"web": {
+                "client_id": client["client_id"],
+                "client_secret": client["client_secret"],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }},
+            scopes=["openid", "https://www.googleapis.com/auth/userinfo.email",
+                    "https://www.googleapis.com/auth/userinfo.profile"],
+            redirect_uri=REDIRECT_URI,
+        )
+        flow.fetch_token(code=code)
+        return google_id_token.verify_oauth2_token(
+            flow.credentials.id_token, GoogleAuthRequest(), audience=client["client_id"]
+        )
+
+    def _route_logout(self):
+        """POST-only (the design notes Phase 3, 2026-08-30 -- see the
+        comment on the removed GET dispatch in do_GET). Actually revokes
+        the session server-side now (_revoke_session_from_cookie), unlike
+        the pre-Phase-3 version of this route, which only ever cleared the
+        browser's own copy -- a stolen cookie stayed valid up to its `exp`
+        regardless of how many times the victim "logged out" (the design notes). Called
+        via fetch(), not a navigation, so this returns JSON rather than a
+        redirect; the design notes has the exact app.js change this expects
+        (fetch(..., {method: "POST"}) then a client-side redirect)."""
+        cookies = self._cookies()
+        if SESSION_COOKIE in cookies:
+            _revoke_session_from_cookie(cookies[SESSION_COOKIE].value)
+        clear = f"{SESSION_COOKIE}=; Path=/; Max-Age=0"
+        self._send_json(200, {"ok": True}, extra_headers={"Set-Cookie": clear})
+
+    def _route_api_me(self):
+        username = self._current_username()
+        if username is None:
+            return self._send_json(401, {"error": "not logged in"})
+        self._send_json(200, {"username": username})
+
+    def _route_vapid_public_key(self):
+        if not os.path.exists(VAPID_PUBLIC_FILE):
+            return self._send_json(404, {"error": "not configured"})
+        key = Path(VAPID_PUBLIC_FILE).read_text().strip()
+        self._send_json(200, {"key": key})
+
+    def _route_sandbox_auth(self):
+        """Backing endpoint for nginx's `auth_request` in front of
+        /sandbox/port<N>/... and /sandbox/<owner>/port<N>/... (see the
+        CHANGELOG/README for the full nginx config). Reuses the exact same
+        session cookie as /agents/ -- there is no separate auth for the
+        sandbox proxy, by design (the user asked for "if not already OAuth'd
+        via agents, do that first"). X-Sandbox-Owner (set by nginx from the
+        URL's $sbowner capture, empty for the self-only path) picks whose
+        container to resolve -- any logged-in aigw user may look up any
+        other user's container this way, no allowlist (2026-08-28, at the
+        user's explicit request: "any user", unlike the deployment notes'
+        per-viewer session sharing). Returns 401 (not logged in at all --
+        nginx redirects to login), 403 (X-Sandbox-Owner names no such user --
+        403, not 404: nginx's auth_request module only ever special-cases
+        401/403 from this subrequest via error_page, anything else becomes a
+        generic 500 "unexpected status" instead of reaching our own
+        error_page), or 502 (logged in, but the target container/port lookup
+        failed) on failure, 200 with an X-Container-IP header on success;
+        nginx captures that header via auth_request_set and uses it as the
+        proxy_pass target."""
+        username = self._current_username()
+        if username is None:
+            return self._send_json(401, {"error": "not logged in"})
+        owner = self.headers.get("X-Sandbox-Owner") or username
+        try:
+            sock_path = backend_socket_path_for(owner)
+        except KeyError:
+            return self._send_json(403, {"error": "no such user"})
+        try:
+            conn, resp = backend_request(sock_path, "GET", "/container-ip", timeout=15)
+            body = json.loads(resp.read())
+            backend_conn_put(sock_path, conn)
+        except (ConnectionRefusedError, OSError, socket.timeout,
+                http.client.HTTPException, ValueError) as e:
+            return self._send_json(502, {"error": f"container lookup failed: {e}"})
+        if resp.status != 200 or "ip" not in body:
+            return self._send_json(502, {"error": body.get("error", "container lookup failed")})
+        self._send_json(200, {"ok": True}, extra_headers={"X-Container-IP": body["ip"]})
+
+    # ---- proxy to per-user backend --------------------------------------
+
+    def _proxy_to_backend(self, method, backend_path, qs_raw="", target_username=None, on_success=None):
+        """target_username lets a caller reach a DIFFERENT user's backend
+        (the deployment notes' /shared/<owner>/... routes) -- default None means
+        the normal case, this same user's own backend. Whenever the target
+        differs from whoever is actually asking, X-Aigw-On-Behalf-Of carries
+        the real caller so the target backend can check that session's own
+        shared_with list; aigw-backend's socket is reachable only by
+        aigw-gateway (this process, via group "aigw") and by the target
+        user themselves (the deployment notes), so a phone client has no way to
+        forge this header at all -- it never reaches aigw-backend directly.
+
+        on_success(username, request_body, response_payload), if given, runs
+        only when the backend answered 200 with a Content-Length body --
+        used solely by the share/unshare routes to update this gateway's own
+        cross-user share hint (the deployment notes) right where the request/response
+        already pass through here, with no separate backend-to-gateway call
+        or second read of the (single-use) request stream needed."""
+        username = self._current_username()
+        if username is None:
+            return self._send_json(401, {"error": "not logged in"})
+
+        target = target_username or username
+        try:
+            sock_path = backend_socket_path_for(target)
+        except KeyError:
+            return self._send_json(404, {"error": "no such user"})
+
+        # backend_request()'s own 60s default leaves too little margin for
+        # POST /sessions (and /claude-auth/login, which creates a session the
+        # same way for its "claude-login" preset): create_session()'s
+        # "new-session" tmux_exec call alone floors at 45s on a cold MSYS2
+        # tmux fork on an ssh:<machine> (aigw-backend's own comment on that
+        # floor), before its two follow-up tmux calls (set-option/
+        # respawn-pane) even start -- each its own ssh round trip. Measured
+        # 2026-09-16: a real create on winbox-a hit exactly this, the gateway
+        # gave up and answered 502 while aigw-backend kept going and finished
+        # the session anyway, invisible to the browser until the next
+        # unrelated GET /sessions (the deployment notes). nginx's
+        # own proxy_read_timeout for /agents/ is 360s, so there is room to be
+        # more patient here specifically.
+        SLOW_CREATE_PATHS = ("/sessions", "/claude-auth/login")
+        timeout = 150 if method == "POST" and backend_path in SLOW_CREATE_PATHS else 60
+
+        # backend_path here is e.g. "/sessions/<id>/events" (BASE_PATH/api
+        # prefix already stripped) -- this is exactly aigw-backend's own
+        # route namespace.
+        if qs_raw:
+            backend_path = f"{backend_path}?{qs_raw}"
+
+        body = None
+        if method == "POST":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+
+        headers = {"Content-Type": self.headers.get("Content-Type", "application/json")}
+        if self.headers.get("Last-Event-ID"):
+            headers["Last-Event-ID"] = self.headers["Last-Event-ID"]
+        if target != username:
+            headers["X-Aigw-On-Behalf-Of"] = username
+
+        try:
+            conn, resp = backend_request(sock_path, method, backend_path,
+                                         body=body, headers=headers, timeout=timeout)
+        except (ConnectionRefusedError, OSError, socket.timeout,
+                http.client.HTTPException) as e:
+            return self._send_json(502, {"error": f"backend unreachable: {e}"})
+
+        content_type = resp.getheader("Content-Type", "application/octet-stream")
+        content_length = resp.getheader("Content-Length")
+        content_disposition = resp.getheader("Content-Disposition")
+
+        self.send_response(resp.status)
+        # This path writes headers directly (send_response/send_header/
+        # end_headers) rather than through _send_json/_send_html, so it
+        # does not get _send_extra_headers' automatic pending-rotation-
+        # cookie attachment for free -- do it explicitly here. Both the
+        # buffered branch below and the SSE branch further down need this,
+        # since a proxied request is exactly the kind of ordinary
+        # authenticated traffic a 5-minute rotation is meant to ride along
+        # on (see _current_username's docstring).
+        pending = getattr(self, "_pending_session_cookie_header", None)
+        if pending is not None:
+            self.send_header("Set-Cookie", pending)
+        self.send_header("Content-Type", content_type)
+        # Relayed for aigw-backend's /sessions/<id>/download -- without it,
+        # the browser has no way to know this response should download as a
+        # file rather than navigate to it (measured: silently dropped here
+        # before, even though aigw-backend sent it correctly).
+        if content_disposition is not None:
+            self.send_header("Content-Disposition", content_disposition)
+        if content_length is not None:
+            try:
+                payload = resp.read(int(content_length))
+            except (OSError, http.client.HTTPException) as e:
+                # Backend went away partway through its own response. Nothing
+                # has been written to the phone yet (headers are buffered until
+                # end_headers), so a clean 502 is still possible.
+                conn.close()
+                return self._send_json(502, {"error": f"backend closed mid-response: {e}"})
+            # The response is complete, so the connection is clean and can go
+            # back in the pool -- unless the backend said otherwise (a 1.0-style
+            # `Connection: close`), which http.client tracks as will_close.
+            # Do this before writing to the phone: that write can raise if it
+            # hung up, and there is no reason to throw away a good connection
+            # to the backend over that.
+            if resp.will_close:
+                conn.close()
+            else:
+                backend_conn_put(sock_path, conn)
+            if on_success and resp.status == 200:
+                on_success(username, body, payload)
+            self.send_header("Content-Length", content_length)
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        # No Content-Length -- this is the SSE stream (aigw-backend leaves it
+        # unset deliberately and relies on close-delimited framing, RFC 7230
+        # the design notes case 7). Relay raw chunks through as they arrive, likewise
+        # without a Content-Length, so nginx/the browser see the same framing.
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        # the deployment notes, Phase 3 review point 3 (2026-08-30): this
+        # connection routinely outlives ordinary request traffic on its own
+        # -- aigw-backend keeps it open indefinitely with a 20s
+        # `: keep-alive` (see that route's own comment), so a user just
+        # watching a chat update live can go a long time with no *new* HTTP
+        # request ever reaching _current_username(). session_jti (stashed
+        # by that same call, before headers were sent) lets _session_touch
+        # notice, mid-stream, if this session's absolute_exp passes or it
+        # gets revoked while the stream itself stays open -- see that
+        # function's own docstring for why it still matters even though
+        # idle timeout (its original reason for existing) was removed
+        # 2026-08-31. Headers are already flushed by this point, so this
+        # can never re-issue a rotated Set-Cookie the way the ordinary
+        # per-request path does; that is fine, this jti was already the tip
+        # when the stream opened, and it is never allowed to rotate further
+        # while superseded (see _session_touch).
+        session_jti = getattr(self, "_pending_session_jti", None)
+        last_touch = time.monotonic()
+        try:
+            while True:
+                # read(1) is deliberate, not a typo: io.BufferedReader.read(n)
+                # loops calling the underlying raw socket read until it
+                # accumulates n bytes (or EOF) -- for this close-delimited,
+                # trickle-fed SSE stream that means read(1024) would block
+                # for several events' worth of data before returning anything.
+                # amt=1 is satisfied by the first byte that arrives, so each
+                # already-available chunk gets forwarded immediately instead.
+                chunk = resp.read(1)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                if session_jti is not None and time.monotonic() - last_touch >= SESSION_LAST_SEEN_WRITE_THROTTLE:
+                    last_touch = time.monotonic()
+                    if not _session_touch(session_jti, username):
+                        # Revoked/idle/absolute-expired while this stream was
+                        # open -- cut it off now rather than let an already
+                        # "logged out" session keep silently receiving chat
+                        # content on a connection nothing else re-checks.
+                        break
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            conn.close()
+
+    def _route_share_or_unshare(self, session_id, action, qs_raw):
+        """POST /agents/api/sessions/<id>/share|unshare (the deployment notes) --
+        stays on the ordinary own-backend path (the caller is always acting
+        on their OWN session; there is no owner param here to spoof), but on
+        a successful `share` also records the hint this gateway's
+        /shared-with-me needs: which owners a given viewer should ask."""
+        def remember_share(owner, request_body, _response_payload):
+            if action != "share":
+                return
+            try:
+                viewer = json.loads(request_body).get("username") if request_body else None
+            except ValueError:
+                viewer = None
+            if viewer:
+                _add_share_hint(owner, viewer)
+
+        return self._proxy_to_backend(
+            "POST", f"/sessions/{session_id}/{action}", qs_raw=qs_raw, on_success=remember_share,
+        )
+
+    def _route_shared_with_me(self):
+        """GET /agents/api/shared-with-me (the deployment notes): for every owner
+        this gateway has ever seen share something with the caller, ask that
+        owner's own backend for the caller's on-behalf-of-filtered session
+        list (the authoritative shared_with check happens there, not here --
+        see aigw-backend's list_sessions) and merge the results. An owner
+        entry that no longer shares anything just yields an empty list; this
+        index is only ever a hint about who to ask, never itself a grant."""
+        username = self._current_username()
+        if username is None:
+            return self._send_json(401, {"error": "not logged in"})
+
+        index = _load_shares_index()
+        owners = index.get(username, [])
+        sessions = []
+        for owner in owners:
+            try:
+                sock_path = backend_socket_path_for(owner)
+            except KeyError:
+                continue
+            try:
+                conn, resp = backend_request(
+                    sock_path, "GET", "/sessions", headers={"X-Aigw-On-Behalf-Of": username},
+                )
+            except (ConnectionRefusedError, OSError, socket.timeout, http.client.HTTPException):
+                continue
+            try:
+                content_length = resp.getheader("Content-Length")
+                payload = resp.read(int(content_length)) if content_length else b""
+            except (OSError, http.client.HTTPException):
+                conn.close()
+                continue
+            if resp.will_close:
+                conn.close()
+            else:
+                backend_conn_put(sock_path, conn)
+            if resp.status != 200:
+                continue
+            try:
+                owner_sessions = json.loads(payload).get("sessions", [])
+            except ValueError:
+                continue
+            for s in owner_sessions:
+                sessions.append({**s, "owner": owner})
+        return self._send_json(200, {"sessions": sessions})
+
+
+def main():
+    server = ThreadingHTTPServer(("127.0.0.1", GATEWAY_PORT), Handler)
+    log(f"listening on 127.0.0.1:{GATEWAY_PORT}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop idle per-user aigw backend instances (aigw-backend@*)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aigw-reap-idle

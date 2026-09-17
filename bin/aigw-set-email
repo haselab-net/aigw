@@ -1,0 +1,61 @@
+#!/bin/bash
+# Self-service registration of the Google account email the "aigw" mobile
+# control panel should recognize for the caller's own Unix account. Stores it
+# in the "Other" slot of the account's own GECOS field (5th colon-separated
+# field of /etc/passwd), leaving Full Name/Room/Work phone/Home phone intact.
+#
+# We deliberately do NOT shell out to `chfn -o` here: on this host (and per
+# chfn(1) generally) the -o/--other field can only be changed by the
+# superuser, and even as root, `chfn` re-authenticates the invoking user via
+# PAM (a password prompt) -- which fails outright for accounts created via
+# `adm-adduser` (--disabled-password, SSH-key-only login, no usable Unix
+# password to authenticate with). Using `usermod -c` as root (via the same
+# self-elevation pattern as the adm-* scripts) sets the field directly with
+# no PAM/password step, so it works for every account regardless of whether
+# it has a usable password.
+set -euo pipefail
+
+# Self-elevate: re-exec through sudo if not root. Safe because this re-runs
+# the same allowlisted path (NOPASSWD for %sandboxusers, see
+# /etc/sudoers.d/aigw), not a broader command.
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo /usr/local/bin/aigw-set-email "$@"
+fi
+
+if [ -z "${SUDO_USER:-}" ]; then
+    echo "This must be run via sudo by a real user (normally just: aigw-set-email you@example.com)." >&2
+    exit 1
+fi
+username="$SUDO_USER"
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: aigw-set-email <email-address>" >&2
+    echo "       aigw-set-email --clear   (remove your registered email)" >&2
+    exit 1
+fi
+
+if [ "$1" = "--clear" ]; then
+    email=""
+else
+    # lowercase for consistent matching against Google's (case-insensitive in
+    # practice) verified email at login time
+    email="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    if ! [[ "$email" =~ ^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$ ]]; then
+        echo "Invalid email address: $1" >&2
+        exit 1
+    fi
+fi
+
+gecos="$(getent passwd "$username" | cut -d: -f5)"
+full="$(cut -d, -f1 <<<"$gecos")"
+room="$(cut -d, -f2 <<<"$gecos")"
+work="$(cut -d, -f3 <<<"$gecos")"
+home="$(cut -d, -f4 <<<"$gecos")"
+
+usermod -c "${full},${room},${work},${home},${email}" "$username"
+
+if [ -n "$email" ]; then
+    echo "Registered ${email} for ${username}. You can now sign in to the aigw mobile panel with this Google account."
+else
+    echo "Cleared the registered email for ${username}."
+fi
