@@ -52,6 +52,7 @@ outbox/ to have them shown as attachments, without this process ever needing
 to `docker exec` just to read them back out.
 """
 import base64
+import datetime
 import difflib
 import getpass
 import json
@@ -73,7 +74,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 HOME = Path.home()
 # This host's own public DNS name, for the one place it's needed below (a
@@ -88,6 +89,15 @@ PUBLIC_HOST = socket.getfqdn()
 SANDHOME = HOME / "sandhome"
 SESSIONS_DIR = SANDHOME / ".aigw"
 STATE_DIR = HOME / ".aigw-state"
+# Persisted screen-panel backlog, across a session's own lifetime (unlike
+# _screen_backlog, the in-memory cache this backs -- see _screen_log_path
+# and the "scrolled off" hookup in _watch_tmux_session,
+# the deployment notes). Under STATE_DIR, not SESSIONS_DIR: this
+# is the backend's own bookkeeping (same shelf as session_links.json/
+# push_subscriptions.json), never something a container-side process reads
+# or writes directly, unlike the per-session dirs under SESSIONS_DIR which
+# are bind-mounted into the container as $AIGW_OUTBOX and friends.
+SCREEN_LOG_DIR = STATE_DIR / "screen-logs"
 VAPID_PRIVATE_KEY_FILE = "/etc/aigw/vapid_private.pem"
 VAPID_SUB_FILE = "/etc/aigw/vapid_sub.txt"
 
@@ -98,6 +108,13 @@ VAPID_SUB_FILE = "/etc/aigw/vapid_sub.txt"
 # plain `claude` only because it runs `bash -l`.
 HOST_CLAUDE_BIN = str(HOME / ".local/bin/claude")
 ROOT_CLAUDE_BIN = "/root/.local/bin/claude"
+
+# Codex CLI is one shared /usr/local/bin/codex (root-owned, world-executable,
+# the deployment notes), not a per-user install like Claude Code above -- so
+# unlike HOST_CLAUDE_BIN/ROOT_CLAUDE_BIN there is only one path, same for
+# host and root. Still not a bare "codex" for the same PATH reason as above.
+HOST_CODEX_BIN = "/usr/local/bin/codex"
+ROOT_CODEX_BIN = "/usr/local/bin/codex"
 
 SESSION_ID_RE = re.compile(r"^[a-f0-9]{8,32}$")
 OUTBOX_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
@@ -438,18 +455,59 @@ TMUX_PRESETS = {
     # screen panel on a phone.
     "claude-tui": {"command": ["claude"], "location": "container",
                    "width": 100, "remote_control": True},
+    # Codex CLI's own interactive TUI (the deployment notes), added at the user's
+    # request "Claudeのように使えるように" -- deliberately screen-panel-only
+    # for now, not CWD_PRESETS/CLAUDE_TUI_PRESETS: no cwd/resume picker, no
+    # --remote-control (that flag is Anthropic's own protocol, meaningless
+    # here; Codex has its own unrelated `codex remote-control` for the
+    # ChatGPT app, not wired into aigw at all). Same reasoning as claude-tui
+    # for the login/status split below: `codex login` prints a URL and waits
+    # for a code, so it gets a pane like "claude-login"; `codex login status`/
+    # `codex logout` are one-shot and run through sandbox_exec/subprocess like
+    # their claude_auth_* counterparts. Not yet available in devbox-<user>
+    # containers built before the Dockerfile's codex install line landed --
+    # `sandbox stop` + a fresh `sandbox` picks up the rebuilt image.
+    #
+    # `--device-auth` (2026-09-27): bare `codex login` defaults to the
+    # loopback/browser-redirect flow, which starts an HTTP listener on
+    # *this* host and expects the browser that completes the OAuth consent
+    # to redirect back to http://localhost:<port>/... on that same host.
+    # Over aigw the browser is the phone, a different machine from the one
+    # running `codex login`, so that redirect can never land and the login
+    # pane just looks stuck on "browser login". `--device-auth` switches to
+    # the real OAuth device-code grant (confirmed with codex-cli 0.155.0,
+    # `codex login --help`): it prints a URL (auth.openai.com/codex/device)
+    # plus a one-time code, both meant to be used from any browser -- the
+    # same link-in-chat shape aigw already renders for claude-login, and no
+    # code needs to be typed back into the pane (it's entered on the
+    # browser page instead). the deployment notes' "no --device-auth
+    # flag" note predates this and is now stale.
+    "codex-login": {"command": ["codex", "login", "--device-auth"], "location": "container"},
+    "codex-login-host": {"command": [HOST_CODEX_BIN, "login", "--device-auth"], "location": "host"},
+    "codex-login-root": {"command": [ROOT_CODEX_BIN, "login", "--device-auth"], "location": "root",
+                         "env": ["HOME=/root", "USER=root", "LOGNAME=root"], "cwd": "/root"},
+    "codex-tui": {"command": ["codex"], "location": "container", "width": 100},
 }
+# Every preset that runs Codex's interactive TUI -- currently just the one
+# (unlike CLAUDE_TUI_PRESETS, no per-SSH_MACHINES entries: not asked for, and
+# codex isn't installed on any SSH_MACHINES entry). Kept as its own named
+# set anyway, same reasoning as CLAUDE_TUI_PRESETS/SSH_SHELL_PRESETS (their
+# own comments) -- a future SSH machine entry should not need a change
+# scattered through create_session.
+CODEX_TUI_PRESETS = {"codex-tui"}
 # One shell + one Claude-TUI + one claude-auth-login preset per SSH_MACHINES
 # entry, generated rather than hand-written per machine so a third machine is
 # one SSH_MACHINES entry, not six more of these. No AIGW_OUTBOX for any of
 # these: these machines share no filesystem with this host (unlike the
 # container, which is bind-mounted), so there is nowhere for an outbox file
-# to land. No resume either -- Claude Code's own conversation history for
-# these lives on the remote machine's filesystem, which this process has no
-# way to read except through a live shell into it. cwd is the one exception,
-# and only for the Claude preset on a machine whose SSH_MACHINES entry sets
-# "drives": True (winbox-a/winbox-b, not linuxbox) -- see CWD_PRESETS below
-# and resolve_ssh_workdir (the deployment notes).
+# to land. cwd (and, once one is chosen, resume) is the one exception, and
+# only for the Claude preset on a machine whose SSH_MACHINES entry sets
+# "drives": True (winbox-a/winbox-b, not linuxbox) -- see CWD_PRESETS below,
+# resolve_ssh_workdir (the deployment notes), and list_ssh_claude_
+# conversations/resolve_ssh_resume_id (the deployment notes) for how a
+# remote conversation history is read at all despite sharing no filesystem
+# with this host (a live `ssh`/`find`/`head` round trip per call, same
+# mechanism _ssh_list_jsonl/_ssh_read_new already use to tail a live chat).
 for _machine, _cfg in SSH_MACHINES.items():
     TMUX_PRESETS[f"shell-{_machine}"] = {"command": [_cfg["bash"], "-l"], "location": f"ssh:{_machine}"}
     # An interactive pane wants "claude_tui" when a machine defines one (see
@@ -490,10 +548,13 @@ HEADLESS_PRESETS = {"claude"}
 # Both run Claude Code, so both care which project directory they start in and
 # both accept `--resume <id>`; the plain shells do not. A drives-capable ssh
 # machine's Claude preset (claude-tui-<machine>, the deployment notes)
-# also takes a cwd -- resolved by resolve_ssh_workdir instead, against that
-# machine's own drives/folders rather than ~/sandhome -- but deliberately
-# never a resume; create_session checks that case separately, not by adding
-# claude-tui-<machine> to this set.
+# also takes a cwd and, once one is chosen, a resume -- resolved by
+# resolve_ssh_workdir/resolve_ssh_resume_id instead, against that machine's
+# own drives/folders and remote conversation logs rather than ~/sandhome
+# (the deployment notes). create_session checks that case separately
+# rather than adding claude-tui-<machine> to this set, because unlike the
+# two members below it has no fixed default directory to resume "the
+# current one" against when no cwd was chosen yet.
 #
 # "claude" is no longer offered in the preset dropdown (2026-08-02, at the
 # user's request -- the interactive TUI does everything it did, plus selection
@@ -501,6 +562,23 @@ HEADLESS_PRESETS = {"claude"}
 # created before that removal must keep working: they still render, still
 # accept messages, and still resume their own conversation.
 CWD_PRESETS = {"claude", "claude-tui"}
+
+# A working directory, but never resume (the deployment notes,
+# 2026-09-27, user request: reopening "shell"/"host-shell"/"root-shell" in
+# the same place it was last used, for screen-log-persist's own restore to
+# have somewhere stable to key on -- see that changelog entry). Kept
+# separate from CWD_PRESETS, not merged into it: the resume validation just
+# below stays exactly as strict as before for these three (no notion of a
+# prior conversation to resume, only a place to start in).
+#
+# "codex-tui" joined this set later (2026-09-28, user request: "codexもフォルダ
+# を選べるようにしてください") rather than CWD_PRESETS: it's container-located
+# and browses the same ~/sandhome tree "shell" does (scope=sandhome, the
+# default -- no new resolver), but still has no resume of its own (`~/.codex/`
+# is SQLite-based, not the plain .jsonl CWD_PRESETS' resume machinery reads,
+# the deployment notes) -- same reasoning that already kept it out of CWD_PRESETS for
+# the checkbox/remote-control differences (the deployment notes).
+SHELL_CWD_PRESETS = {"shell", "host-shell", "root-shell", "codex-tui"}
 
 ROOT_TMUX_SOCKET = f"/run/aigw-root-tmux/{getpass.getuser()}/sock"
 
@@ -687,8 +765,9 @@ def require_unlock_if_outside_sandbox(location):
     gate. Call this from every function that is about to do something
     outside this user's own sandbox container: as of this writing that is
     create_session, adopt_session, send_message, send_key, stop_session,
-    resize_session, claude_auth_logout_scope, start_claude_login, and
-    kill_all_chrome. One function, one call per caller, so a future
+    resize_session, claude_auth_logout_scope, start_claude_login,
+    kill_all_chrome, and (2026-09-27) list_root_subdirs/resolve_root_workdir
+    for "root-shell"'s own workdir picker. One function, one call per caller, so a future
     "sandbox-outside" action either goes through here or is a reviewable
     omission instead of a silently-missing check re-derived by hand at each
     new call site (the design notes: "個別に条件を書くと必ず漏れる").
@@ -1035,8 +1114,8 @@ def list_root_tmux_sessions():
 
     Returns None, not merely an empty set, when this user's window is
     currently locked (root_shell_allowed() is False): since 2026-08-31's
-    "sever access, don't kill the server" (the deployment notes
-    not-kill), a locked window does not mean the server has stopped, only
+    "sever access, don't kill the server"
+    (the deployment notes), a locked window does not mean the server has stopped, only
     that this process cannot currently reach its socket to ask. Callers MUST
     NOT treat None the same as "confirmed nothing running" -- see
     list_sessions()'s own handling of this, which is exactly why this
@@ -1192,6 +1271,12 @@ def list_sessions(on_behalf_of=None):
     live_root = None
     root_checked = False  # separate from live_root itself being None -- see below
     live_ssh = {}  # location -> set of names
+    # One read for the whole listing, not per-session -- see "session links"
+    # section (create_link etc.) for what this is. Never populated at all
+    # for on_behalf_of (a shared collaborator sees the same alive/preset/cwd
+    # fields as the owner, but linking is this account's own business, same
+    # as session-order).
+    links = _load_links() if on_behalf_of is None else {}
     out = []
     for d in sorted(SESSIONS_DIR.iterdir()):
         if not d.is_dir():
@@ -1246,6 +1331,17 @@ def list_sessions(on_behalf_of=None):
             if live_container is None:
                 live_container = list_tmux_sessions()
             meta["alive"] = meta.get("tmux_name", d.name) in live_container
+        link_id, rec = _link_for_session(links, d.name)
+        if rec is not None:
+            partner_id = _other_side(rec, d.name)
+            partner_meta = load_meta(partner_id)
+            meta["link"] = {
+                "id": link_id,
+                "partner": partner_id,
+                "partner_label": (partner_meta or {}).get("label", partner_id),
+                "turns_used": rec["turns_used"],
+                "max_turns": rec["max_turns"],
+            }
         out.append(meta)
         ensure_watcher(d.name)
     return out
@@ -1684,6 +1780,165 @@ def claude_auth_status_all():
     return result
 
 
+# ---- Codex CLI authentication (the deployment notes) ---------------------------
+#
+# Same three places, same reasoning, as the Claude Code block just above --
+# container/host/root, no ssh:<machine> (codex isn't installed on
+# any SSH_MACHINES entry, `codex-tui` isn't in CLAUDE_TUI_PRESETS' sibling
+# sets for those). The one real difference: `codex login status`/`codex
+# logout` have no `--json` form, just an exit code and a one-line human
+# message ("Logged in using ChatGPT" / "Not logged in"), so there is no
+# _parse_claude_auth_output equivalent to share -- the raw text *is* the
+# status, and the frontend renders {loggedIn, text} instead of Claude's
+# richer {loggedIn, email, authMethod, ...}.
+CODEX_AUTH_TIMEOUT = 60
+
+
+def _codex_status_result(returncode, out, err):
+    text = (out or "").strip() or (err or "").strip()
+    return {"loggedIn": returncode == 0, "text": text[:500]}
+
+
+def codex_auth_status():
+    """`codex login status` inside the container, via `sandbox exec` -- same
+    privilege as claude_auth_status (this user's own container, this user's
+    own command)."""
+    try:
+        r = sandbox_exec(["codex", "login", "status"], timeout=CODEX_AUTH_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"error": f"could not ask the container: {e}"}
+    return _codex_status_result(r.returncode, r.stdout, r.stderr)
+
+
+def codex_auth_logout():
+    try:
+        r = sandbox_exec(["codex", "logout"], timeout=CODEX_AUTH_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(f"could not ask the container: {e}")
+    if r.returncode != 0:
+        raise RuntimeError(((r.stderr or "").strip() or (r.stdout or "").strip()
+                            or f"exit {r.returncode}")[:500])
+    return (r.stdout or "").strip()[:500]
+
+
+def codex_auth_status_host():
+    """`codex login status` on the host itself, as this same user -- same
+    privilege as claude_auth_status_host."""
+    try:
+        r = subprocess.run(
+            [HOST_CODEX_BIN, "login", "status"],
+            capture_output=True, text=True, timeout=CODEX_AUTH_TIMEOUT,
+            cwd=os.path.expanduser("~"),
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"error": f"could not run on host: {e}"}
+    return _codex_status_result(r.returncode, r.stdout, r.stderr)
+
+
+def codex_auth_logout_host():
+    try:
+        r = subprocess.run(
+            [HOST_CODEX_BIN, "logout"],
+            capture_output=True, text=True, timeout=CODEX_AUTH_TIMEOUT,
+            cwd=os.path.expanduser("~"),
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(f"could not run on host: {e}")
+    if r.returncode != 0:
+        raise RuntimeError(((r.stderr or "").strip() or (r.stdout or "").strip()
+                            or f"exit {r.returncode}")[:500])
+    return (r.stdout or "").strip()[:500]
+
+
+def codex_auth_status_root():
+    """`codex login status` as root, through the root tmux server -- same
+    route and privilege boundary as claude_auth_status_root. -x 500/-y 50 for
+    the same reason that function gives (a multi-line answer truncated by a
+    short/narrow pane never satisfies `ready`); here the answer is one short
+    line, but the pane is shared machinery, not worth a second shape."""
+    if not root_shell_allowed():
+        return None
+
+    def as_result(text):
+        if not text:
+            return None
+        # No exit code to read from a captured pane (unlike claude_auth_
+        # status_root's JSON, whose loggedIn field is self-contained) -- the
+        # two literal messages `codex login status` prints are the only
+        # signal, confirmed 2026-09-24: "Logged in using ChatGPT" (exit 0)
+        # vs "Not logged in" (exit 1).
+        return _codex_status_result(0 if text.startswith("Logged in") else 1, text, "")
+
+    try:
+        out = _root_tmux_capture(f"{ROOT_CODEX_BIN} login status",
+                                 as_result, ROOT_AUTH_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"error": f"could not ask root: {e}"}
+    return out if out is not None else {"error": "no answer from the root pane"}
+
+
+def codex_auth_logout_root():
+    if not root_shell_allowed():
+        raise RuntimeError("root shell is not enabled for this user")
+    text = _root_tmux_capture(f"{ROOT_CODEX_BIN} logout",
+                              lambda t: t or None, ROOT_AUTH_TIMEOUT)
+    if text is None:
+        raise RuntimeError("no answer from the root pane")
+    return text[:500]
+
+
+def codex_auth_status_all():
+    return {
+        "container": codex_auth_status(),
+        "host": codex_auth_status_host(),
+        "root": codex_auth_status_root(),
+    }
+
+
+CODEX_LOGIN_SCOPES = {
+    "container": ("codex-login", "Codex ログイン"),
+    "host": ("codex-login-host", "Codex ログイン (host)"),
+    "root": ("codex-login-root", "Codex ログイン (root)"),
+}
+
+
+def start_codex_login(scope="container"):
+    """POST /codex-auth/login -- same shape and same "never a second
+    concurrent pane" reasoning as start_claude_login (its own comment)."""
+    if scope not in CODEX_LOGIN_SCOPES:
+        raise ValueError(f"unknown scope: {scope}")
+    require_unlock_if_outside_sandbox(scope)
+    if scope == "root" and not root_shell_allowed():
+        raise ValueError("root shell is not enabled for this user")
+    preset, label = CODEX_LOGIN_SCOPES[scope]
+    live = [m for m in list_sessions()
+            if m.get("preset") == preset and m.get("alive") and not m.get("stopped")]
+    live.sort(key=lambda m: m.get("created_ts", 0), reverse=True)
+    reuse = live[0] if live and time.time() - live[0].get("created_ts", 0) < CLAUDE_LOGIN_MAX_AGE else None
+    for m in live:
+        if reuse is None or m["id"] != reuse["id"]:
+            stop_session(m["id"])
+    if reuse is not None:
+        append_event(reuse["id"], {
+            "type": "system",
+            "text": "進行中のログインがあるので、それを開きました。"
+                    "このペインの案内に従って認証してください。",
+        })
+        return reuse
+    return create_session(preset, label)
+
+
+def codex_auth_logout_scope(scope):
+    if scope not in ("container", "host", "root"):
+        raise ValueError(f"unknown scope: {scope}")
+    require_unlock_if_outside_sandbox(scope)
+    if scope == "container":
+        return codex_auth_logout()
+    if scope == "host":
+        return codex_auth_logout_host()
+    return codex_auth_logout_root()
+
+
 # ---- headful-Chrome cleanup ("Kill Chrome" on the 設定 page) ---------------
 #
 # Left running (the deployment notes), each user's chrome-debug@<user>.service
@@ -1917,6 +2172,152 @@ def resolve_workdir(rel):
     return str(target)
 
 
+# ---- working-directory picker for "shell"'s non-Claude siblings -----------
+#
+# the deployment notes: "shell" already reuses resolve_workdir/
+# list_subdirs above unchanged (same ~/sandhome tree, same container). These
+# two cover "host-shell" and "root-shell" instead -- each a different
+# filesystem, with no single ~/sandhome-like root to stay inside (a
+# host-shell/root-shell pane already hands its user the run of that whole
+# filesystem, same reasoning list_ssh_subdirs' own comment gives for
+# ssh:<machine>), so unlike resolve_workdir there is no containment check --
+# only "is this a real directory".
+
+
+def list_host_subdirs(abs_path):
+    """Immediate subdirectories of one directory on the real host
+    filesystem, for "host-shell"'s own workdir picker. Local os.scandir, not
+    a docker exec or ssh round trip: "host-shell" already runs as this very
+    backend's own OS user directly on the host, so this process can already
+    read anything such a pane's shell could. Defaults to this user's real
+    $HOME, not "/", so the picker starts somewhere meaningful rather than at
+    the top of the whole host tree."""
+    root_path = abs_path or str(HOME)
+    out = []
+    try:
+        entries = sorted(os.scandir(root_path), key=lambda e: e.name)
+    except OSError:
+        return []
+    for e in entries:
+        if e.name.startswith("."):
+            continue
+        try:
+            if not e.is_dir():
+                continue
+        except OSError:
+            continue
+        out.append(e.name)
+        if len(out) >= SUBDIR_LIMIT:
+            break
+    return out
+
+
+def resolve_host_workdir(rel):
+    """Validate a client-supplied real-host working directory for
+    "host-shell". Must be an absolute path -- unlike resolve_workdir there
+    is no single tree this is relative to -- that this process's own OS
+    user can already see is a real directory. None means "wherever the pane
+    starts" (this user's real $HOME, same as never having passed -c at all)."""
+    if not rel or not rel.strip():
+        return None
+    rel = rel.strip()
+    if "\x00" in rel:
+        raise ValueError("invalid working directory")
+    target = Path(rel)
+    if not target.is_absolute():
+        raise ValueError("host-shell working directory must be an absolute path")
+    if not target.is_dir():
+        raise ValueError(f"no such directory: {rel}")
+    return str(target)
+
+
+# root-shell's own version of the two above routes through the root tmux
+# server instead (_root_tmux_capture, same "throwaway pane, capture its
+# output" mechanism claude_auth_status_root/kill_all_chrome already use) --
+# never a new ACL grant to this backend's own uid. aigw-root-tmux-grant's
+# existing bridge is deliberately narrow (one fixed path, read-only, for the
+# chat-log tailer only); a folder picker needs to read anywhere, so a
+# filesystem-wide grant to the backend user's own uid would be the wrong shape of
+# privilege to add just for this. Both self-gate on root_shell_allowed()/
+# require_unlock_if_outside_sandbox("root") -- the same root-tier passkey
+# window opening a root-shell pane already requires -- so a standalone
+# GET (browsing before a session even exists) cannot skip it just because
+# create_session's own gate runs earlier in that particular call path
+# (the deployment notes' sibling note on this same choice,
+# user-confirmed: reuse the existing unlock window rather than a fresh
+# per-request passkey challenge).
+ROOT_WORKDIR_TIMEOUT = 8
+
+
+def list_root_subdirs(abs_path):
+    """Immediate subdirectories of one directory on the real root
+    filesystem, for "root-shell"'s own workdir picker. Defaults to "/"
+    (2026-09-28, user request: browse from the real filesystem root, not
+    tucked away under /root the way list_host_subdirs starts at $HOME) --
+    unlike host-shell, root-shell's own trust level already spans the
+    whole machine, so there is no "somewhere meaningful" subtree to prefer
+    over the actual root."""
+    # Unlock gate first, same order as start_claude_login & co.: while the
+    # window is locked aigw-unlockd has severed this uid's access to the
+    # root socket, so root_shell_allowed() is False *because* it is locked
+    # -- checking it first turned "needs passkey" into a plain 400 that
+    # withUnlockRetry never sees (the deployment notes).
+    require_unlock_if_outside_sandbox("root")
+    if not root_shell_allowed():
+        raise RuntimeError("root shell is not enabled for this user")
+    path = abs_path or "/"
+    marker = f"__AIGW_LS_{uuid.uuid4().hex[:8]}__"
+    cmd = f"ls -1p -- {shlex.quote(path)} 2>/dev/null; echo {marker}"
+    text = _root_tmux_capture(cmd, lambda t: t if marker in t else None, ROOT_WORKDIR_TIMEOUT)
+    if text is None:
+        return []
+    out = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line == marker or line.startswith(marker):
+            continue
+        if not line.endswith("/") or line.startswith("."):
+            continue
+        out.append(line[:-1])
+        if len(out) >= SUBDIR_LIMIT:
+            break
+    return out
+
+
+def resolve_root_workdir(rel):
+    """Validate a client-supplied real root-filesystem working directory for
+    "root-shell" -- confirmed to actually be a directory via the same
+    root-pane route as list_root_subdirs (this backend's own uid usually
+    cannot even see that path at all, so a local os.path check would be
+    meaningless here). None means "wherever the pane starts" (/root, same
+    as never having passed -c at all)."""
+    if not rel or not rel.strip():
+        return None
+    rel = rel.strip()
+    if "\x00" in rel:
+        raise ValueError("invalid working directory")
+    if not rel.startswith("/"):
+        raise ValueError("root-shell working directory must be an absolute path")
+    # Unlock gate first -- see list_root_subdirs above.
+    require_unlock_if_outside_sandbox("root")
+    if not root_shell_allowed():
+        raise RuntimeError("root shell is not enabled for this user")
+    marker = f"__AIGW_TESTD_{uuid.uuid4().hex[:8]}__"
+    # No "--" here (unlike list_root_subdirs' `ls`): POSIX test/[ never
+    # adopted "--" as an end-of-options marker the way coreutils commands
+    # did (dash's builtin test rejects it outright, "unexpected operator" --
+    # measured against the real root pane, which runs sh/dash, not bash).
+    # shlex.quote() alone is enough here since the whole command still goes
+    # through the shell as one string; only a genuinely dash-adjacent path
+    # (starting with "-") could still be misread as an operator, an
+    # acceptable, pre-existing-elsewhere edge case (see e.g. list_ssh_subdirs).
+    cmd = f"test -d {shlex.quote(rel)} && echo {marker}OK || echo {marker}NO"
+    text = _root_tmux_capture(cmd, lambda t: t if marker in t else None, ROOT_WORKDIR_TIMEOUT)
+    if text is None or f"{marker}OK" not in text:
+        raise ValueError(f"no such directory: {rel}")
+    return rel
+
+
 # Optional, deployment-supplied site routes (the deployment notes):
 # project-docs is the one aigw-backend route this applies to -- see
 # aigw_site_routes.py's own docstring. A deployment with no such module
@@ -2028,7 +2429,7 @@ def resolve_ssh_workdir(machine, path):
 # host's own filesystem.
 #
 # claude.ai org seat admin (the deployment notes) was ToS-disabled
-# 2026-08-28 (ai-design#claude-admin-tier-tos) and both its routes were
+# 2026-08-28 (the deployment notes) and both its routes were
 # already dead code with nothing calling run_claude_admin_tier() at all --
 # deleted outright rather than moved, since there was no live feature left
 # to give an extension point to.
@@ -2231,30 +2632,67 @@ def _user_message_text(obj):
     return text
 
 
+def _summary_from_lines(lines):
+    """Shared scan behind _conversation_summary (local file) and
+    _ssh_conversation_summary (remote `head` output): the first stored
+    "summary" record, else the first real user message, else "" -- the UI
+    falls back to the timestamp. Split out of _conversation_summary so the
+    ssh: counterpart doesn't have to reimplement the same per-line JSON
+    parsing against a different source of lines."""
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("type") == "summary" and obj.get("summary"):
+            return str(obj["summary"])[:120]
+        if obj.get("type") == "user":
+            text = _user_message_text(obj)
+            if text:
+                return text[:120]
+    return ""
+
+
 def _conversation_summary(path):
-    """A short human label for one conversation log: its stored summary if it
-    has one, else the first real user message, else "" (the UI falls back to
-    the timestamp)."""
-    read = 0
-    try:
+    """A short human label for one conversation log -- see
+    _summary_from_lines. Reads at most CONV_SUMMARY_SCAN_BYTES."""
+    def _capped_lines():
+        read = 0
         with path.open("r", errors="replace") as f:
             for line in f:
                 read += len(line)
                 if read > CONV_SUMMARY_SCAN_BYTES:
-                    break
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if obj.get("type") == "summary" and obj.get("summary"):
-                    return str(obj["summary"])[:120]
-                if obj.get("type") == "user":
-                    text = _user_message_text(obj)
-                    if text:
-                        return text[:120]
+                    return
+                yield line
+    try:
+        return _summary_from_lines(_capped_lines())
     except OSError:
-        pass
-    return ""
+        return ""
+
+
+def _ssh_conversation_summary(machine, key, filename):
+    """Remote equivalent of _conversation_summary, for a conversation log on
+    a drives-capable ssh machine: same _summary_from_lines scan, over a
+    `head -c CONV_SUMMARY_SCAN_BYTES` round trip instead of a local file
+    open. filename must already be a validated `<conv-id>.jsonl` from
+    _ssh_list_jsonl's own listing -- same "never call this with anything
+    else" contract as _ssh_read_new, and the same reason (interpolated
+    unquoted into the shell command below via _ssh_invoke, not _ssh_run --
+    see _ssh_list_jsonl's docstring for why `$HOME` needs that).
+
+    `head` can cut the final line at an arbitrary byte, mid-UTF-8-character
+    or mid-JSON -- that trailing partial line just fails json.loads() inside
+    _summary_from_lines and is skipped, same as a local read hitting the
+    same byte boundary."""
+    conv_id = filename[:-len(".jsonl")] if filename.endswith(".jsonl") else filename
+    if not CLAUDE_CONV_ID_RE.match(conv_id):
+        return ""
+    path = f"$HOME/.claude/projects/{key}/{filename}"
+    cmd = f'head -c {CONV_SUMMARY_SCAN_BYTES} "{path}" 2>/dev/null'
+    r = _ssh_invoke(machine, cmd, timeout=10)
+    if r.returncode != 0:
+        return ""
+    return _summary_from_lines(r.stdout.splitlines())
 
 
 def _claude_session_labels():
@@ -2316,6 +2754,59 @@ def resolve_resume_id(abs_cwd, resume_id):
     return resume_id
 
 
+def list_ssh_claude_conversations(machine, posix_cwd, limit=40):
+    """ssh: counterpart of list_claude_conversations(): Claude Code
+    conversations already recorded for `posix_cwd` on a drives-capable ssh
+    machine, newest first (the deployment notes). Requires an explicit
+    posix_cwd -- unlike the local picker, there is no fixed default directory
+    to fall back to when none was chosen yet (see create_session's own
+    comment on this). Returns [] rather than raising when the remote project
+    directory can't even be determined (machine unreachable, cygpath
+    failure) -- same "nothing to show yet, not an error" contract
+    _remote_claude_project_dir_key already documents for its own None
+    return, so this can be called eagerly from the workdir picker without a
+    separate reachability check first."""
+    key = _remote_claude_project_dir_key(machine, posix_cwd)
+    if key is None:
+        return []
+    files = _ssh_list_jsonl(machine, key)
+    files.sort(key=lambda e: e[1], reverse=True)
+    del files[limit:]
+    aigw_labels = _claude_session_labels()
+    out = []
+    for name, mtime in files:
+        conv_id = name[:-len(".jsonl")]
+        out.append({
+            "id": conv_id,
+            "mtime": mtime,
+            "aigw_label": aigw_labels.get(conv_id),
+            "summary": _ssh_conversation_summary(machine, key, name),
+        })
+    return out
+
+
+def resolve_ssh_resume_id(machine, posix_cwd, resume_id):
+    """ssh: counterpart of resolve_resume_id(): check that a requested
+    conversation id really is one of posix_cwd's own logs on `machine`
+    before it is ever passed to `claude --resume` there. Same shell-quoting
+    reasoning as _ssh_list_jsonl -- resume_id is already validated against
+    CLAUDE_CONV_ID_RE before it is interpolated unquoted, and `$HOME` needs
+    real remote shell expansion, so this goes through _ssh_invoke directly
+    rather than _ssh_run."""
+    if not resume_id:
+        return None
+    if not CLAUDE_CONV_ID_RE.match(resume_id):
+        raise ValueError("invalid conversation id")
+    key = _remote_claude_project_dir_key(machine, posix_cwd)
+    if key is None:
+        raise ValueError(f"{machine} is not reachable over SSH right now")
+    cmd = f'test -f "$HOME/.claude/projects/{key}/{resume_id}.jsonl"'
+    r = _ssh_invoke(machine, cmd, timeout=10)
+    if r.returncode != 0:
+        raise ValueError("no such conversation in that directory")
+    return resume_id
+
+
 MIN_PANE_COLS = 20
 MAX_PANE_COLS = 500
 MIN_PANE_ROWS = 10
@@ -2369,6 +2860,9 @@ TRUST_DIALOG_MARKER = "Yes, I trust this folder"
 TUI_READY_MARKER = "bypass permissions on"
 TRUST_DIALOG_POLL_INTERVAL = 0.3
 TRUST_DIALOG_POLL_TIMEOUT = 8
+# The selection-menu highlight glyphs Claude Code has used for this dialog
+# ("❯" in current builds, a plain ">" in the MSYS2 console's fallback font).
+TRUST_DIALOG_CURSOR_CHARS = ("\u276f", ">")
 
 
 def _accept_workspace_trust_if_shown(location, tmux_name):
@@ -2399,11 +2893,39 @@ def _accept_workspace_trust_if_shown(location, tmux_name):
         r = tmux_exec(location, ["capture-pane", "-p", "-t", tmux_name])
         if r.returncode == 0:
             if TRUST_DIALOG_MARKER in r.stdout:
-                tmux_exec(location, ["send-keys", "-t", tmux_name, "Enter"])
-                return
-            if TUI_READY_MARKER in r.stdout:
+                # Never assume which option is highlighted: newer Claude Code
+                # builds list "No, exit" first *and highlighted* (measured
+                # 2026-09-25 on winbox-b), so a bare Enter there quits claude
+                # with status 1 a second after the session was created. Move
+                # the cursor onto the "Yes" row first, re-check on the next
+                # poll, and only press Enter once it is actually there.
+                move = _trust_dialog_cursor_move(r.stdout)
+                if move is None:
+                    tmux_exec(location, ["send-keys", "-t", tmux_name, "Enter"])
+                    return
+                if move:
+                    tmux_exec(location, ["send-keys", "-t", tmux_name, move])
+            elif TUI_READY_MARKER in r.stdout:
                 return  # already past the gate -- nothing to accept
         time.sleep(TRUST_DIALOG_POLL_INTERVAL)
+
+
+def _trust_dialog_cursor_move(screen):
+    """For a captured trust-dialog screen: None if the "Yes, I trust this
+    folder" row is the highlighted one (safe to press Enter), otherwise the
+    key ("Up"/"Down") that moves the highlight towards it, or "" if the
+    highlight cannot be located at all (then send nothing and let the next
+    poll look again -- pressing Enter blind is exactly what exits claude)."""
+    lines = screen.splitlines()
+    yes_idx = next((i for i, l in enumerate(lines) if TRUST_DIALOG_MARKER in l), None)
+    cursor_idx = next((i for i, l in enumerate(lines)
+                       if l.lstrip()[:1] in TRUST_DIALOG_CURSOR_CHARS
+                       and i != yes_idx and ("exit" in l or "No" in l)), None)
+    if yes_idx is not None and lines[yes_idx].lstrip()[:1] in TRUST_DIALOG_CURSOR_CHARS:
+        return None
+    if yes_idx is None or cursor_idx is None:
+        return ""
+    return "Down" if yes_idx > cursor_idx else "Up"
 
 
 def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, cols=None, rows=None):
@@ -2429,34 +2951,52 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         candidate = location.split(":", 1)[1]
         if SSH_MACHINES.get(candidate, {}).get("drives"):
             ssh_drive_machine = candidate
-    if resume and preset not in CWD_PRESETS:
+    if resume and preset not in CWD_PRESETS and not ssh_drive_machine:
         # No notion of a prior conversation outside the two local Claude
-        # presets -- the plain shells have none, and a drives-capable ssh
-        # machine's Claude preset has no way to list its own remote
-        # conversation history (see CWD_PRESETS' own comment).
-        raise ValueError(f"resume only applies to the {'/'.join(sorted(CWD_PRESETS))} presets")
-    if cwd and not (preset in CWD_PRESETS or ssh_drive_machine):
-        # The plain shells get their directory from the pane itself (`sandbox
-        # exec`'s own workdir, or TMUX_PRESETS' "cwd") and have no notion of a
-        # working directory to pick, so silently ignoring this would be worse
-        # than saying so.
+        # presets and a drives-capable ssh machine's own Claude preset --
+        # the plain shells have none.
         raise ValueError(
-            f"cwd only applies to the {'/'.join(sorted(CWD_PRESETS))} presets, "
+            f"resume only applies to the {'/'.join(sorted(CWD_PRESETS))} presets, "
+            "or a drives-capable ssh machine's Claude preset"
+        )
+    if cwd and not (preset in CWD_PRESETS or preset in SHELL_CWD_PRESETS or ssh_drive_machine):
+        # ssh:<machine>'s own "shell-<machine>" (not a drives-capable
+        # machine's Claude preset) still has no notion of a working
+        # directory to pick -- MSYS2/linuxbox quoting over ssh is its own
+        # can of worms (the deployment notes) this hasn't been extended
+        # to cover, and silently ignoring this would be worse than saying so.
+        raise ValueError(
+            f"cwd only applies to the {'/'.join(sorted(CWD_PRESETS | SHELL_CWD_PRESETS))} presets, "
             "or a drives-capable ssh machine's Claude preset"
         )
     if ssh_drive_machine:
         abs_cwd = resolve_ssh_workdir(ssh_drive_machine, cwd)
+        if resume and abs_cwd is None:
+            # Unlike the local CWD_PRESETS, there is no fixed directory to
+            # fall back to here (abs_cwd is None) -- list_ssh_claude_
+            # conversations/resolve_ssh_resume_id both need a real posix_cwd
+            # to build the remote machine's project-dir key from
+            # (the deployment notes). The UI already only offers a resume
+            # picker once a drive/folder has actually been chosen, so this
+            # only fires for a hand-crafted request.
+            raise ValueError("resume requires an explicit working directory on this machine")
+        resume_id = resolve_ssh_resume_id(ssh_drive_machine, abs_cwd, resume) if abs_cwd else None
+    elif preset == "host-shell":
+        abs_cwd = resolve_host_workdir(cwd)
+        resume_id = None  # SHELL_CWD_PRESETS: already validated above, never reached with resume set
+    elif preset == "root-shell":
+        abs_cwd = resolve_root_workdir(cwd)
         resume_id = None
     else:
         abs_cwd = resolve_workdir(cwd)
         resume_id = resolve_resume_id(abs_cwd, resume)
     # Pre-assign the Claude Code conversation id itself, before `claude` ever
     # runs, instead of guessing which on-disk .jsonl in the (possibly shared)
-    # project directory belongs to this pane after the fact -- see aigw-
-    # design#shell-claude-tail-cross-session-claim for the incident this
+    # project directory belongs to this pane after the fact -- see
+    # the deployment notes for the incident this
     # closes (two root-shell sessions in the same cwd, one silently locked
-    # onto the other's conversation forever), and the deployment notes
-    # tail-resumable-retry for a second, independent way the same guessing
+    # onto the other's conversation forever), and
+    # the deployment notes for a second, independent way the same guessing
     # can wedge a session shut permanently. Only for a genuinely NEW
     # conversation (resume_id already names an existing, unambiguous file)
     # and only where this process can inject the id directly:
@@ -2501,6 +3041,15 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     (sdir / "outbox").mkdir(parents=True)
     (sdir / "output.log").touch()
     (sdir / "events.jsonl").touch()
+    # A resume with no explicit label carries over the name a past aigw
+    # session already gave this same conversation (the deployment notes,
+    # 2026-09-24, at the user's request: "セッション名なども引き継ぐように")
+    # -- _claude_session_labels() is the same {claude_session_id: label} map
+    # list_claude_conversations() already builds to show "[label]" next to
+    # each entry in the resume picker, just reused here at creation time
+    # instead of only for display. Falls through to the plain preset-name
+    # default when the conversation never had one (or isn't a resume at all).
+    inherited_label = resume_id and _claude_session_labels().get(resume_id)
     # tmux_name is kept separate from the aigw session id (they happen to be
     # equal for panes we create, but not for adopted ones), and tmux_location
     # says which of the two tmux servers -- container or host -- it lives in;
@@ -2508,7 +3057,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     # (`location` itself was already computed above, before the unlock gate.)
     meta = {
         "id": session_id,
-        "label": label or preset,
+        "label": label or inherited_label or preset,
         "preset": preset,
         "tmux_name": session_id,
         "tmux_location": location,
@@ -2553,6 +3102,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     # the container at the *same absolute path*, so this one AIGW_OUTBOX value
     # is correct for a host pane and a container pane alike.
     outbox_path = str(sdir / "outbox")
+    talkto_path = str(sdir / TALKTO_FILENAME)
     spec = TMUX_PRESETS[preset]
     inner_command = list(spec["command"])
     # Opt-out (default on) skip of Claude Code's own tool-use/trust
@@ -2563,6 +3113,22 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     # interactive TUI presets.
     if preset in CLAUDE_TUI_PRESETS and skip_permissions:
         inner_command.append("--dangerously-skip-permissions")
+    # Codex counterpart of the line above (2026-09-27, filling in the gap
+    # the deployment's changelog left open): the devbox-<user> container
+    # is already the real isolation boundary here (same reasoning as
+    # claude-tui's --dangerously-skip-permissions -- see this function's own
+    # docstring/comment above), and Codex's own nested sandbox needs
+    # bubblewrap, which doesn't work inside this container as-is (default
+    # Docker seccomp/AppArmor blocks the unprivileged user namespace it wants
+    # even though the host kernel allows one, the deployment notes). Rather
+    # than loosening the container's own security profile for every user just
+    # so Codex can re-sandbox itself *inside* a sandbox, tell Codex to skip
+    # that inner layer entirely. No frontend checkbox drives this for
+    # codex-tui (unlike claude-tui, its screen-panel-only design has no
+    # #claude-opts panel to host one, `the deployment notes`) -- it rides
+    # create_session's own skip_permissions=True default instead.
+    if preset in CODEX_TUI_PRESETS and skip_permissions:
+        inner_command.append("--dangerously-bypass-approvals-and-sandbox")
     if spec.get("remote_control"):
         inner_command.append(f"--remote-control={remote_control_name(meta)}")
     if resume_id:
@@ -2602,7 +3168,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     if location.startswith("ssh:"):
         command = inner_command
     else:
-        env_pairs = [f"AIGW_OUTBOX={outbox_path}"]
+        env_pairs = [f"AIGW_OUTBOX={outbox_path}", f"AIGW_TALKTO={talkto_path}"]
         if assigned_claude_session_id and preset in ("shell", "host-shell", "root-shell"):
             # Read back by the shell function _inject_claude_session_id_
             # wrapper defines further down, once the pane exists.
@@ -2706,8 +3272,8 @@ def _inject_claude_session_id_wrapper(location, tmux_name, session_id_value=None
     """Defines a `claude` shell function in a freshly-spawned "shell"/
     "host-shell"/"root-shell"/SSH_SHELL_PRESETS ("shell-<machine>") pane
     that transparently adds `--session-id "$AIGW_SESSION_ID"` to a bare
-    `claude` invocation -- see the deployment notes
-    claim for why guessing which on-disk .jsonl belongs to which pane after
+    `claude` invocation -- see
+    the deployment notes for why guessing which on-disk .jsonl belongs to which pane after
     the fact is unreliable once two panes share a cwd.
 
     session_id_value: only needed for SSH_SHELL_PRESETS. The local presets
@@ -2843,6 +3409,7 @@ def _run_claude_headless_turn(session_id, text):
     if meta is None:
         return
     outbox_path = str(sdir / "outbox")
+    talkto_path = str(sdir / TALKTO_FILENAME)
 
     # Recording our own PID *inside the container's pid namespace* (via a
     # tiny `sh -c 'echo $$ > pidfile; exec ...'` wrapper -- `exec` replaces
@@ -2866,7 +3433,8 @@ def _run_claude_headless_turn(session_id, text):
         msg = shquote("aigw: cannot enter working directory " + meta["cwd"])
         inner += f"cd {shquote(meta['cwd'])} || {{ echo {msg} >&2; exit 1; }}; "
     inner += (
-        f"echo $$ > {shquote(str(pid_file))}; exec env AIGW_OUTBOX={shquote(outbox_path)} "
+        f"echo $$ > {shquote(str(pid_file))}; "
+        f"exec env AIGW_OUTBOX={shquote(outbox_path)} AIGW_TALKTO={shquote(talkto_path)} "
         f"claude --dangerously-skip-permissions "
         f"-p {shquote(text)} --output-format stream-json --verbose"
     )
@@ -3089,6 +3657,7 @@ def stop_session(session_id):
         meta["ended_ts"] = time.time()
         save_meta(session_id, meta)
     append_event(session_id, {"type": "session_ended"})
+    break_link(session_id, reason="セッションが終了しました")
 
 
 def delete_session(session_id):
@@ -3155,7 +3724,7 @@ def _load_next_seq(session_id):
     return n + 1
 
 
-OUTBOX_MODEL3D_SUFFIXES = {"glb", "gltf"}
+OUTBOX_MODEL3D_SUFFIXES = {"glb", "gltf", "obj"}
 OUTBOX_IMAGE_SUFFIXES = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"}
 
 
@@ -3172,7 +3741,13 @@ def outbox_attachment_kind(filename):
     Added 2026-08-15 alongside the "attachment" event type below -- before
     this, EVERY outbox file was unconditionally announced as an "image"
     event, so a generated .glb (see the deployment notes) just rendered
-    as a broken <img> with no way to actually see it."""
+    as a broken <img> with no way to actually see it.
+
+    "obj" joined the set 2026-09-22 (the deployment notes) -- unlike glb/
+    gltf, an OBJ on its own is only ever geometry; viewer3d.html's OBJ
+    path renders it with a default material when there is no companion
+    MTL (see _sibling_mtl_for_obj below for how a flat top-level OBJ gets
+    paired with one when there is)."""
     suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if suffix in OUTBOX_IMAGE_SUFFIXES:
         return "image"
@@ -3223,8 +3798,8 @@ def save_inbox_attachment(session_id, meta, filename, data):
     container at the identical absolute path), so the host-side path this
     function writes to is already correct there, unchanged.
 
-    ssh:<machine> shares no filesystem with this host at all (the deployment notes
-    machines-arch), so the file is scp'd over into ~/aigw-inbox/<session-id>/
+    ssh:<machine> shares no filesystem with this host at all
+    (the deployment notes), so the file is scp'd over into ~/aigw-inbox/<session-id>/
     on that machine, and the answer is the Windows-style path `cygpath -w`
     reports back -- the remote Claude Code is a native Windows build
     (claude.exe under MSYS2 tmux, not WSL), so a POSIX-style /c/Users/...
@@ -3312,6 +3887,103 @@ def _freeze_outbox_snapshot(outbox, name, mtime):
     return frozen_name
 
 
+# ---- Folder attachments (browsing a directory dropped in outbox/, 2026-09-22) ----
+#
+# Everything above treats outbox/ as a flat bag of files. A directory a
+# session drops there used to be silently invisible: _scan_outbox_for_
+# attachments only ever looked at p.is_file(). This section gives a
+# directory the same "arrives as an attachment card" treatment, except
+# tapping it opens a one-level-at-a-time browser (same shape as the
+# ~/sandhome working-directory picker, resolve_workdir/list_subdirs above)
+# instead of rendering the directory itself.
+
+OUTBOX_BROWSE_LIMIT = 1000
+
+
+def resolve_outbox_subpath(outbox_root, rel):
+    """Validate a client-supplied path relative to one session's outbox/
+    root and return it as an absolute Path, confined to that root exactly
+    the way resolve_workdir confines a working directory to ~/sandhome:
+    `..`, an absolute path, or a symlink pointing outside are all caught by
+    resolving the final target and checking containment, not by rejecting
+    particular characters. An empty/missing rel means the root itself (the
+    top of a folder attachment)."""
+    root = outbox_root.resolve()
+    if not rel or not rel.strip():
+        return root
+    rel = rel.strip()
+    if "\x00" in rel:
+        raise ValueError("invalid path")
+    rel = rel.strip("/")
+    if not rel:
+        return root
+    target = (outbox_root / rel).resolve()
+    if target != root and root not in target.parents:
+        raise ValueError("path must stay inside this attachment's folder")
+    return target
+
+
+def list_outbox_entries(root, abs_dir):
+    """Immediate children of one directory inside a session's outbox/ tree,
+    split into subdirs and files -- same "one level at a time" shape as
+    list_subdirs (the deployment notes) above, but this one also returns files
+    (with their outbox_attachment_kind) since browsing a folder attachment
+    is about opening what's inside it, not picking a working directory.
+    Symlinks are followed but only kept if they stay inside outbox/ root,
+    same reasoning as list_subdirs: a folder a session dropped is not a
+    trusted input, and this listing is served to a phone browsing whatever
+    a tool (or, if that tool were compromised, an attacker) put there."""
+    try:
+        entries = sorted(os.scandir(abs_dir), key=lambda e: e.name)
+    except OSError:
+        return [], []
+    dirs, files = [], []
+    for e in entries:
+        if e.name.startswith(".") or e.name.startswith(FROZEN_SNAPSHOT_PREFIX):
+            continue
+        try:
+            if e.is_symlink():
+                target = Path(e.path).resolve()
+                if target != root and root not in target.parents:
+                    continue
+            if e.is_dir():
+                dirs.append(e.name)
+            elif e.is_file():
+                files.append({"name": e.name, "kind": outbox_attachment_kind(e.name)})
+        except OSError:
+            continue
+        if len(dirs) + len(files) >= OUTBOX_BROWSE_LIMIT:
+            break
+
+    # OBJ+MTL pairing (the deployment notes, 2026-09-22): fold a same-stem
+    # .mtl into its .obj's own entry (an "mtl" field) instead of listing it
+    # separately -- outbox-browse.html then opens both at once instead of
+    # showing what would otherwise look like two unrelated rows for one
+    # model. Unlike the flat top-level pairing in _scan_outbox_for_
+    # attachments below, there is no freezing to work around here: browsed
+    # files are always served by their real, live names already.
+    mtl_names = {f["name"] for f in files if f["name"].lower().endswith(".mtl")}
+    paired_mtls = set()
+    for f in files:
+        if f["kind"] == "model3d" and f["name"].lower().endswith(".obj"):
+            mtl_name = f"{f['name'].rsplit('.', 1)[0]}.mtl"
+            if mtl_name in mtl_names:
+                f["mtl"] = mtl_name
+                paired_mtls.add(mtl_name)
+    if paired_mtls:
+        files = [f for f in files if f["name"] not in paired_mtls]
+    return dirs, files
+
+
+def _sibling_mtl_for_obj(outbox, obj_name):
+    """A live .mtl next to obj_name with the same stem, if present right
+    now -- the deployment notes' flat top-level OBJ+MTL pairing (see the
+    call site in _scan_outbox_for_attachments below for why the pair is
+    served unfrozen, by its real names, once found)."""
+    mtl = outbox / f"{obj_name.rsplit('.', 1)[0]}.mtl"
+    return mtl if mtl.is_file() else None
+
+
 def _scan_outbox_for_attachments(session_id, outbox, seen_files):
     """One poll's worth of outbox/ scanning, shared by _watch_session
     (headless presets) and _watch_tmux_session (everything else) -- both
@@ -3326,22 +3998,76 @@ def _scan_outbox_for_attachments(session_id, outbox, seen_files):
     Mutates `seen_files` in place (a (name, mtime) set both callers
     already own and pass by reference, same as before extraction) and
     calls append_event directly for each newly-seen file; nothing is
-    returned."""
+    returned.
+
+    A directory is announced once, the first time it is seen, as a
+    kind="folder" attachment -- but keyed on name alone ("dir" stands in
+    for the missing mtime half of the tuple, a sentinel that can never
+    collide with a real float) rather than re-keyed on the directory's own
+    mtime. A directory's mtime changes every time something is added inside
+    it, and unlike a file there is no "overwrite" to freeze a snapshot of --
+    the folder is browsed live via resolve_outbox_subpath/list_outbox_
+    entries -- so keying on mtime would re-announce (a new chat bubble for)
+    the same folder on every single file a tool drops into it afterward."""
     if not outbox.exists():
         return
     for p in outbox.iterdir():
-        if p.is_file() and not p.name.startswith(FROZEN_SNAPSHOT_PREFIX):
-            key = (p.name, p.stat().st_mtime)
+        if p.name.startswith(FROZEN_SNAPSHOT_PREFIX):
+            continue
+        if p.is_dir():
+            key = (p.name, "dir")
             if key not in seen_files:
                 seen_files.add(key)
-                kind = outbox_attachment_kind(p.name)
-                announce_name = _freeze_outbox_snapshot(outbox, p.name, key[1])
                 append_event(session_id, {
-                    "type": "attachment", "filename": announce_name,
-                    "kind": kind,
-                    "mtime": key[1],
+                    "type": "attachment", "filename": p.name,
+                    "kind": "folder",
                     "source_filename": p.name,
                 })
+            continue
+        if p.is_file():
+            key = (p.name, p.stat().st_mtime)
+            if key in seen_files:
+                continue
+            kind = outbox_attachment_kind(p.name)
+            # A flat top-level OBJ with a live sibling MTL
+            # (the deployment notes, 2026-09-22): announced as one paired attachment,
+            # unfrozen -- the MTL's own texture references are bare
+            # relative filenames resolved against wherever the MTL itself
+            # was served from, and /files/<name> is a flat namespace where
+            # that only lands on the right sibling if neither file was
+            # renamed by _freeze_outbox_snapshot. This trades away the
+            # usual "already-announced attachment can never change under
+            # you" guarantee for this pair specifically -- same trade a
+            # folder attachment already makes, for the same underlying
+            # reason (cross-file relative references). Pairing only looks
+            # at the current poll, not a later one: if the MTL hasn't
+            # landed yet the OBJ is announced alone right away (falls
+            # through to the plain, frozen path below) rather than held
+            # back waiting for it -- a same-basename MTL that shows up on
+            # a later poll is then just its own ordinary file attachment,
+            # not merged in after the fact.
+            if kind == "model3d" and p.name.lower().endswith(".obj"):
+                mtl = _sibling_mtl_for_obj(outbox, p.name)
+                if mtl is not None:
+                    mtl_key = (mtl.name, mtl.stat().st_mtime)
+                    seen_files.add(key)
+                    seen_files.add(mtl_key)
+                    append_event(session_id, {
+                        "type": "attachment", "filename": p.name,
+                        "kind": kind,
+                        "mtime": key[1],
+                        "source_filename": p.name,
+                        "mtl": mtl.name,
+                    })
+                    continue
+            seen_files.add(key)
+            announce_name = _freeze_outbox_snapshot(outbox, p.name, key[1])
+            append_event(session_id, {
+                "type": "attachment", "filename": announce_name,
+                "kind": kind,
+                "mtime": key[1],
+                "source_filename": p.name,
+            })
 
 
 def append_event(session_id, event):
@@ -3390,6 +4116,268 @@ def events_page(session_id, before=None, limit=50):
     return events[-limit:] if limit else events, has_more
 
 
+# ---- session links (agent-to-agent relay) --------------------------------
+#
+# User request: let the Claude Code running in this user's own sandbox
+# container converse with one running on the host (or as root) -- the user
+# picks which two of their own sessions to connect, and disconnects when
+# done. A "link" is nothing but {a, b, max_turns, turns_used}.
+#
+# What actually triggers a relayed message is deliberately NOT "every reply
+# this session produces" -- an earlier version of this hooked append_event's
+# "agent_output" (one per assistant-with-text JSONL line in Claude Code's own
+# transcript), and in practice that fires several times per logical turn
+# (once per aside between tool calls, not once for the final answer), so a
+# single turn flooded the partner with a handful of fragments instead of one
+# message (user feedback, 2026-09-26). Instead, Claude decides for itself,
+# explicitly, by running `talkto "text"` (see /usr/local/bin/talkto) --
+# talkto's only job is to append one JSON line to the file named by the
+# $AIGW_TALKTO env var this pane was started with (create_session, same
+# bind-mount-shared-path trick as $AIGW_OUTBOX), and _watch_talkto_file below
+# (called from the same per-session poll loop that already scans outbox/)
+# reads new lines from it and calls _relay_to_partner for each. No new
+# network path, no new privilege: the file lives under this session's own
+# directory under ~/sandhome, exactly like outbox/.
+#
+# Deliberately NOT a new privilege: relaying into a "host"/"root" session
+# still goes through send_message()'s own require_unlock_if_outside_sandbox
+# gate below, unchanged. A relay attempt made while that window is closed
+# raises UnlockRequired same as any human-typed message would -- caught here
+# and turned into a skipped hop (not consumed against max_turns, not a
+# disconnect), so a link touching host/root can only make progress while a
+# human keeps that tier's passkey window open. This is intentional and is
+# the real backstop against an unsupervised root loop, more than max_turns
+# below -- max_turns guards the everyday container<->container/host case
+# where no such window exists to rate-limit it.
+#
+# Single-user-scoped by construction: this whole process is one user's own
+# aigw-backend (see BACKEND_SOCKET_PATH), so any session_id that load_meta()
+# resolves here already belongs to the caller -- no separate ownership check
+# needed, same reasoning already relied on throughout this file.
+_links_lock = threading.Lock()
+LINKS_PATH = STATE_DIR / "session_links.json"
+# Per-session, under sdir (~/sandhome, bind-mounted at the same path in
+# container/host/root) -- what /usr/local/bin/talkto appends to and
+# _poll_talkto_file, below, tails. Not under STATE_DIR: unlike LINKS_PATH
+# (this backend's own bookkeeping) this file's other end is written by a
+# process running *inside* whatever pane the session is, which only ever
+# has ~/sandhome, not this backend's private state directory.
+TALKTO_FILENAME = "talkto_out.jsonl"
+DEFAULT_LINK_MAX_TURNS = 20
+# Lower default when either side is "root": still capped by the unlock
+# window above, but a much shorter leash by default for the one location
+# whose commands run as root.
+DEFAULT_LINK_MAX_TURNS_ROOT = 6
+
+
+def _load_links():
+    if not LINKS_PATH.exists():
+        return {}
+    try:
+        return json.loads(LINKS_PATH.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
+def _save_links(links):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    LINKS_PATH.write_text(json.dumps(links))
+
+
+def _link_for_session(links, session_id):
+    """The (link_id, record) this session is currently part of, or (None,
+    None). Every record names its two sides as "a"/"b"; which one
+    session_id is doesn't matter to any caller here, so this is the only
+    place that cares."""
+    for link_id, rec in links.items():
+        if session_id in (rec["a"], rec["b"]):
+            return link_id, rec
+    return None, None
+
+
+def _other_side(rec, session_id):
+    return rec["b"] if session_id == rec["a"] else rec["a"]
+
+
+def list_links():
+    with _links_lock:
+        links = _load_links()
+    return [{"id": link_id, **rec} for link_id, rec in links.items()]
+
+
+def create_link(session_a, session_b, max_turns=None):
+    if session_a == session_b:
+        raise ValueError("a session cannot be linked to itself")
+    meta_a, meta_b = load_meta(session_a), load_meta(session_b)
+    if meta_a is None or meta_b is None:
+        raise ValueError("both sessions must exist")
+    if meta_a.get("stopped") or meta_b.get("stopped"):
+        raise ValueError("cannot link an already-stopped session")
+    with _links_lock:
+        links = _load_links()
+        for sid in (session_a, session_b):
+            if _link_for_session(links, sid)[0] is not None:
+                raise ValueError(f"session {sid} is already linked -- disconnect it first")
+        if max_turns is None:
+            locations = {meta_a.get("tmux_location"), meta_b.get("tmux_location")}
+            max_turns = DEFAULT_LINK_MAX_TURNS_ROOT if "root" in locations else DEFAULT_LINK_MAX_TURNS
+        link_id = uuid.uuid4().hex[:12]
+        rec = {
+            "a": session_a, "b": session_b,
+            "max_turns": int(max_turns), "turns_used": 0,
+            "created_ts": time.time(),
+        }
+        links[link_id] = rec
+        _save_links(links)
+    # The aigw-only note (phone UI, cosmetic -- see append_event's own
+    # comment on why this never reaches the actual pane). Separate from the
+    # real priming message below, which is the one that matters: Claude
+    # itself has no other way to learn `talkto` exists or who the other side
+    # is.
+    note = (f"🔗「{meta_a.get('label', session_a)}」と「{meta_b.get('label', session_b)}」を"
+            f"つなぎました(上限{rec['max_turns']}往復)。")
+    append_event(session_a, {"type": "system", "text": note})
+    append_event(session_b, {"type": "system", "text": note})
+    # Best-effort: an actual turn in each pane (not just the cosmetic note
+    # above), so Claude is told about `talkto` and the partner's label
+    # without the user having to type it by hand every time
+    # (the deployment notes). Goes through the ordinary send_message(), so a link touching
+    # host/root that's created while that tier's unlock window is closed
+    # simply doesn't get primed on that side -- same "skip, never bypass"
+    # stance as _relay_to_partner's own UnlockRequired handling. The link
+    # itself still exists either way; the human can prime that side by hand
+    # (or reopen it once unlocked and prime it themselves).
+    for sid, other_label, other_agent in (
+        (session_a, meta_b.get("label", session_b), _agent_persona_label(meta_b.get("preset"))),
+        (session_b, meta_a.get("label", session_a), _agent_persona_label(meta_a.get("preset"))),
+    ):
+        priming = (
+            f"[aigwセッション連携] このセッションは「{other_label}」という別の{other_agent}"
+            f"のセッションとつながりました。相手に話しかけたいときは、内容を引数にして"
+            f"`talkto \"内容\"` を実行してください -- そのテキストがそのまま相手への次の"
+            "メッセージとして届きます(あなたの応答を自動転送する仕組みではないので、"
+            "送りたい内容は自分でtalktoに渡してください)。最大"
+            f"{rec['max_turns']}往復で自動的に切断されます。"
+        )
+        try:
+            send_message(sid, priming, submit=True)
+        except (UnlockRequired, RuntimeError, subprocess.TimeoutExpired):
+            append_event(sid, {
+                "type": "system",
+                "text": "🔗 このセッションには連携の案内をまだ伝えられていません"
+                        "(sandbox外の解錠が必要、または送信に失敗)。"
+                        "手動で`talkto`の使い方を伝えてください。",
+            })
+    return {"id": link_id, **rec}
+
+
+def break_link(session_id, reason=None):
+    """Disconnects whatever link session_id is part of, if any -- called both
+    from POST /sessions/unlink (reason=None, the user's own "切断") and
+    automatically when a linked session ends (stop_session/delete_session)
+    or the turn cap is reached (_relay_agent_output)."""
+    with _links_lock:
+        links = _load_links()
+        link_id, rec = _link_for_session(links, session_id)
+        if link_id is None:
+            return False
+        del links[link_id]
+        _save_links(links)
+    text = "🔗 連携を切断しました。" if reason is None else f"🔗 連携を切断しました({reason})。"
+    for sid in (rec["a"], rec["b"]):
+        if load_meta(sid) is not None:
+            append_event(sid, {"type": "system", "text": text})
+    return True
+
+
+def _relay_to_partner(session_id, text):
+    """Called from _watch_talkto_file, below, for every line Claude itself
+    chose to write via `talkto`. Best-effort and silent about anything other
+    than the two outcomes described in this section's own comment above
+    (skipped hop / cap reached) -- a relay failure must never take down the
+    tailer thread that triggered it."""
+    with _links_lock:
+        links = _load_links()
+        link_id, rec = _link_for_session(links, session_id)
+        if link_id is None:
+            return
+        partner = _other_side(rec, session_id)
+        next_count = rec["turns_used"] + 1
+    partner_meta = load_meta(partner)
+    if partner_meta is None or partner_meta.get("stopped"):
+        break_link(session_id, reason="相手のセッションが終了しました")
+        return
+    if next_count > rec["max_turns"]:
+        break_link(session_id, reason=f"上限{rec['max_turns']}往復に達したため自動切断")
+        return
+    origin_meta = load_meta(session_id)
+    origin_label = (origin_meta or {}).get("label", session_id)
+    try:
+        send_message(partner, text, submit=True, from_user=f"🔗 {origin_label}")
+    except UnlockRequired:
+        # Skipped, not consumed against max_turns or disconnected -- see this
+        # section's own comment on why this is the real backstop for a link
+        # touching host/root.
+        append_event(session_id, {
+            "type": "system",
+            "text": "🔗 相手への転送には解錠が必要です(sandbox外)。解錠してから続けてください。",
+        })
+        return
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        break_link(session_id, reason=f"相手への送信に失敗したため自動切断: {e}")
+        return
+    with _links_lock:
+        links = _load_links()
+        if link_id in links:
+            links[link_id]["turns_used"] = next_count
+            _save_links(links)
+
+
+def _read_new_talkto_lines(path, offset):
+    """Pure: given the byte offset already consumed from `path` (a per-
+    session talkto_out.jsonl -- see TALKTO_FILENAME's own comment), returns
+    (new_offset, texts) for whatever complete JSON lines
+    /usr/local/bin/talkto has appended since. Same "read only what's new,
+    tolerate an incomplete trailing line" shape as _split_assistant_text_
+    events, but this file has no schema of its own to speak of -- one JSON
+    object per line, only ever {"ts":..., "text":...}, written by nothing
+    but talkto itself."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return offset, []
+    if size <= offset:
+        return offset, []
+    with path.open("rb") as f:
+        f.seek(offset)
+        chunk = f.read(size - offset)
+    *complete, remainder = chunk.split(b"\n")
+    new_offset = size - len(remainder)
+    texts = []
+    for raw in complete:
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        text = obj.get("text") if isinstance(obj, dict) else None
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+    return new_offset, texts
+
+
+def _poll_talkto_file(session_id, talkto_path, offset):
+    """One poll's worth: relay any new talkto lines and return the updated
+    offset. Shared by _watch_tmux_session and _watch_session, same "one
+    helper, called from both loops" shape as _scan_outbox_for_attachments
+    right above them."""
+    new_offset, texts = _read_new_talkto_lines(talkto_path, offset)
+    for text in texts:
+        _relay_to_partner(session_id, text)
+    return new_offset
+
+
 def _already_announced_attachments(session_id):
     """(filename, mtime) pairs this session has already emitted an
     "attachment"/"image" event for, read back from events.jsonl -- the seed
@@ -3415,7 +4403,24 @@ def _already_announced_attachments(session_id):
     file would never match a seen_files entry keyed by the frozen name, and
     every image would be re-frozen and re-announced on every restart.
     Events from before frozen snapshots existed have no `source_filename`,
-    where `filename` itself was always the source."""
+    where `filename` itself was always the source.
+
+    A kind="folder" event (see _scan_outbox_for_attachments) carries no
+    "mtime" either, but for the opposite reason: it is deliberately keyed
+    on name alone ("dir" sentinel) so the folder isn't re-announced every
+    time something new appears inside it. Sealing it to the directory's
+    current on-disk mtime like a pre-mtime-fix file would do here -- the
+    next poll would see a *different* mtime (something was added) and
+    wrongly treat that as a fresh, never-announced folder.
+
+    A paired OBJ+MTL event (the deployment notes) carries an "mtl" field
+    alongside its own "mtime" -- the OBJ half reconstructs the normal way,
+    but the MTL half was never separately timestamped (there is no event
+    of its own to read one back from), so it goes through the same
+    current-on-disk-mtime sealing as a pre-mtime-fix file. That is exactly
+    right here too: this pair was announced unfrozen, so "seal to
+    whatever's on disk right now" and "the MTL as it was at announce time"
+    are the same file."""
     keyed = set()
     names_no_mtime = set()
     events_path = session_dir(session_id) / "events.jsonl"
@@ -3429,10 +4434,14 @@ def _already_announced_attachments(session_id):
                 continue
             if ev.get("type") in ("attachment", "image") and ev.get("filename"):
                 src_name = ev.get("source_filename") or ev["filename"]
-                if "mtime" in ev:
+                if ev.get("kind") == "folder":
+                    keyed.add((src_name, "dir"))
+                elif "mtime" in ev:
                     keyed.add((src_name, ev["mtime"]))
                 else:
                     names_no_mtime.add(src_name)
+                if ev.get("mtl"):
+                    names_no_mtime.add(ev["mtl"])
     if names_no_mtime:
         outbox = session_dir(session_id) / "outbox"
         for name in names_no_mtime:
@@ -3518,7 +4527,9 @@ def _watch_session(session_id):
     sdir = session_dir(session_id)
     log_path = sdir / "output.log"
     outbox = sdir / "outbox"
+    talkto_path = sdir / TALKTO_FILENAME
     offset = 0
+    talkto_offset = 0
     seen_files = _already_announced_attachments(session_id)
     last_liveness_check = 0.0
     try:
@@ -3537,6 +4548,7 @@ def _watch_session(session_id):
                         append_event(session_id, {"type": "agent_output", "text": text})
 
             _scan_outbox_for_attachments(session_id, outbox, seen_files)
+            talkto_offset = _poll_talkto_file(session_id, talkto_path, talkto_offset)
 
             now = time.time()
             if now - last_liveness_check > 5:
@@ -3621,6 +4633,138 @@ def _screen_lines_scrolled_off(prev_lines, new_lines):
     return list(prev_lines)
 
 
+# Once an on-disk screen log (see _screen_log_path) grows past this many
+# bytes, the next append also trims it back down to SCREEN_BACKLOG_MAX_LINES
+# -- checked via a cheap stat() rather than counting lines on every single
+# append, same hysteresis reasoning SCREEN_BACKLOG_MAX_LINES's own comment
+# gives for the in-memory list: bounded, but not at the cost of a read+
+# rewrite on every scrolled-off batch.
+SCREEN_LOG_TRIM_SIZE_BYTES = 2_000_000
+
+
+def _screen_log_path(cwd, location, claude_session_id):
+    """Where this session's scrolled-off screen lines persist on disk, so a
+    later session can restore them into _screen_backlog before it has
+    scrolled anything of its own (the deployment notes) -- the
+    screen-panel equivalent of _extract_history_events's chat-log backfill,
+    but keyed differently: there is no Claude Code transcript to read this
+    back from (the tmux pane itself, and everything it ever drew, is gone
+    once a session ends), so this backend's own file is the only record,
+    and the key has to be something a *later*, unrelated session can also
+    compute for itself before any pane exists to ask.
+
+    `claude_session_id` (present from creation for "claude-tui" and, since
+    the deployment notes, pre-assigned for a brand-
+    new "shell"/"host-shell"/"root-shell" conversation too, real or not) is
+    only trusted once Claude Code has actually confirmed it by creating the
+    matching transcript file -- otherwise it is just this session's own
+    unused reservation, worthless as a key for anything else to find later
+    (every brand-new shell session gets a *different* random one, whether
+    or not `claude` is ever run in it). Confirmed, it is the best key there
+    is: stable across every future resume of that same conversation. Not
+    confirmed (no `claude` ever run here, or not far enough into starting
+    up yet), (location, cwd) is the fallback -- #limits already asks a user
+    not to run two root-shell/host-shell panes in the same cwd at once, for
+    the same "which one owns this" reason _claim_transcript exists, so the
+    same pair is safe to reuse as a key here too. None only when even that
+    is unavailable (cwd unresolved -- an "attach" adopting a pane whose
+    path tmux itself could not report -- or an ssh:<machine> location,
+    which has no local filesystem to persist to at all: this store is
+    this-host-only, unlike SESSIONS_DIR which is bind-mounted into the
+    container): persistence is simply skipped.
+
+    `cwd` is meta["cwd"] for "claude-tui" (set once at creation,
+    resolve_workdir'd, and never wrong for this session's whole life) but
+    NOT for "shell"/"host-shell"/"root-shell"/"attach" -- those never take
+    an explicit working directory (create_session's own CWD_PRESETS
+    check), so meta["cwd"] is always null for them and the caller must
+    resolve the pane's actual current directory live via tmux's own
+    `pane_current_path` instead (same source _watch_shell_claude/
+    _resolve_claude_conversation already trust for exactly this reason)."""
+    if location.startswith("ssh:"):
+        return None
+    home = _claude_home_for_location(location)
+    if claude_session_id:
+        proj_dir = claude_project_dir(cwd, home=home)
+        # Path.exists() only swallows ENOENT/ENOTDIR/EBADF/ELOOP, not EACCES
+        # (see cpython's pathlib._ignore_error) -- so a root-shell jsonl
+        # still stuck in the ACL_SELF_HEAL_SCHEDULE race (this backend's own
+        # user genuinely denied read, not "doesn't exist yet") raises
+        # PermissionError straight out of this call instead of just
+        # returning False, which used to crash this function's caller's
+        # entire _watch_tmux_session thread outright (measured 2026-09-29,
+        # right after an aigw-unlockd restart zeroed every open unlock
+        # window and briefly put every root-shell session's jsonl back in
+        # that pre-regrant state at once). Treat it the same as "not there
+        # yet" -- the cwd-keyed fallback below still works either way, and
+        # _watch_shell_claude's own ACL_SELF_HEAL_SCHEDULE is what actually
+        # fixes the underlying ACL, not this function.
+        try:
+            found = (proj_dir / f"{claude_session_id}.jsonl").exists()
+        except OSError:
+            found = False
+        if found:
+            return SCREEN_LOG_DIR / "claude" / f"{claude_session_id}.log"
+    if not cwd:
+        return None
+    cwd_key = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    loc_key = re.sub(r"[^A-Za-z0-9]", "-", location or "container")
+    return SCREEN_LOG_DIR / "shell" / loc_key / f"{cwd_key}.log"
+
+
+def _live_pane_cwd(location, tmux_name):
+    """One-off `pane_current_path` query, standalone -- unlike the per-poll
+    one _watch_tmux_session's own main loop piggybacks onto its existing
+    capture-pane call (no separate round trip there), this runs once, at
+    that same function's startup, only to seed _screen_backlog before the
+    main loop has queried anything itself yet. None on any failure (a pane
+    that has not finished starting up, say) -- exactly as good as not
+    seeding at all, which is what happens without this."""
+    try:
+        r = tmux_exec(location, ["display-message", "-p", "-t", tmux_name, "#{pane_current_path}"])
+    except subprocess.TimeoutExpired:
+        return None
+    if r.returncode != 0:
+        return None
+    path = r.stdout.rstrip("\n")
+    return path or None
+
+
+def _load_screen_log(path):
+    """The persisted counterpart's read side -- last SCREEN_BACKLOG_MAX_LINES
+    lines, same cap as the in-memory backlog this seeds, so a restored
+    session cannot start out "ahead" of what a live one could ever hold."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+    return lines[-SCREEN_BACKLOG_MAX_LINES:]
+
+
+def _append_screen_log(path, lines):
+    """The persisted counterpart's write side, called alongside every
+    _screen_backlog append (_watch_tmux_session) with the same
+    `scrolled_off` batch. Trimming is size-triggered, not per-append (see
+    SCREEN_LOG_TRIM_SIZE_BYTES) -- an occasional full read+rewrite, not one
+    on every scroll. Best-effort: a write failure here must not take down
+    the watcher thread that also owns dead-pane detection for this
+    session, so it only logs."""
+    if not lines:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            for line in lines:
+                f.write(line + "\n")
+        if path.stat().st_size > SCREEN_LOG_TRIM_SIZE_BYTES:
+            kept = _load_screen_log(path)
+            with path.open("w") as f:
+                for line in kept:
+                    f.write(line + "\n")
+    except OSError as e:
+        log(f"_append_screen_log({path}): {e!r}")
+
+
 def _watch_tmux_session(session_id):
     """Watches a real tmux pane -- both the "shell" preset (a pane this
     backend created) and an adopted "attach" session (one the user started
@@ -3668,18 +4812,50 @@ def _watch_tmux_session(session_id):
     tmux_name = meta.get("tmux_name", session_id)
     location = meta.get("tmux_location", "container")
     preset = meta.get("preset")
+    claude_session_id = meta.get("claude_session_id")
+    # meta["cwd"] is reliable (resolve_workdir'd at creation, fixed for this
+    # session's whole life) whenever the user actually picked one --
+    # "claude-tui" always has it (CWD_PRESETS), "shell"/"host-shell"/
+    # "root-shell"/"codex-tui" have it only if this particular session was
+    # created with an explicit cwd (the deployment notes;
+    # SHELL_CWD_PRESETS, cwd optional there unlike CWD_PRESETS). Left at the
+    # create_session default
+    # (meta["cwd"] is None) instead, the pane's actual current directory has
+    # to come from tmux itself (see _screen_log_path's own docstring) --
+    # "attach" always falls into this case too, having no create_session
+    # call of its own to have set it in the first place. Refreshed live in
+    # the main loop below for every _screen_log_path call after this one;
+    # this is only the one-time value used to seed _screen_backlog before
+    # that loop has queried anything of its own.
+    static_cwd = meta.get("cwd")
+    cwd = static_cwd if static_cwd else _live_pane_cwd(location, tmux_name)
     sdir = session_dir(session_id)
     outbox = sdir / "outbox"
+    talkto_path = sdir / TALKTO_FILENAME
+    talkto_offset = 0
     seen_files = _already_announced_attachments(session_id)
     committed_lines = []
     pending_line = None
     prev_lines = []
+    # Restore whatever a past session (same claude conversation, or same
+    # cwd with no claude conversation at all) already persisted, before
+    # this pane has scrolled anything of its own -- see _screen_log_path
+    # (the deployment notes). Only seeds _screen_backlog when
+    # there is something to seed with, so screen_history_page's own
+    # "never polled" (None) vs. "polled, nothing scrolled off yet" ([])
+    # distinction is unaffected for a session with nothing to restore.
+    _seed_path = _screen_log_path(cwd, location, claude_session_id)
+    _seed_lines = _load_screen_log(_seed_path) if _seed_path is not None else []
+    if _seed_lines:
+        with _screen_backlog_lock:
+            _screen_backlog[session_id] = _seed_lines
     last_liveness_check = 0.0
     try:
         while True:
             time.sleep(TMUX_POLL_INTERVAL)
 
             _scan_outbox_for_attachments(session_id, outbox, seen_files)
+            talkto_offset = _poll_talkto_file(session_id, talkto_path, talkto_offset)
 
             # -J joins lines the pane wrapped, so what comes back is what the
             # program printed rather than what happened to fit. Without it a
@@ -3729,7 +4905,7 @@ def _watch_tmux_session(session_id):
                     # tab (which tmux silently mangles into "_" instead --
                     # "|" has neither problem: not whitespace, not touched).
                     ";", "display-message", "-p", "-t", tmux_name,
-                    "#{pane_dead}|#{pane_dead_status}|#{pane_height}",
+                    "#{pane_dead}|#{pane_dead_status}|#{pane_height}|#{pane_current_path}",
                 ])
             except subprocess.TimeoutExpired:
                 log(f"tmux capture-pane for {session_id} timed out; skipping this poll")
@@ -3750,6 +4926,15 @@ def _watch_tmux_session(session_id):
                 # cost-avoidance reasoning as pane_dead's own comment above.
                 pane_height = (int(dead_fields[2]) if len(dead_fields) > 2 and dead_fields[2].isdigit()
                                else SCREEN_LINES)
+                # Live cwd for _screen_log_path
+                # (the deployment notes), same round trip -- ignored whenever static_cwd
+                # is already reliable (see its own comment above), but a
+                # session with no explicit cwd of its own has no stored
+                # value at all, and even one that does can still `cd`
+                # elsewhere by hand over its life, so this is re-read every
+                # poll rather than cached once.
+                pane_cwd = dead_fields[3] if len(dead_fields) > 3 and dead_fields[3] else None
+                cwd = static_cwd if static_cwd else pane_cwd
 
                 new_lines = [l.rstrip() for l in clean_terminal_text(capture_text).split("\n")]
                 while new_lines and new_lines[-1] == "":
@@ -3793,6 +4978,17 @@ def _watch_tmux_session(session_id):
                             backlog.extend(scrolled_off)
                             if len(backlog) > SCREEN_BACKLOG_MAX_LINES:
                                 del backlog[:len(backlog) - SCREEN_BACKLOG_MAX_LINES]
+                        # Recomputed every time, not cached from thread
+                        # start: claude_session_id only becomes "confirmed"
+                        # (see _screen_log_path) once Claude Code actually
+                        # creates the transcript file, which for a brand-
+                        # new conversation happens well after this thread
+                        # started, and a plain shell that later runs
+                        # `claude` by hand crosses that same line mid-
+                        # session too.
+                        log_path = _screen_log_path(cwd, location, claude_session_id)
+                        if log_path is not None:
+                            _append_screen_log(log_path, scrolled_off)
 
                 # The live screen, derived from this same capture rather than
                 # a second `capture-pane` call -- one docker exec every 0.3s
@@ -3971,8 +5167,8 @@ def _split_assistant_text_events(buf):
     root-shell/attach) -- extracted 2026-09-01 after a codebase health
     pass found this exact parsing block duplicated between them, in
     precisely the area of the codebase with the heaviest bug history
-    (the deployment notes, CHANGELOG's
-    aigw-shell-claude-watcher-permission-retry, and this same day's
+    (the deployment notes,
+    the deployment's changelog, and this same day's
     the deployment notes) -- two copies meant a fix to one
     could miss the other.
 
@@ -4000,6 +5196,75 @@ def _split_assistant_text_events(buf):
                 if text.strip():
                     texts.append(text)
     return buf, texts
+
+
+def _parse_iso_timestamp(raw):
+    """Best-effort ISO8601 -> epoch float for a transcript line's own
+    "timestamp" field (e.g. "2026-09-21T07:09:41.372Z"), so a backfilled
+    history event (_extract_history_events) can carry the moment it was
+    actually said instead of the moment it was replayed. None on anything
+    unparseable -- append_event() then falls back to time.time() for that
+    one event same as it always has, never fatal."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.datetime.strptime(
+            raw, "%Y-%m-%dT%H:%M:%S.%fZ"
+        ).replace(tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _extract_history_events(buf):
+    """One-time parse of a Claude Code transcript snapshot into chat-log
+    events, in file order -- both sides of the conversation, unlike
+    _split_assistant_text_events (which deliberately only surfaces
+    Claude's half, because for live tailing the user's own turns are
+    already recorded by send_message()). Used only to backfill a
+    brand-new aigw session's own (empty) events.jsonl when it starts by
+    resuming a conversation that already has prior history on disk --
+    see _tail_claude_transcript's is_resume branch
+    (the deployment notes) -- so "続きから" actually shows the
+    conversation being continued, not a blank chat log next to a screen
+    panel that (via `claude --resume`'s own redraw) still shows it.
+
+    A "user" line's message.content is a plain non-empty string only for
+    an actual human-typed turn; Claude Code also writes "user"-typed
+    lines to carry tool_result blocks back to itself mid-turn, and those
+    always have a list content instead -- excluded here the same way
+    _split_assistant_text_events already excludes non-"text" assistant
+    blocks."""
+    events = []
+    for raw in buf.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            continue
+        message = obj.get("message") or {}
+        ts = _parse_iso_timestamp(obj.get("timestamp"))
+        obj_type = obj.get("type")
+        if obj_type == "user":
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                event = {"type": "user_message", "text": content}
+                if ts is not None:
+                    event["ts"] = ts
+                events.append(event)
+        elif obj_type == "assistant":
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    if text.strip():
+                        event = {"type": "agent_output", "text": text}
+                        if ts is not None:
+                            event["ts"] = ts
+                        events.append(event)
+    return events
 
 
 def _tail_claude_transcript(session_id):
@@ -4050,20 +5315,43 @@ def _tail_claude_transcript(session_id):
 
     if is_resume:
         # Resumed conversation: the log already exists (resolve_resume_id
-        # checked that at creation time). Start from its current end so
-        # today's session picks up only what's said from here on, the same
-        # way a backend restart reattaching to an already-discovered
-        # "claude-tui" log does not replay everything back into the chat.
-        # Claimed too (see _claim_transcript), not just newly-discovered
-        # files: a resumed conversation is exactly as much "this session's
-        # own" as a freshly-discovered one, and must be just as unavailable
-        # for some other session's discovery loop to mistakenly pick up.
+        # checked that at creation time). Claimed too (see
+        # _claim_transcript), not just newly-discovered files: a resumed
+        # conversation is exactly as much "this session's own" as a
+        # freshly-discovered one, and must be just as unavailable for some
+        # other session's discovery loop to mistakenly pick up.
         _claim_transcript(proj_dir, f"{claude_session_id}.jsonl", session_id)
         target_path = proj_dir / f"{claude_session_id}.jsonl"
         try:
-            offset = target_path.stat().st_size
+            current_size = target_path.stat().st_size
         except OSError:
             return
+        # Backfill iff this aigw session's OWN chat log has never had
+        # anything tailed into it yet (events.jsonl still empty, exactly
+        # as create_session's .touch() left it) -- that is what tells a
+        # genuine "続きから" (brand-new session id, wrapping a conversation
+        # that already has history on disk) apart from a backend restart
+        # reattaching its tailer thread to a "claude-tui" session that was
+        # already running and already being tailed under this SAME session
+        # id (that one's events.jsonl already has the entries this same
+        # history would just duplicate). See _extract_history_events
+        # (the deployment notes) -- fixes "続きから"'s chat log
+        # starting blank next to a screen panel that (via `claude
+        # --resume`'s own redraw) still shows the conversation.
+        own_events_path = session_dir(session_id) / "events.jsonl"
+        try:
+            never_tailed = own_events_path.stat().st_size == 0
+        except OSError:
+            never_tailed = False
+        if never_tailed:
+            try:
+                with target_path.open("rb") as f:
+                    history = f.read(current_size)
+            except OSError:
+                history = b""
+            for event in _extract_history_events(history):
+                append_event(session_id, event)
+        offset = current_size
     else:
         # Brand-new conversation: Claude Code has not created its log file
         # yet (it may not even have started). Wait for one that was not
@@ -4181,8 +5469,8 @@ def _tail_claude_transcript(session_id):
 # existing jsonl's mtime may be for _watch_shell_claude to still treat it as
 # "the conversation aigw-backend merely lost track of across a restart"
 # rather than "an unrelated earlier conversation in the same cwd". Widened
-# from the original 20.0 on 2026-09-14 (the deployment notes
-# restart-during-turn): a restart *gap* is seconds, but the on-disk file's
+# from the original 20.0 on 2026-09-14
+# (the deployment notes): a restart *gap* is seconds, but the on-disk file's
 # own last write can be much older than that even while the conversation is
 # very much still going -- a long agentic turn (several tool calls, a slow
 # command) routinely goes well past 20s between writes, and a restart that
@@ -4196,6 +5484,71 @@ def _tail_claude_transcript(session_id):
 RESUME_STALE_THRESHOLD_SECONDS = 180.0
 
 CLAUDE_FOREGROUND_POLL_INTERVAL = 2.0
+
+# ACL self-heal backoff for _watch_shell_claude's root-shell read-permission
+# race (the deployment notes, 2026-09-29, user
+# request "最初に1分待つのは困るので": 5s/30s/2min/5min elapsed since the
+# read first started failing, not a blind periodic timer -- most reads never
+# hit this at all, so there is no reason to make every session pay a fixed
+# poll tax for the rare one that does). A brand-new root-shell `claude`
+# conversation's .jsonl can be created with an ACL mask that denies this
+# backend's own user read access until an explicit `setfacl -m` recomputes
+# it (posix_acl_create semantics against Claude Code's 0600 create mode --
+# see verb_regrant's own docstring in aigw-unlockd, and
+# the deployment's changelog for the 2026-08-30 half of this fix
+# that only stopped it from crashing the watcher, not from happening).
+# Previously that only ever got fixed as a side effect of the user's next
+# unrelated passkey re-authentication -- possibly minutes to indefinitely
+# later, since 2026-08-31's "sever access, don't kill the server" redesign
+# means an already-open window kept alive by ordinary activity never
+# retriggers the grant on its own. The last entry is also the "give up
+# and tell the user" threshold, not just another regrant attempt.
+ACL_SELF_HEAL_SCHEDULE = (5.0, 30.0, 120.0, 300.0)
+
+
+def _request_acl_regrant():
+    """Best-effort: ask aigw-unlockd to re-run aigw-root-tmux-grant's setfacl
+    for this backend's own user (verb_regrant's own docstring has the full
+    story). Requires an already-open root-tier window -- if there is none,
+    unlockd just says so and this returns False, which the caller treats
+    exactly like "regrant didn't happen this time, the schedule will ask
+    again" rather than an error of its own."""
+    resp = _unlockd_call("regrant")
+    return bool(resp.get("ok"))
+
+
+def _note_transcript_read_failure(session_id, location, fail_since, regrant_idx, error_sent):
+    """Called from _watch_shell_claude every poll where reading its claimed
+    target file raised OSError (see that function's own two call sites) --
+    tracks how long this *particular* stretch of failures has been going on
+    and, for a "root"-location session only (the only one with an ACL of
+    its own to fix, see ACL_SELF_HEAL_SCHEDULE), asks for a regrant once per
+    schedule threshold crossed and posts one user-visible error once the
+    final threshold passes with the read still failing. Returns the updated
+    (fail_since, regrant_idx, error_sent) for the caller to carry into its
+    next iteration -- plain function instead of a class/closure since
+    _watch_shell_claude already tracks a handful of other per-poll locals
+    (target_path, offset, buf, ...) the exact same way.
+
+    A successful read (the caller's own job to detect) must reset all three
+    back to (None, 0, False) instead of calling this -- see the two call
+    sites' surrounding code."""
+    now = time.time()
+    if fail_since is None:
+        fail_since = now
+    if location == "root":
+        elapsed = now - fail_since
+        while regrant_idx < len(ACL_SELF_HEAL_SCHEDULE) and elapsed >= ACL_SELF_HEAL_SCHEDULE[regrant_idx]:
+            _request_acl_regrant()
+            regrant_idx += 1
+        if not error_sent and elapsed >= ACL_SELF_HEAL_SCHEDULE[-1]:
+            append_event(session_id, {
+                "type": "system",
+                "text": "⚠️ 会話ログを読み取れません(権限エラーが続いています)。"
+                        "パスキーでroot解錠をやり直すと直ることがあります。",
+            })
+            error_sent = True
+    return fail_since, regrant_idx, error_sent
 
 
 def _is_claude_foreground(command):
@@ -4259,8 +5612,8 @@ def _watch_shell_claude(session_id):
     "claude-tui"/"claude", there is no notion of resuming a *specific* past
     conversation picked from a list) -- EXCEPT when create_session pre-
     assigned a fresh one for a brand-new conversation (local "shell"/
-    "host-shell"/"root-shell" and, since the deployment notes
-    resumable-retry, ssh: SSH_SHELL_PRESETS too): in that case there is
+    "host-shell"/"root-shell" and, since
+    the deployment notes, ssh: SSH_SHELL_PRESETS too): in that case there is
     nothing to discover at all, see preassigned_id below. Absent it,
     nothing here needs to survive a backend restart -- it just starts
     noticing again from whatever is running once ensure_watcher re-fires
@@ -4286,6 +5639,12 @@ def _watch_shell_claude(session_id):
     known = set()
     offset = 0
     buf = b""
+    # ACL self-heal bookkeeping (_note_transcript_read_failure,
+    # ACL_SELF_HEAL_SCHEDULE) -- only ever touched for location == "root",
+    # but harmless to carry for every location.
+    acl_fail_since = None
+    acl_regrant_idx = 0
+    acl_error_sent = False
 
     try:
         while True:
@@ -4351,10 +5710,10 @@ def _watch_shell_claude(session_id):
                 have_target = (target_name is not None) if is_ssh else (target_path is not None)
                 if not have_target and preassigned_id:
                     # create_session already minted this id just for this
-                    # session before `claude` ever ran (the deployment notes
-                    # claude-tail-cross-session-claim, extended to ssh:
-                    # SSH_SHELL_PRESETS by the deployment notes
-                    # resumable-retry) -- nothing to guess, no candidate to
+                    # session before `claude` ever ran
+                    # (the deployment notes, extended to ssh:
+                    # SSH_SHELL_PRESETS by
+                    # the deployment notes) -- nothing to guess, no candidate to
                     # weigh against another session's. The file may not
                     # exist yet if `claude` only just started; size <=
                     # offset (0) below simply retries next poll until it
@@ -4509,8 +5868,8 @@ def _watch_shell_claude(session_id):
                     # moving), not because it is actually someone else's
                     # file. Re-admitting it here whenever it is freshly
                     # modified again fixes a permanent-hang case measured
-                    # live 2026-09-16 (the deployment notes
-                    # resumable-retry): this thread's own still-live
+                    # live 2026-09-16
+                    # (the deployment notes): this thread's own still-live
                     # conversation had gone an already-known-possible >180s
                     # without a write at the exact instant of an unrelated
                     # aigw-backend restart, got rejected once by that
@@ -4570,6 +5929,8 @@ def _watch_shell_claude(session_id):
                 try:
                     size = target_path.stat().st_size
                 except OSError:
+                    acl_fail_since, acl_regrant_idx, acl_error_sent = _note_transcript_read_failure(
+                        session_id, location, acl_fail_since, acl_regrant_idx, acl_error_sent)
                     continue
                 if size <= offset:
                     continue
@@ -4577,20 +5938,24 @@ def _watch_shell_claude(session_id):
                 # expected and transient: a brand-new jsonl created under a
                 # directory with a default ACL for this user gets its ACL
                 # mask intersected with the *creation mode*'s group bits
-                # (posix_acl_create semantics, see the deployment notes
-                # transcript-acl), which is 0 for the 0600 Claude Code
+                # (posix_acl_create semantics, see
+                # the deployment notes), which is 0 for the 0600 Claude Code
                 # creates these with -- so the named ACL entry aigw-root-
                 # tmux-grant set up is silently inert until some later event
-                # (e.g. the next grant run, which re-applies the mask via an
-                # explicit setfacl -m instead of the creation-time
-                # intersection) fixes it. Must not exit the watcher over
-                # this like the outer except does -- just retry next poll.
+                # fixes it. Must not exit the watcher over this like the
+                # outer except does -- just retry next poll, and (2026-09-29,
+                # ACL_SELF_HEAL_SCHEDULE) actively ask for that "later event"
+                # on a backoff instead of only ever getting it as a side
+                # effect of the user's next unrelated passkey unlock.
                 try:
                     with target_path.open("rb") as f:
                         f.seek(offset)
                         chunk = f.read(size - offset)
                 except OSError:
+                    acl_fail_since, acl_regrant_idx, acl_error_sent = _note_transcript_read_failure(
+                        session_id, location, acl_fail_since, acl_regrant_idx, acl_error_sent)
                     continue
+                acl_fail_since, acl_regrant_idx, acl_error_sent = None, 0, False
                 offset = size
                 buf += chunk
 
@@ -4893,6 +6258,26 @@ def _transcript_speaker(preset):
     return "Claude" if preset in CLAUDE_PERSONA_PRESETS else "出力"
 
 
+def _agent_persona_label(preset):
+    """Human-facing name for whichever AI agent a session's own preset
+    implies is running there -- used by create_link's priming message
+    (the deployment notes, 2026-09-27: linking a "codex-tui" session in with
+    a Claude one). Unlike CLAUDE_PERSONA_PRESETS/_transcript_speaker (only
+    ever "Claude" vs. generic "output"), this also names Codex specifically,
+    since the priming message tells one side's agent what kind of thing is
+    on the other end of `talkto` -- getting that wrong ("another Claude
+    Code session" when the partner is actually Codex) would be actively
+    misleading, not just imprecise. "shell"/"host-shell"/"root-shell"/
+    "attach" have no fixed agent (anything might be running by hand, or
+    nothing at all) -- generic wording covers that honestly instead of
+    guessing which one."""
+    if preset in CLAUDE_PERSONA_PRESETS:
+        return "Claude Code"
+    if preset in CODEX_TUI_PRESETS:
+        return "Codex CLI"
+    return "何らかのAIエージェント"
+
+
 def _transcript_filename(meta):
     # Deliberately not built from the user-supplied label: it can contain
     # arbitrary characters (including non-ASCII), which Content-Disposition
@@ -5063,16 +6448,23 @@ def _shared_get_path_allowed(parts):
     is reachable when the request carries an on_behalf_of. Matches exactly
     the routes that call resolve_session_access() before doing anything
     (events, events/page, screen, files/<name>, subagents, subagents/<id>,
-    download), plus the bare session list (list_sessions(on_behalf_of) does
-    the equivalent shared_with filtering) -- see the comment above this
-    function for why this is the right boundary."""
+    download, outbox-dirs, outbox-files/<path...>), plus the bare session
+    list (list_sessions(on_behalf_of) does the equivalent shared_with
+    filtering) -- see the comment above this function for why this is the
+    right boundary."""
     if parts == ["sessions"]:
         return True
     if len(parts) < 3 or parts[0] != "sessions":
         return False
     action = parts[2]
+    # outbox-files carries an arbitrary-depth path after it (a folder
+    # attachment can be browsed to any depth), unlike every other route
+    # here which is a fixed length -- checked before the length-specific
+    # branches below rather than folded into one of them.
+    if action == "outbox-files" and len(parts) >= 4:
+        return True
     if len(parts) == 3:
-        return action in ("events", "screen", "subagents", "download")
+        return action in ("events", "screen", "subagents", "download", "outbox-dirs")
     if len(parts) == 4:
         if action == "events":
             return parts[3] == "page"
@@ -5172,6 +6564,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if parts == ["sessions"]:
             return self._json(200, {"sessions": list_sessions(on_behalf_of)})
+
+        # Never reached with on_behalf_of set, same reasoning as
+        # /session-order just below (this user's own links only).
+        if parts == ["sessions", "links"]:
+            return self._json(200, {"links": list_links()})
 
         # The viewer's own manual drag-reorder of the session list
         # (the deployment notes, 2026-09-11): a display preference, not a
@@ -5302,6 +6699,48 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(*err)
             return self._serve_outbox_file(parts[1], parts[3])
 
+        # Folder attachments (kind="folder", the deployment notes): same
+        # "one level at a time" shape as /workdirs below, but rooted at one
+        # session's own outbox/ instead of ~/sandhome. A separate route
+        # rather than overloading /workdirs -- the root is per-session, not
+        # per-user, and unlike a working directory picker this one also
+        # needs to hand back files, not just subdirectories.
+        if len(parts) == 3 and parts[0] == "sessions" and parts[2] == "outbox-dirs":
+            session_id = parts[1]
+            _, err = resolve_session_access(session_id, on_behalf_of)
+            if err:
+                return self._json(*err)
+            outbox_root = session_dir(session_id) / "outbox"
+            root = outbox_root.resolve()
+            try:
+                abs_dir = resolve_outbox_subpath(outbox_root, qs.get("dir", [""])[0])
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            rel = "" if abs_dir == root else os.path.relpath(abs_dir, root)
+            dirs, files = list_outbox_entries(root, abs_dir)
+            return self._json(200, {
+                "dir": "" if rel == "." else rel,
+                "subdirs": dirs,
+                "files": files,
+            })
+
+        # A file inside a folder attachment (not the flat top-level /files/
+        # route above, which only ever takes one already-frozen basename).
+        # `parts[3:]` lets the path itself carry arbitrary depth, each
+        # segment unquoted individually since, unlike outbox-root filenames
+        # (OUTBOX_NAME_RE), a name inside a dropped folder can contain
+        # spaces or non-ASCII characters that encodeURIComponent escapes --
+        # `parts` here is the raw, still-percent-encoded split of the URL
+        # path (do_GET does no blanket unquoting), unlike qs from parse_qs
+        # which already decodes query values.
+        if len(parts) >= 4 and parts[0] == "sessions" and parts[2] == "outbox-files":
+            session_id = parts[1]
+            _, err = resolve_session_access(session_id, on_behalf_of)
+            if err:
+                return self._json(*err)
+            rel = "/".join(unquote(p) for p in parts[3:])
+            return self._serve_outbox_subpath_file(session_id, rel)
+
         # Choices for the two headless-claude knobs on the new-session bar.
         # Both are pure directory reads of this user's own ~/sandhome (see
         # list_workdirs / claude_project_dir), never a container round-trip.
@@ -5366,12 +6805,48 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["claude-auth"]:
             return self._json(200, claude_auth_status_all())
 
+        if parts == ["codex-auth"]:
+            return self._json(200, codex_auth_status_all())
+
         # One level at a time: the client asks for the children of whatever
         # directory it is currently showing. `dir` is echoed back normalised,
         # so the client never has to reconstruct the path it landed on.
+        # `scope` (2026-09-27, the deployment notes) picks which
+        # filesystem/resolver pair this browses -- "sandhome" (default, the
+        # original and only behavior before this) for "claude"/"claude-tui"/
+        # "shell" alike (same tree, same resolve_workdir/list_subdirs), or
+        # "host"/"root" for "host-shell"/"root-shell"'s own real-filesystem
+        # pickers. Unlike "sandhome", `dir` for those two is the absolute
+        # path itself, not something relative to a single fixed root -- there
+        # isn't one to be relative to.
         if parts == ["workdirs"]:
+            scope = qs.get("scope", ["sandhome"])[0]
+            dir_param = qs.get("dir", [""])[0]
+            if scope == "host":
+                try:
+                    abs_cwd = resolve_host_workdir(dir_param)
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(200, {
+                    "dir": abs_cwd or str(HOME),
+                    "subdirs": list_host_subdirs(abs_cwd),
+                })
+            if scope == "root":
+                try:
+                    abs_cwd = resolve_root_workdir(dir_param)
+                    subdirs = list_root_subdirs(abs_cwd)
+                except UnlockRequired as e:
+                    return self._unlock_required(e)
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                except RuntimeError as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(200, {
+                    "dir": abs_cwd or "/",
+                    "subdirs": subdirs,
+                })
             try:
-                abs_cwd = resolve_workdir(qs.get("dir", [""])[0])
+                abs_cwd = resolve_workdir(dir_param)
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
             rel = "" if abs_cwd is None else os.path.relpath(abs_cwd, SANDHOME)
@@ -5381,8 +6856,8 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         # Same "one level at a time" shape as /workdirs above, but for a
-        # drives-capable ssh machine's Claude preset (the deployment notes
-        # workdirs) -- an empty `dir` means "no drive chosen yet", answered
+        # drives-capable ssh machine's Claude preset
+        # (the deployment notes) -- an empty `dir` means "no drive chosen yet", answered
         # with the machine's own drive letters instead of subdirs; a chosen
         # drive/folder answers with that directory's subdirs instead.
         if parts == ["ssh-workdirs"]:
@@ -5399,13 +6874,33 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"dir": "", "drives": list_ssh_drives(machine), "subdirs": []})
             return self._json(200, {"dir": dir_, "drives": [], "subdirs": list_ssh_subdirs(machine, dir_)})
 
-        # Optional, deployment-supplied route (the deployment notes
-        # split): project-docs -- see aigw_site_routes.handle_backend_get
+        # Optional, deployment-supplied route
+        # (the deployment notes): project-docs -- see aigw_site_routes.handle_backend_get
         # and SITE_CTX/the aigw_site_routes import (near resolve_workdir).
         if aigw_site_routes and aigw_site_routes.handle_backend_get(self, SITE_CTX, parts, qs):
             return
 
         if parts == ["claude-conversations"]:
+            # An optional `machine` switches this to the ssh: counterpart
+            # (the deployment notes) -- same shape as /ssh-workdirs right
+            # above it: `dir` is that machine's own posix path (as resolved
+            # by /ssh-workdirs, not a ~/sandhome-relative one), and an empty
+            # `dir` (no drive/folder chosen yet) answers with no
+            # conversations rather than erroring, since list_ssh_claude_
+            # conversations has no fixed directory to fall back to there.
+            machine = qs.get("machine", [""])[0]
+            if machine:
+                if not SSH_MACHINES.get(machine, {}).get("drives"):
+                    return self._json(400, {"error": "unknown or non-drives-capable ssh machine"})
+                if not ssh_reachable(machine):
+                    return self._json(400, {"error": f"{machine} is not reachable over SSH right now"})
+                try:
+                    dir_ = resolve_ssh_workdir(machine, qs.get("dir", [""])[0])
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                if dir_ is None:
+                    return self._json(200, {"conversations": []})
+                return self._json(200, {"conversations": list_ssh_claude_conversations(machine, dir_)})
             try:
                 abs_cwd = resolve_workdir(qs.get("cwd", [""])[0])
             except ValueError as e:
@@ -5478,6 +6973,51 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, RuntimeError) as e:
                 return self._json(400, {"error": str(e)})
             return self._json(201, meta)
+
+        # Codex counterparts of the two claude-auth routes just above -- same
+        # shapes, same scopes (no ssh:<machine>, see CODEX_LOGIN_SCOPES).
+        if parts == ["codex-auth", "logout"]:
+            scope = (self._read_json_body() or {}).get("scope", "container")
+            try:
+                return self._json(200, {"ok": True, "output": codex_auth_logout_scope(scope)})
+            except UnlockRequired as e:
+                return self._unlock_required(e)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                return self._json(502, {"error": str(e)})
+
+        if parts == ["codex-auth", "login"]:
+            scope = (self._read_json_body() or {}).get("scope", "container")
+            try:
+                meta = start_codex_login(scope)
+            except UnlockRequired as e:
+                return self._unlock_required(e)
+            except (ValueError, RuntimeError) as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(201, meta)
+
+        # {"a": id, "b": id, "max_turns": int?} -- see create_link's own
+        # comment for validation/defaults. No unlock gate here: creating the
+        # record itself does nothing outside the sandbox on its own, that
+        # happens (and is gated) per relayed message, in send_message via
+        # _relay_agent_output.
+        if parts == ["sessions", "link"]:
+            body = self._read_json_body() or {}
+            try:
+                rec = create_link(body.get("a"), body.get("b"), body.get("max_turns"))
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            return self._json(201, rec)
+
+        # {"session_id": id} -- disconnects whatever link that session is
+        # part of, if any. Idempotent: unlinking an already-unlinked session
+        # is not an error, same spirit as stop_session on an already-stopped
+        # one.
+        if parts == ["sessions", "unlink"]:
+            body = self._read_json_body() or {}
+            broke = break_link(body.get("session_id", ""))
+            return self._json(200, {"ok": True, "broke": broke})
 
         # {"scope": "self"|"all"} -- "all" additionally requires root_shell
         # (see kill_all_chrome), same gate GET /capabilities already reports
@@ -5809,6 +7349,29 @@ class Handler(BaseHTTPRequestHandler):
         # sniffs the bytes), but a browser tab opened directly on this URL
         # should still render/preview sensibly.
         self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_outbox_subpath_file(self, session_id, rel):
+        """Same shape as _serve_outbox_file above, but for a file reached by
+        browsing into a folder attachment (the deployment notes) -- `rel` is
+        an arbitrary-depth path under that session's outbox/ root rather
+        than a single already-frozen basename, so the safety boundary is
+        resolve_outbox_subpath's containment check instead of
+        OUTBOX_NAME_RE."""
+        if not SESSION_ID_RE.match(session_id):
+            return self._json(400, {"error": "invalid path"})
+        outbox_root = session_dir(session_id) / "outbox"
+        try:
+            p = resolve_outbox_subpath(outbox_root, rel)
+        except ValueError as e:
+            return self._json(400, {"error": str(e)})
+        if not p.is_file():
+            return self._json(404, {"error": "not found"})
+        data = p.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(p.name)[0] or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

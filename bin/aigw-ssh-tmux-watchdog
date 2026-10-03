@@ -1,0 +1,217 @@
+#!/opt/aigw/venv/bin/python3
+"""Watchdog for the real tmux servers aigw-backend drives over SSH
+(SSH_MACHINES in aigw-backend, /etc/aigw/ssh_machines.json).
+
+The MSYS2/Cygwin tmux on the Windows machines occasionally wedges: the
+server process stays alive but stops answering its socket, so every client
+aigw-backend starts (list-sessions polls, capture-pane, new-session) hangs
+forever. From the phone that looks like "aigw stopped responding": session
+creation runs into its 45s + 240s waits and nginx gives up first, and
+existing panes stop updating. Measured 2026-09-25 on winbox-b: one wedged
+server, 130 hung clients piled up over ~15 minutes.
+
+Run from aigw-ssh-tmux-watchdog.timer. Per machine, each run:
+
+  1. connectivity probe (`true`) -- a machine that is off/asleep is not
+     a tmux problem, so nothing below happens for it
+  2. `tmux list-sessions` with a timeout -- a hang here means the server
+     is wedged ("no server running" is a quick, healthy answer)
+  3. the list of tmux processes, read from /proc (no ps/awk pattern
+     matching on the remote side: a pattern in a command line matches the
+     shell running it, which is how a hand-run cleanup once killed itself)
+
+Recovery (after WEDGE_STRIKES consecutive hung list-sessions): kill every
+non-interactive tmux client, every stuck `new-session` wrapper and every
+tmux server. The wedged server's panes are lost, but they were unreachable
+anyway; the next session aigw creates forks a fresh server. Interactive
+clients (stdin on a pty -- someone attached by hand) are left alone.
+Hung clients alone (server answering, same non-interactive client pids
+still there after STUCK_STRIKES runs) are killed without touching the
+server. Every action is logged and pushed to the users in
+/etc/aigw/ssh-tmux-watchdog.json ({"notify_users": ["<user>", ...]}).
+"""
+import json
+import os
+import pwd
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SSH_CONFIG = "/opt/aigw-ssh/config"
+MACHINES_FILE = "/etc/aigw/ssh_machines.json"
+CONFIG_FILE = "/etc/aigw/ssh-tmux-watchdog.json"
+STATE_DIR = Path("/var/lib/aigw-ssh-tmux-watchdog")
+VAPID_PRIVATE_KEY_FILE = "/etc/aigw/vapid_private.pem"
+VAPID_SUB_FILE = "/etc/aigw/vapid_sub.txt"
+# The shared key under /opt/aigw-ssh is root-owned and world-readable on
+# purpose (every aigw-backend@<user> uses it), which ssh refuses only when
+# the *invoking* user owns it -- i.e. root. So ssh runs as this user.
+SSH_USER = "aigw"
+
+CONNECT_TIMEOUT = 20
+LIST_TIMEOUT = 20
+WEDGE_STRIKES = 2
+STUCK_STRIKES = 3
+
+# Emits "pid|winpid|stdin|cmdline" for every process whose command line
+# mentions tmux. winpid only exists on Cygwin/MSYS2, where `kill -9` does not
+# reliably stop a wedged tmux server (measured 2026-09-25) and taskkill on
+# the Windows pid is needed instead.
+PROC_SCRIPT = r'''for d in /proc/[0-9]*; do
+  c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+  case "$c" in *tmux*) ;; *) continue ;; esac
+  printf '%s|%s|%s|%s\n' "${d#/proc/}" "$(cat "$d/winpid" 2>/dev/null)" "$(readlink "$d/fd/0" 2>/dev/null)" "$c"
+done'''
+
+INTERACTIVE_STDIN = ("/dev/pty", "/dev/pts/", "/dev/tty", "/dev/cons")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def ssh(machine, remote_cmd, timeout):
+    # setpriv rather than runuser/sudo: no PAM session, so no two journal
+    # lines per ssh call every couple of minutes.
+    pw = pwd.getpwnam(SSH_USER)
+    argv = ["setpriv", f"--reuid={pw.pw_uid}", f"--regid={pw.pw_gid}", "--clear-groups",
+            "env", f"HOME={pw.pw_dir}", "ssh", "-F", SSH_CONFIG,
+            "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={CONNECT_TIMEOUT}", machine, remote_cmd]
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def list_tmux_procs(machine, tmux_bin):
+    r = ssh(machine, PROC_SCRIPT, timeout=60)
+    if r is None or r.returncode != 0:
+        return None
+    procs = []
+    for line in r.stdout.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) != 4:
+            continue
+        pid, winpid, stdin, cmd = parts
+        cmd = cmd.strip()
+        if cmd.startswith("tmux: server"):
+            kind = "server"
+        elif cmd.startswith("tmux: client"):
+            kind = "client"
+        elif f"{tmux_bin} new-session" in cmd and cmd.split()[0].endswith("bash"):
+            kind = "new-session"  # aigw-backend's `bash -c '<tmux> new-session ... </dev/null'`
+        else:
+            continue
+        procs.append({"pid": pid, "winpid": winpid, "kind": kind,
+                      "interactive": stdin.startswith(INTERACTIVE_STDIN), "cmd": cmd})
+    return procs
+
+
+def kill_procs(machine, procs):
+    cmds = []
+    for p in procs:
+        if p["winpid"]:
+            cmds.append(f"taskkill //F //PID {shlex.quote(p['winpid'])} >/dev/null 2>&1 || kill -9 {shlex.quote(p['pid'])}")
+        else:
+            cmds.append(f"kill -9 {shlex.quote(p['pid'])}")
+    if not cmds:
+        return
+    r = ssh(machine, "; ".join(cmds) + "; true", timeout=60)
+    if r is None:
+        log(f"{machine}: kill command itself timed out")
+
+
+def notify(message):
+    try:
+        cfg = json.loads(Path(CONFIG_FILE).read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    try:
+        from pywebpush import webpush
+    except ImportError:
+        log("pywebpush not available, skipping push")
+        return
+    vapid_sub = "mailto:aigw@localhost"
+    if os.path.exists(VAPID_SUB_FILE):
+        vapid_sub = Path(VAPID_SUB_FILE).read_text().strip()
+    payload = json.dumps({"session_id": None, "message": message})
+    for user in cfg.get("notify_users", []):
+        try:
+            subs_path = Path(pwd.getpwnam(user).pw_dir) / ".aigw-state" / "push_subscriptions.json"
+            subs = json.loads(subs_path.read_text())
+        except (KeyError, OSError, ValueError):
+            continue
+        for sub in subs:
+            try:
+                webpush(subscription_info=sub, data=payload,
+                        vapid_private_key=VAPID_PRIVATE_KEY_FILE, vapid_claims={"sub": vapid_sub})
+            except Exception as e:  # an expired subscription is the backend's to prune
+                log(f"push to {user} failed: {e}")
+
+
+def check(machine, spec, state):
+    tmux_bin = spec["tmux"]
+    r = ssh(machine, "true", timeout=CONNECT_TIMEOUT + 10)
+    if r is None or r.returncode != 0:
+        log(f"{machine}: unreachable, skipped")
+        return {}
+
+    r = ssh(machine, f"{shlex.quote(tmux_bin)} list-sessions", timeout=LIST_TIMEOUT)
+    hung = r is None
+    procs = list_tmux_procs(machine, tmux_bin)
+    if procs is None:
+        log(f"{machine}: could not list processes")
+        return state
+
+    wedge = state.get("wedge", 0) + 1 if hung else 0
+    stale = {p["pid"] for p in procs if p["kind"] in ("client", "new-session") and not p["interactive"]}
+    seen = state.get("seen", {})
+    seen = {pid: seen.get(pid, 0) + 1 for pid in stale}
+    stuck = [p for p in procs if seen.get(p["pid"], 0) >= STUCK_STRIKES]
+    log(f"{machine}: list-sessions {'HUNG' if hung else 'ok'}, "
+        f"{sum(p['kind'] == 'server' for p in procs)} server(s), {len(stale)} non-interactive client(s), "
+        f"{len(stuck)} stuck")
+
+    if wedge >= WEDGE_STRIKES:
+        victims = [p for p in procs if p["kind"] == "server" or p["pid"] in stale]
+        log(f"{machine}: tmux server wedged ({wedge} hung list-sessions in a row) -- killing "
+            + ", ".join(f"{p['kind']}:{p['pid']}" for p in victims))
+        kill_procs(machine, victims)
+        notify(f"{machine}: tmux サーバーが固まっていたので再起動しました"
+               f"(client {len(stale)} 個を整理)。固まっていたセッションは作り直してください。")
+        return {}
+    if stuck and not hung:
+        log(f"{machine}: killing {len(stuck)} stuck client(s): " + ", ".join(p["pid"] for p in stuck))
+        kill_procs(machine, stuck)
+        notify(f"{machine}: 応答しない tmux client {len(stuck)} 個を整理しました。")
+        seen = {pid: n for pid, n in seen.items() if n < STUCK_STRIKES}
+    return {"wedge": wedge, "seen": seen}
+
+
+def main():
+    machines = json.loads(Path(MACHINES_FILE).read_text())
+    only = set(sys.argv[1:])
+    STATE_DIR.mkdir(mode=0o700, exist_ok=True)
+    for machine, spec in machines.items():
+        if only and machine not in only:
+            continue
+        state_path = STATE_DIR / f"{machine}.json"
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = {}
+        try:
+            state = check(machine, spec, state)
+        except Exception as e:  # one machine must never stop the others
+            log(f"{machine}: check failed: {e}")
+            continue
+        state["ts"] = time.time()
+        state_path.write_text(json.dumps(state))
+
+
+if __name__ == "__main__":
+    main()

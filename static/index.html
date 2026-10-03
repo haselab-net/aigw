@@ -58,7 +58,20 @@
   }
   .session-row .label { font-weight: 600; }
   .session-row .meta { font-size: 0.75rem; color: #9aa5b1; }
-  .session-row .delete-btn, .session-row .edit-btn, .session-row .archive-btn {
+  /* Armed (see app.js's linkArmedSessionId): the one 🔗 button currently
+     waiting for a second tap on some other session's 🔗 to complete the
+     link. */
+  .session-row .link-btn.armed { color: #4285F4; }
+  /* Bar shown only while armed, offering the one way out besides tapping a
+     second 🔗: same shape as #archive-toggle-btn, not a .session-row. */
+  #link-armed-banner {
+    display: none; align-items: center; justify-content: space-between;
+    padding: 0.6rem 1rem; margin-bottom: 0.6rem; border-radius: 8px;
+    border: 1px solid #4285F4; background: #1c2531; font-size: 0.85rem;
+  }
+  #link-armed-banner.visible { display: flex; }
+  #link-armed-banner button { background: none; border: none; color: #9aa5b1; }
+  .session-row .delete-btn, .session-row .edit-btn, .session-row .archive-btn, .session-row .link-btn {
     background: none; border: none; color: #9aa5b1; font-size: 1.1rem;
     padding: 0.4rem 0.6rem; flex-shrink: 0;
   }
@@ -101,23 +114,27 @@
      whole row past the screen. #ssh-cwd-opts is the same
      idea for a drives-capable ssh machine's Claude preset (winbox-a/
      winbox-b), so it shares every rule below with #claude-opts -- only the
-     markup inside differs (no resume row: see app.js). */
-  #claude-opts, #ssh-cwd-opts { display: none; flex-direction: column; gap: 0.5rem; }
-  #claude-opts.visible, #ssh-cwd-opts.visible { display: flex; }
-  #claude-opts select, #ssh-cwd-opts select { flex: 1; min-width: 0; font-size: 0.85rem; }
-  #claude-opts .nsb-icon, #ssh-cwd-opts .nsb-icon { color: #9aa5b1; font-size: 0.85rem; flex-shrink: 0; }
+     markup inside differs (drive/folder breadcrumb instead of a
+     sandhome-relative one; see app.js). #shell-cwd-opts (2026-09-27,
+     the deployment notes) is the same again for "shell"/
+     "host-shell"/"root-shell" -- a working directory with no resume row at
+     all (these have no notion of resuming a specific past conversation). */
+  #claude-opts, #ssh-cwd-opts, #shell-cwd-opts { display: none; flex-direction: column; gap: 0.5rem; }
+  #claude-opts.visible, #ssh-cwd-opts.visible, #shell-cwd-opts.visible { display: flex; }
+  #claude-opts select, #ssh-cwd-opts select, #shell-cwd-opts select { flex: 1; min-width: 0; font-size: 0.85rem; }
+  #claude-opts .nsb-icon, #ssh-cwd-opts .nsb-icon, #shell-cwd-opts .nsb-icon { color: #9aa5b1; font-size: 0.85rem; flex-shrink: 0; }
   /* The breadcrumb keeps its *end* visible (direction: rtl flips which side
      the ellipsis lands on): with sandhome/a/b/c/d (or D:/a/b/c/d) the deepest
      component is the one that identifies where you are. */
-  #cwd-crumb, #ssh-cwd-crumb {
+  #cwd-crumb, #ssh-cwd-crumb, #shell-cwd-crumb {
     flex: 1; min-width: 0; font-size: 0.85rem; font-family: ui-monospace, monospace;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
   }
-  #cwd-up, #ssh-cwd-up {
+  #cwd-up, #ssh-cwd-up, #shell-cwd-up {
     flex-shrink: 0; padding: 0.35rem 0.7rem; border-radius: 8px; border: 1px solid #2a3542;
     background: #1c2531; color: #e6e6e6;
   }
-  #cwd-up:disabled, #ssh-cwd-up:disabled { opacity: 0.35; }
+  #cwd-up:disabled, #ssh-cwd-up:disabled, #shell-cwd-up:disabled { opacity: 0.35; }
 
   #view-chat { display: none; flex-direction: column; flex: 1; min-height: 0; }
   #chat-header { display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1rem; background: #131a22; }
@@ -357,6 +374,8 @@
      applyCapabilities() in app.js) -- same gate as the preset option. */
   #auth-row-root { display: none; }
   #auth-row-root.visible { display: flex; }
+  #codex-auth-row-root { display: none; }
+  #codex-auth-row-root.visible { display: flex; }
   /* Same gate as #auth-row-root above, just one button instead of a whole
      row: any user can kill their own Chrome, only root-shell users get the
      "everyone" button too. */
@@ -447,7 +466,7 @@
            users the backend reports as able to become root.
            (A "Codewhale" option lived here until 2026-08-01.) -->
       <div class="nsb-row">
-        <select id="preset"><option value="claude-tui">Claude</option><option value="shell">Shell (sandbox内)</option><option value="host-shell">Shell (sandbox外・ホスト)</option></select>
+        <select id="preset"><option value="claude-tui">Claude</option><option value="codex-tui">Codex</option><option value="shell">Shell (sandbox内)</option><option value="host-shell">Shell (sandbox外・ホスト)</option></select>
         <input id="label" placeholder="名前(任意)">
         <button id="create-btn">開始</button>
       </div>
@@ -487,11 +506,13 @@
            preset -- Windows machines only, shown
            instead of #claude-opts, which is ~/sandhome-relative and
            meaningless on a machine sharing no filesystem with this host.
-           No resume row: Claude Code's own conversation history for these
-           lives on the remote machine's filesystem, not listable from here
-           (see aigw-backend's create_session). Same one-level-at-a-time
-           navigation as #claude-opts, just rooted at "pick a drive" instead
-           of sandhome. -->
+           Same one-level-at-a-time navigation as #claude-opts, just rooted
+           at "pick a drive" instead of sandhome. The resume row only
+           appears once a drive/folder has actually been chosen (see
+           app.js's refreshSshConversations) -- unlike #claude-opts there is
+           no fixed default directory to resume "the current one" against
+           before that (the deployment notes, aigw-backend's
+           create_session). -->
       <div id="ssh-cwd-opts">
         <div class="nsb-row">
           <span class="nsb-icon" title="作業ドライブ/フォルダ">📁</span>
@@ -501,7 +522,37 @@
         <div class="nsb-row">
           <select id="ssh-cwd-child"><option value="">ドライブを選ぶ…</option></select>
         </div>
+        <div class="nsb-row">
+          <span class="nsb-icon" title="続きから">⏱</span>
+          <select id="ssh-resume"><option value="">新規</option></select>
+        </div>
       </div>
+      <!-- Working-directory-only picker for "shell"/"host-shell"/
+           "root-shell"/"codex-tui" (2026-09-27,
+           the deployment notes; codex-tui added 2026-09-28): no resume row (aigw-backend's
+           SHELL_CWD_PRESETS has no notion of resuming a specific past
+           conversation, unlike #claude-opts). "shell"/"codex-tui" browse
+           ~/sandhome (same tree #claude-opts does); "host-shell" this
+           user's real host filesystem; "root-shell" the real root
+           filesystem, routed through the root tmux pane and gated the same
+           passkey-unlock way opening the session itself already is (see
+           app.js's refreshShellCwdWorkdirs). -->
+      <div id="shell-cwd-opts">
+        <div class="nsb-row">
+          <span class="nsb-icon" title="作業ディレクトリ">📁</span>
+          <span id="shell-cwd-crumb" title="作業ディレクトリ">sandhome</span>
+          <button id="shell-cwd-up" title="上のフォルダへ">↑</button>
+        </div>
+        <div class="nsb-row">
+          <select id="shell-cwd-child"><option value="">サブフォルダを開く…</option></select>
+        </div>
+      </div>
+    </div>
+    <!-- Shown only while a 🔗 tap is waiting for its second session (see
+         app.js's linkArmedSessionId) -- "セッション連携" (the deployment notes). -->
+    <div id="link-armed-banner">
+      <span id="link-armed-text"></span>
+      <button id="link-armed-cancel">キャンセル</button>
     </div>
     <div id="sessions"></div>
     <!-- Closed by default, opened by tapping the
@@ -594,6 +645,47 @@
            touching this core file. Left empty and untouched if no
            site-extras.js is present. -->
       <div id="site-extra-auth-rows"></div>
+    </div>
+    <!-- Codex CLI's own auth rows, same shape as claude-auth-section above
+         (the deployment notes) -- no ssh:<machine> rows, codex isn't installed on
+         those machines. Kept as a visually separate section (its own h2)
+         rather than interleaved with Claude's rows, since "container/host/
+         root" repeats and a shared label per row would be ambiguous about
+         which tool it's for. -->
+    <h2 style="margin: 1rem 0 0.25rem; padding: 0 1rem; font-size: 0.85rem; color: #9aa5b1;">Codex</h2>
+    <div id="codex-auth-section">
+      <div class="auth-row">
+        <div class="auth-line">
+          <span class="auth-label">sandbox内</span>
+          <span id="codex-auth-status" class="auth-status-text">確認中…</span>
+        </div>
+        <div class="auth-actions">
+          <button class="codex-auth-login" data-scope="container">ログイン</button>
+          <button class="codex-auth-logout" data-scope="container">ログアウト</button>
+        </div>
+      </div>
+      <div class="auth-row" id="codex-auth-row-host">
+        <div class="auth-line">
+          <span class="auth-label">sandbox外(host)</span>
+          <span id="codex-auth-status-host" class="auth-status-text">確認中…</span>
+        </div>
+        <div class="auth-actions">
+          <button class="codex-auth-login" data-scope="host">ログイン</button>
+          <button class="codex-auth-logout" data-scope="host">ログアウト</button>
+        </div>
+      </div>
+      <!-- Hidden unless GET /capabilities says root_shell, same gate as
+           #auth-row-root above. -->
+      <div class="auth-row" id="codex-auth-row-root">
+        <div class="auth-line">
+          <span class="auth-label">root</span>
+          <span id="codex-auth-status-root" class="auth-status-text">確認中…</span>
+        </div>
+        <div class="auth-actions">
+          <button class="codex-auth-login" data-scope="root">ログイン</button>
+          <button class="codex-auth-logout" data-scope="root">ログアウト</button>
+        </div>
+      </div>
     </div>
   </div>
 

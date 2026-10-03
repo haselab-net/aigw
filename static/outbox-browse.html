@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>フォルダ</title>
+<!-- Self-contained, no dependency on app.js/site-extras.js, same reasoning
+     as viewer3d.html: opened in its own tab from a "folder" attachment
+     card (the deployment notes), it should work even if the chat SPA's own
+     bundle failed to load for some reason. Reimplements the tiny bit of
+     app.js it needs (session/owner -> API URL) rather than importing it,
+     since app.js's helpers are closed over its own IIFE and not exported. -->
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; min-height: 100%; background: #0b0f14; color: #d7dde5;
+    font: 15px/1.5 ui-monospace, monospace;
+  }
+  #crumbs {
+    position: sticky; top: 0; z-index: 2; padding: 0.7rem 0.9rem;
+    background: #131a22; border-bottom: 1px solid rgba(255,255,255,0.1);
+    overflow-x: auto; white-space: nowrap; font-size: 0.85rem;
+  }
+  #crumbs button {
+    background: none; border: none; color: #6ea8fe; font: inherit;
+    padding: 0.15rem 0.2rem; cursor: pointer;
+  }
+  #crumbs button:disabled { color: #d7dde5; cursor: default; }
+  #crumbs .sep { color: #566072; padding: 0 0.15rem; }
+  #list { padding: 0.4rem 0 2rem; }
+  .row {
+    display: flex; align-items: center; gap: 0.7rem; width: 100%;
+    box-sizing: border-box; padding: 0.7rem 0.9rem; background: none;
+    border: none; border-bottom: 1px solid rgba(255,255,255,0.06);
+    color: #d7dde5; font: inherit; text-align: left; text-decoration: none;
+  }
+  button.row { cursor: pointer; }
+  .row .icon { font-size: 1.2rem; flex: none; }
+  .row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #empty, #error { padding: 2rem 1rem; text-align: center; color: #8a96a3; }
+  #error { color: #ea4335; display: none; }
+</style>
+</head>
+<body>
+<div id="crumbs"></div>
+<div id="list"></div>
+<div id="empty" style="display:none;">(空のフォルダです)</div>
+<div id="error"></div>
+<script>
+  const qs = new URLSearchParams(location.search);
+  const sessionId = qs.get("session") || "";
+  const owner = qs.get("owner") || "";
+  const rootName = qs.get("name") || "";
+  let currentDir = qs.get("dir") || "";
+
+  const crumbsEl = document.getElementById("crumbs");
+  const listEl = document.getElementById("list");
+  const emptyEl = document.getElementById("empty");
+  const errorEl = document.getElementById("error");
+
+  // Same shape as app.js's sessionPath()/sessionApiUrl() (the deployment notes) --
+  // duplicated rather than imported, see the note at the top of this file.
+  function apiUrl(suffix) {
+    const base = owner
+      ? `/shared/${encodeURIComponent(owner)}/sessions/${sessionId}`
+      : `/sessions/${sessionId}`;
+    return `/agents/api${base}${suffix}`;
+  }
+
+  function outboxFilesUrl(dir, filename) {
+    const segments = (dir ? dir.split("/") : []).concat([filename]).filter(Boolean);
+    return apiUrl(`/outbox-files/${segments.map(encodeURIComponent).join("/")}`);
+  }
+
+  function viewerUrl(src, label, opts) {
+    const params = new URLSearchParams({ src, name: label });
+    if (opts?.type) params.set("type", opts.type);
+    if (opts?.mtl) params.set("mtl", opts.mtl);
+    return `/agents/viewer3d.html?${params}`;
+  }
+
+  function renderCrumbs(dir) {
+    crumbsEl.innerHTML = "";
+    // The root of this browser is the folder attachment itself (rootName),
+    // not outbox/ as a whole -- a session's outbox/ can hold other
+    // attachments (images, other folders) that have nothing to do with
+    // this one, so there is no reason to let this page wander up past it.
+    const parts = dir ? dir.split("/") : [];
+    const mkCrumb = (label, targetDir, isLast) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.disabled = isLast;
+      if (!isLast) b.addEventListener("click", () => navigate(targetDir));
+      crumbsEl.appendChild(b);
+    };
+    mkCrumb(rootName || "フォルダ", "", parts.length === 0);
+    let acc = "";
+    parts.forEach((seg, i) => {
+      const sep = document.createElement("span");
+      sep.className = "sep";
+      sep.textContent = "›";
+      crumbsEl.appendChild(sep);
+      acc = acc ? `${acc}/${seg}` : seg;
+      mkCrumb(seg, acc, i === parts.length - 1);
+    });
+  }
+
+  function rowButton(icon, name, onClick) {
+    const b = document.createElement("button");
+    b.className = "row";
+    b.innerHTML = `<span class="icon"></span><span class="name"></span>`;
+    b.querySelector(".icon").textContent = icon;
+    b.querySelector(".name").textContent = name;
+    b.addEventListener("click", onClick);
+    listEl.appendChild(b);
+  }
+
+  function rowLink(icon, name, href) {
+    const a = document.createElement("a");
+    a.className = "row";
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.innerHTML = `<span class="icon"></span><span class="name"></span>`;
+    a.querySelector(".icon").textContent = icon;
+    a.querySelector(".name").textContent = name;
+    listEl.appendChild(a);
+  }
+
+  async function navigate(dir) {
+    listEl.innerHTML = "";
+    emptyEl.style.display = "none";
+    errorEl.style.display = "none";
+    let r;
+    try {
+      const res = await fetch(apiUrl(`/outbox-dirs?dir=${encodeURIComponent(dir)}`));
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error((body && body.error) || `${res.status}`);
+      }
+      r = await res.json();
+    } catch (e) {
+      errorEl.textContent = `読み込めませんでした: ${e.message}`;
+      errorEl.style.display = "block";
+      return;
+    }
+    currentDir = r.dir;
+    document.title = rootName ? `${rootName} — フォルダ` : "フォルダ";
+    renderCrumbs(currentDir);
+    const url = new URL(location.href);
+    url.searchParams.set("dir", currentDir);
+    history.replaceState(null, "", url);
+
+    for (const name of r.subdirs) {
+      rowButton("📁", name, () => navigate(currentDir ? `${currentDir}/${name}` : name));
+    }
+    for (const f of r.files) {
+      const fileUrl = outboxFilesUrl(currentDir, f.name);
+      if (f.kind === "model3d") {
+        // f.mtl (the deployment notes, 2026-09-22): aigw-backend already
+        // paired a same-stem .mtl into this .obj's own entry and left it
+        // out of `files` -- switch viewer3d.html to its OBJ path and hand
+        // it that .mtl's own outbox-files URL too. glb/gltf (no f.mtl)
+        // keep the plain <model-viewer> call unchanged.
+        const isObj = f.name.toLowerCase().endsWith(".obj");
+        const opts = isObj ? { type: "obj", mtl: f.mtl ? outboxFilesUrl(currentDir, f.mtl) : null } : null;
+        rowButton("🧊", f.name, () => window.open(viewerUrl(fileUrl, f.name, opts), "_blank"));
+      } else if (f.kind === "image") {
+        rowLink("🖼️", f.name, fileUrl);
+      } else {
+        rowLink("📄", f.name, fileUrl);
+      }
+    }
+    if (!r.subdirs.length && !r.files.length) emptyEl.style.display = "block";
+  }
+
+  if (!sessionId) {
+    errorEl.textContent = "セッションが指定されていません。";
+    errorEl.style.display = "block";
+  } else {
+    navigate(currentDir);
+  }
+</script>
+</body>
+</html>

@@ -263,9 +263,10 @@ SESSION_SHARE_RE = re.compile(rf"^{re.escape(BASE_PATH)}/api/sessions/([^/]+)/(s
 # /sessions/<id>/notify (takes a session id but never calls
 # resolve_session_access), GET /capabilities, /workdirs, /tmux-sessions,
 # /claude-conversations, /project-docs/{roots,api} (runs a binary in the
-# victim's home as the victim), /claude-auth, /container-ip (no session id
-# at all), POST /sessions (creates a pane as the victim, root if they have
-# root-shell), /sessions/adopt, /claude-auth/{login,logout}, /chrome/kill.
+# victim's home as the victim), /claude-auth, /codex-auth, /container-ip (no
+# session id at all), POST /sessions (creates a pane as the victim, root if
+# they have root-shell), /sessions/adopt, /claude-auth/{login,logout},
+# /codex-auth/{login,logout}, /chrome/kill.
 # Any logged-in aigw user could reach every one of those against ANY other
 # user, not just someone who had shared a session with them.
 #
@@ -318,6 +319,12 @@ SHARED_ALLOWED_GET_RE = re.compile(
     r"|^/sessions/[^/]+/files/[^/]+$"
     r"|^/sessions/[^/]+/subagents(/[^/]+)?$"
     r"|^/sessions/[^/]+/download$"
+    # Folder attachments (the deployment notes, 2026-09-22): browsing into
+    # and opening files inside a directory a session dropped in outbox/.
+    # outbox-files carries an arbitrary-depth path after it, same as its
+    # backend-side counterpart in aigw-backend's _shared_get_path_allowed.
+    r"|^/sessions/[^/]+/outbox-dirs$"
+    r"|^/sessions/[^/]+/outbox-files/.+$"
 )
 SHARED_ALLOWED_POST_RE = re.compile(
     r"^/sessions/[^/]+/(messages|keys|stop|resize|rename)$"
@@ -1242,8 +1249,8 @@ class Handler(BaseHTTPRequestHandler):
         # is owned by another task). A bare GET here now just falls through
         # to the 404 at the bottom of this method, same as any other
         # unrecognized path -- there is no reason to special-case a 405.
-        # Optional, deployment-supplied routes (the deployment notes
-        # split): self-signup, the doc-tool viewer, and other deployment-
+        # Optional, deployment-supplied routes
+        # (the deployment notes): self-signup, the doc-tool viewer, and other deployment-
         # specific routes -- see aigw_site_routes.py and the SITE_CTX/
         # aigw_site_routes import above. None of what this module used to
         # hardcode here belong in a generic published core.
@@ -1256,8 +1263,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == f"{BASE_PATH}/app.js":
             return self._send_file(STATIC_DIR / "app.js", "application/javascript")
         # Optional, deployment-supplied extension for the two empty
-        # "site-extra-*" hook points in index.html (the deployment notes
-        # public-split's frontend follow-up) -- e.g. an internal docs-viewer
+        # "site-extra-*" hook points in index.html
+        # (the deployment notes' frontend follow-up) -- e.g. an internal docs-viewer
         # header link, or whatever else a given deployment wants that the
         # published core app.js/index.html deliberately don't bake in.
         # _send_file already 404s cleanly if
@@ -1280,6 +1287,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file(STATIC_DIR / "viewer3d.html", "text/html; charset=utf-8")
         if path == f"{BASE_PATH}/vendor/model-viewer.min.js":
             return self._send_file(STATIC_DIR / "vendor" / "model-viewer.min.js", "application/javascript")
+        # three.js + OBJLoader/MTLLoader/OrbitControls (the deployment notes,
+        # 2026-09-22): <model-viewer> above only understands glTF/GLB, so an
+        # OBJ+MTL pair gets a second, hand-rolled rendering path in
+        # viewer3d.html built directly on three.js instead. Same vendoring
+        # reasoning as model-viewer.min.js -- pinned version, fetched once,
+        # not loaded from a CDN.
+        if path in (
+            f"{BASE_PATH}/vendor/three.module.min.js",
+            f"{BASE_PATH}/vendor/OBJLoader.js",
+            f"{BASE_PATH}/vendor/MTLLoader.js",
+            f"{BASE_PATH}/vendor/OrbitControls.js",
+        ):
+            return self._send_file(STATIC_DIR / "vendor" / path.rsplit("/", 1)[-1], "application/javascript")
+        # A folder a session dropped in $AIGW_OUTBOX (kind="folder" chat
+        # attachment, the deployment notes) -- what a tapped folder card
+        # opens in a new tab. Same "unauthenticated shell, authenticated
+        # data" reasoning as viewer3d.html just above: this page has no
+        # session-specific content baked in, only session/dir/owner query
+        # params it uses to build /api/sessions/.../outbox-dirs and
+        # .../outbox-files/... URLs of its own, and those still need the
+        # real session cookie to return anything.
+        if path == f"{BASE_PATH}/outbox-browse.html":
+            return self._send_file(STATIC_DIR / "outbox-browse.html", "text/html; charset=utf-8")
         # Passkey registration page (Phase 2b). `aigw-passkey register <user>`
         # -- root-only, see the deployment notes' sibling section --
         # prints exactly this URL with ?user=&token=, so the path is fixed by
@@ -1407,8 +1437,8 @@ class Handler(BaseHTTPRequestHandler):
         email = claims["email"].strip().lower()
         username = find_username_for_email(email)
         if username is None:
-            # A deployment-supplied site route (the deployment notes
-            # split) can offer self-signup for its own fixed domain here --
+            # A deployment-supplied site route
+            # (the deployment notes) can offer self-signup for its own fixed domain here --
             # see aigw_site_routes.maybe_start_signup's own docstring for
             # the "hd" claim check it does before ever writing a response.
             # Everyone else (or any deployment with no such module at all)
@@ -1580,7 +1610,7 @@ class Handler(BaseHTTPRequestHandler):
         # unrelated GET /sessions (the deployment notes). nginx's
         # own proxy_read_timeout for /agents/ is 360s, so there is room to be
         # more patient here specifically.
-        SLOW_CREATE_PATHS = ("/sessions", "/claude-auth/login")
+        SLOW_CREATE_PATHS = ("/sessions", "/claude-auth/login", "/codex-auth/login")
         timeout = 150 if method == "POST" and backend_path in SLOW_CREATE_PATHS else 60
 
         # backend_path here is e.g. "/sessions/<id>/events" (BASE_PATH/api

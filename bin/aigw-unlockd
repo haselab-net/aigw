@@ -1422,6 +1422,62 @@ def verb_touch(uid, pid, req):
     return {"ok": True, "expires_at": int(new_expires_at)}
 
 
+def verb_regrant(uid, pid, req):
+    """Re-applies aigw-root-tmux-grant's read ACL for `user`'s already-open
+    root-tier window, without touching the window's expiry (unlike touch,
+    this is not "activity" and must not extend anything -- see below).
+
+    Added 2026-09-29 (the deployment notes) for
+    aigw-backend's own _watch_shell_claude: a brand-new root-shell `claude`
+    conversation's .jsonl is created 0600 by root under a directory this
+    grant's default ACL covers, and POSIX ACL's posix_acl_create semantics
+    intersect the new file's own mask with that creation mode's *group*
+    bits -- 0 for a 0600 create -- so the named ACL entry aigw-root-tmux-
+    grant already set up on the *directory* is silently inert for that one
+    new file until an explicit `setfacl -m` (not mere default-ACL
+    inheritance) recomputes its mask from scratch (`man 5 acl`; the
+    affected file's own ACL entries are all still there the whole time,
+    only the effective mask is wrong). Previously
+    (the deployment's changelog, 2026-08-30) the only thing that
+    ever fixed this was a *new* unlock ceremony transitioning a closed
+    window to open -- _start_unit()'s own "already active, so re-grant
+    directly" branch, which runs the identical setfacl but only on that
+    transition. A window kept open by ordinary activity (`touch` on every
+    send_message/resize/... call) never retriggers it, so a long-lived
+    root-shell session's chat log could stay silently stuck until the user
+    happened to re-authenticate for an unrelated reason. This verb lets
+    aigw-backend ask for the same setfacl on its own backoff schedule
+    instead of waiting on that coincidence.
+
+    Deliberately gated on an open root-tier window exactly like touch (a
+    user with no open window has nothing here to regrant *for* -- there is
+    no running-but-inaccessible-to-them tmux server in that state worth
+    patching ACLs on behalf of), but never extends or otherwise mutates
+    the window: this is not itself a sandbox-outside action, just
+    maintenance on an already-granted one, so it must not silently keep an
+    idle window alive the way a real touch legitimately does (see
+    verb_touch's own docstring on why a passive check must never double
+    as an extension)."""
+    user = _field(req, "user")
+    _resolve_uid(user)
+    _require_peer_is_user_or_root(uid, user)
+    now = time.time()
+    with _lock:
+        entry = _unlocks.get(user)
+        if entry is None or entry[1] <= now:
+            deny_reason = "not-unlocked"
+        elif not _tier_satisfies(entry[2], "root"):
+            deny_reason = "insufficient-tier"
+        else:
+            deny_reason = None
+    if deny_reason:
+        _audit("regrant", user, "denied", reason=deny_reason, pid=pid)
+        return {"ok": False, "error": "not unlocked for root"}
+    _grant_access(user)
+    _audit("regrant", user, "ok", pid=pid)
+    return {"ok": True}
+
+
 def verb_lock(uid, pid, req):
     user = _field(req, "user")
     _resolve_uid(user)
@@ -1550,6 +1606,7 @@ _VERBS = {
     "finish-assertion": verb_finish_assertion,
     "status": verb_status,
     "touch": verb_touch,
+    "regrant": verb_regrant,
     "lock": verb_lock,
     "list-credentials": verb_list_credentials,
     "revoke-credential": verb_revoke_credential,

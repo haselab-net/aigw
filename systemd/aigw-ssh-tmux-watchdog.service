@@ -1,0 +1,8 @@
+[Unit]
+Description=Detect and recover wedged tmux servers on aigw's SSH machines
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aigw-ssh-tmux-watchdog
+TimeoutStartSec=10min

@@ -34,6 +34,9 @@
   const sessionsEl = document.getElementById("sessions");
   const archiveToggleBtn = document.getElementById("archive-toggle-btn");
   const archivedListEl = document.getElementById("archived-list");
+  const linkArmedBannerEl = document.getElementById("link-armed-banner");
+  const linkArmedTextEl = document.getElementById("link-armed-text");
+  const linkArmedCancelBtn = document.getElementById("link-armed-cancel");
   const tmuxSessionsEl = document.getElementById("tmux-sessions");
   const whoEl = document.getElementById("who");
   const messagesEl = document.getElementById("messages");
@@ -68,6 +71,11 @@
   const sshCwdCrumbEl = document.getElementById("ssh-cwd-crumb");
   const sshCwdUpBtn = document.getElementById("ssh-cwd-up");
   const sshCwdChildEl = document.getElementById("ssh-cwd-child");
+  const sshResumeEl = document.getElementById("ssh-resume");
+  const shellCwdOptsEl = document.getElementById("shell-cwd-opts");
+  const shellCwdCrumbEl = document.getElementById("shell-cwd-crumb");
+  const shellCwdUpBtn = document.getElementById("shell-cwd-up");
+  const shellCwdChildEl = document.getElementById("shell-cwd-child");
 
   // Working directory for a new claude session, relative to ~/sandhome
   // ("" = ~/sandhome itself). Walked one level at a time, so it can go as
@@ -115,10 +123,32 @@
   // machines share no filesystem with this host, so there is no ~/sandhome
   // for a working directory to mean anything in. A drives-capable machine's
   // own Claude preset (claude-tui-<machine>) gets a *different* cwd picker
-  // instead (#ssh-cwd-opts, sshCwdMachines below) -- never
-  // added to this list, since it has no resume and is rooted at a drive
-  // letter, not ~/sandhome.
+  // instead (#ssh-cwd-opts/#ssh-resume, sshCwdMachines below) -- never
+  // added to this list, since it's rooted at a drive letter, not
+  // ~/sandhome, and (unlike the two members below) has no fixed default
+  // directory to resume "the current one" against before a drive/folder is
+  // actually chosen (the deployment notes).
   const CWD_PRESETS = ["claude", "claude-tui"];
+  // Working-directory-only pickers (2026-09-27,
+  // the deployment notes, user request: "続きから"/screen-log-persist restoring the plain
+  // shells needs somewhere stable to key on, same as claude-tui already
+  // has). No resume row for any of these (aigw-backend's SHELL_CWD_PRESETS
+  // has no notion of resuming a specific past conversation) -- see
+  // #shell-cwd-opts, shown instead of #claude-opts/#ssh-cwd-opts.
+  // "shell" browses the exact same ~/sandhome tree "claude"/"claude-tui" do
+  // (GET /workdirs?scope=sandhome, the default, unchanged); "host-shell"
+  // this user's real host filesystem (scope=host); "root-shell" the real
+  // root filesystem via the root tmux pane (scope=root, can pop the same
+  // passkey prompt opening the session itself already can). "codex-tui"
+  // joined this list 2026-09-28 (user request), same scope=sandhome as
+  // "shell" -- it just has no resume of its own (aigw-backend's own
+  // SHELL_CWD_PRESETS comment), unlike claude-tui/CWD_PRESETS above.
+  const SHELL_CWD_PRESETS = ["shell", "host-shell", "root-shell", "codex-tui"];
+  const SHELL_CWD_SCOPE = { shell: "sandhome", "host-shell": "host", "root-shell": "root", "codex-tui": "sandhome" };
+  // Each preset's own current position, independently -- switching the
+  // preset dropdown between e.g. "host-shell" and "root-shell" must not
+  // carry one's browsed-to path over to the other's picker.
+  let shellCwdByPreset = { shell: "", "host-shell": "", "root-shell": "", "codex-tui": "" };
   // Machines whose Claude preset offers #ssh-cwd-opts (winbox-a/winbox-b,
   // not linuxbox) -- from GET /capabilities' ssh_machines_drives, since
   // which machines exist/support it is a live backend answer, same as
@@ -257,6 +287,7 @@
       // Same gate as the preset option above: the root Claude-auth row is
       // only ever useful to a user who can reach the root tmux server at all.
       document.getElementById("auth-row-root").classList.add("visible");
+      document.getElementById("codex-auth-row-root").classList.add("visible");
     }
     localPresetOptionsHtml = presetEl.innerHTML;
 
@@ -309,6 +340,9 @@
     const showSshCwd = sshCwdMachines.includes(currentMachine) && presetEl.value === `claude-tui-${currentMachine}`;
     sshCwdOptsEl.classList.toggle("visible", showSshCwd);
     if (showSshCwd) refreshSshWorkdirs();
+    const showShellCwd = SHELL_CWD_PRESETS.includes(presetEl.value);
+    shellCwdOptsEl.classList.toggle("visible", showShellCwd);
+    if (showShellCwd) refreshShellCwdWorkdirs();
   }
 
   // Re-reads the level `currentCwd` points at. A directory that has since
@@ -408,6 +442,7 @@
       opt.textContent = atRoot ? `${name.toUpperCase()}:` : name;
       sshCwdChildEl.appendChild(opt);
     }
+    await refreshSshConversations();
   }
 
   async function navigateSshTo(path) {
@@ -430,20 +465,108 @@
     navigateSshTo(cut === -1 ? "" : currentSshCwd.slice(0, cut));
   });
 
-  // Conversations are per-directory (Claude Code files them under the cwd
-  // they ran in), so this reruns on every navigation.
-  async function refreshConversations() {
-    const cwd = currentCwd;
-    resumeEl.innerHTML = "";
+  // ---- working-directory-only picker, for "shell"/"host-shell"/
+  // "root-shell" (2026-09-27, the deployment notes) -----------------
+  //
+  // One picker, three backend scopes (SHELL_CWD_SCOPE) -- "sandhome" walks
+  // one level at a time exactly like #claude-opts' own (`dir` relative to
+  // ~/sandhome, "" at the root); "host"/"root" walk the real filesystem
+  // instead, so `dir` there is an absolute path throughout, no relative
+  // math needed -- see aigw-backend's GET /workdirs.
+
+  async function refreshShellCwdWorkdirs() {
+    const preset = presetEl.value;
+    const scope = SHELL_CWD_SCOPE[preset];
+    if (!scope) return;
+    const asked = shellCwdByPreset[preset];
+    const fetchIt = () => api(`/workdirs?scope=${scope}&dir=${encodeURIComponent(asked)}`);
+    // "root": GET /workdirs?scope=root can 403 unlock_required (root-shell's
+    // own picker routes through the root tmux pane, gated the same passkey-
+    // unlock way opening the session itself already is) -- withUnlockRetry
+    // runs that ceremony right here instead of leaving the picker empty
+    // until 開始 is pressed and the *session* creation call hits the same
+    // gate. "sandhome"/"host" never raise this, so wrapping them too would
+    // just be a needless no-op layer.
+    const r = await (scope === "root" ? withUnlockRetry(fetchIt) : fetchIt()).catch(() => null);
+    // A later navigation, or a preset switch while this was in flight,
+    // already won -- same guard as refreshWorkdirs()/refreshSshWorkdirs().
+    if (presetEl.value !== preset || shellCwdByPreset[preset] !== asked) return;
+    if (!r) {
+      if (shellCwdByPreset[preset] === "") {
+        // Even the default dir failed (e.g. passkey cancelled): clear the
+        // previous preset's options rather than leave them looking current.
+        shellCwdCrumbEl.textContent = "";
+        shellCwdUpBtn.disabled = true;
+        shellCwdChildEl.innerHTML = "";
+        const fail = document.createElement("option");
+        fail.value = "";
+        fail.textContent = "(一覧を取得できません)";
+        shellCwdChildEl.appendChild(fail);
+        shellCwdChildEl.disabled = true;
+        return;
+      }
+      shellCwdByPreset[preset] = "";
+      return refreshShellCwdWorkdirs();
+    }
+    shellCwdByPreset[preset] = r.dir;
+    shellCwdCrumbEl.textContent = scope === "sandhome" ? (r.dir ? `sandhome/${r.dir}` : "sandhome") : r.dir;
+    shellCwdUpBtn.disabled = scope === "sandhome" ? !r.dir : r.dir === "/";
+
+    shellCwdChildEl.innerHTML = "";
+    const head = document.createElement("option");
+    head.value = "";
+    head.textContent = r.subdirs.length ? "サブフォルダを開く…" : "(サブフォルダなし)";
+    shellCwdChildEl.appendChild(head);
+    shellCwdChildEl.disabled = !r.subdirs.length;
+    for (const name of r.subdirs) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      shellCwdChildEl.appendChild(opt);
+    }
+  }
+
+  async function navigateShellCwdTo(rel) {
+    shellCwdByPreset[presetEl.value] = rel;
+    await refreshShellCwdWorkdirs();
+  }
+
+  shellCwdChildEl.addEventListener("change", () => {
+    const name = shellCwdChildEl.value;
+    if (!name) return;
+    const scope = SHELL_CWD_SCOPE[presetEl.value];
+    const cur = shellCwdByPreset[presetEl.value];
+    navigateShellCwdTo(
+      scope === "sandhome"
+        ? (cur ? `${cur}/${name}` : name)
+        : (cur === "/" ? `/${name}` : `${cur}/${name}`)
+    );
+  });
+
+  shellCwdUpBtn.addEventListener("click", () => {
+    const scope = SHELL_CWD_SCOPE[presetEl.value];
+    const cur = shellCwdByPreset[presetEl.value];
+    if (scope === "sandhome") {
+      if (!cur) return;
+      const cut = cur.lastIndexOf("/");
+      navigateShellCwdTo(cut === -1 ? "" : cur.slice(0, cut));
+    } else {
+      if (!cur || cur === "/") return;
+      const cut = cur.lastIndexOf("/");
+      navigateShellCwdTo(cut <= 0 ? "/" : cur.slice(0, cut));
+    }
+  });
+
+  // Shared option-building behind refreshConversations (local) and
+  // refreshSshConversations (a drives-capable ssh machine,
+  // the deployment notes) -- both fetch the same {id, mtime, aigw_label, summary} shape
+  // from GET /claude-conversations, just against a different cwd/machine.
+  function populateConversationSelect(selectEl, conversations) {
+    selectEl.innerHTML = "";
     const fresh = document.createElement("option");
     fresh.value = "";
     fresh.textContent = "新規";
-    resumeEl.appendChild(fresh);
-    const { conversations } = await api(`/claude-conversations?cwd=${encodeURIComponent(cwd)}`)
-      .catch(() => ({ conversations: [] }));
-    // A slow directory read could land after the user has already picked
-    // another directory; that answer belongs to the old one, so drop it.
-    if (currentCwd !== cwd) return;
+    selectEl.appendChild(fresh);
     for (const c of conversations) {
       const opt = document.createElement("option");
       opt.value = c.id;
@@ -454,9 +577,77 @@
       // Claude Code's own auto-generated summary since it's what the user
       // actually chose to call it (2026-08-29, at the user's request).
       opt.textContent = c.aigw_label ? `${when} [${c.aigw_label}] ${rest}` : `${when} ${rest}`;
-      resumeEl.appendChild(opt);
+      // Read back by wireResumeLabelPrefill below -- aigw-backend's own
+      // create_session() already falls back to this same label server-side
+      // when the field is left blank, so this prefill is purely so the name
+      // is visible/editable *before* tapping 開始, not what actually makes
+      // it carry over (the deployment notes, 2026-09-24).
+      if (c.aigw_label) opt.dataset.aigwLabel = c.aigw_label;
+      selectEl.appendChild(opt);
     }
   }
+
+  // Conversations are per-directory (Claude Code files them under the cwd
+  // they ran in), so this reruns on every navigation.
+  async function refreshConversations() {
+    const cwd = currentCwd;
+    const { conversations } = await api(`/claude-conversations?cwd=${encodeURIComponent(cwd)}`)
+      .catch(() => ({ conversations: [] }));
+    // A slow directory read could land after the user has already picked
+    // another directory; that answer belongs to the old one, so drop it.
+    if (currentCwd !== cwd) return;
+    populateConversationSelect(resumeEl, conversations);
+  }
+
+  // ssh: counterpart of refreshConversations, for a drives-capable ssh
+  // machine's own Claude preset (the deployment notes). currentSshCwd ===
+  // "" means no drive/folder has been chosen yet -- list_ssh_claude_
+  // conversations has no fixed directory to fall back to there (unlike
+  // ~/sandhome locally), so this just shows "新規" with nothing else,
+  // same as passing an empty `dir` to GET /claude-conversations does
+  // server-side.
+  async function refreshSshConversations() {
+    const machine = currentMachine;
+    const cwd = currentSshCwd;
+    if (!cwd) {
+      populateConversationSelect(sshResumeEl, []);
+      return;
+    }
+    const { conversations } = await api(
+      `/claude-conversations?machine=${encodeURIComponent(machine)}&dir=${encodeURIComponent(cwd)}`
+    ).catch(() => ({ conversations: [] }));
+    // Same "a later navigation already won" guard as refreshConversations.
+    if (machine !== currentMachine || currentSshCwd !== cwd) return;
+    populateConversationSelect(sshResumeEl, conversations);
+  }
+
+  // Picking a conversation to resume prefills its own past name into the
+  // label field, same "carry the name over" request the backend default
+  // above already covers -- this just makes the carried-over name visible
+  // and still editable before creating, instead of a silent default the
+  // user only discovers afterward.
+  //
+  // lastAutoLabel tracks what this listener itself last wrote, so it can
+  // tell "the user typed their own text" (never touched again, even across
+  // switching candidates) apart from "still showing whatever we filled in
+  // last time" (safe to replace when a *different* candidate is picked --
+  // without this, picking conversation A then B would leave A's name
+  // behind because the field was no longer literally empty). One closure
+  // per select (local/ssh are independent pickers, never shown at once, but
+  // switching machine/preset between them should not leak one's state into
+  // the other's).
+  function wireResumeLabelPrefill(selectEl) {
+    let lastAutoLabel = null;
+    selectEl.addEventListener("change", () => {
+      const labelEl = document.getElementById("label");
+      if (labelEl.value !== "" && labelEl.value !== lastAutoLabel) return;
+      const wanted = selectEl.selectedOptions[0]?.dataset.aigwLabel || "";
+      labelEl.value = wanted;
+      lastAutoLabel = wanted || null;
+    });
+  }
+  wireResumeLabelPrefill(resumeEl);
+  wireResumeLabelPrefill(sshResumeEl);
 
   presetEl.addEventListener("change", applyPresetOptions);
 
@@ -529,6 +720,13 @@
     for (const [scope, el] of Object.entries(authStatusEls)) {
       renderAuthStatus(el, st[scope]);
     }
+    // Piggybacked here rather than adding a second call at every one of this
+    // function's own call sites (view-auth open, the refresh button, login/
+    // logout completing, ...): every one of those moments is exactly when
+    // the Codex rows also want a refresh, and codexAuthStatusEls is defined
+    // by the time any of them can fire (both blocks run at load, this one
+    // first).
+    refreshCodexAuthStatus();
   }
 
   // These commands can take a few seconds; without disabling the whole set, a
@@ -613,6 +811,103 @@
     authLoginBtns = [...authLoginBtns, loginBtn];
     authLogoutBtns = [...authLogoutBtns, logoutBtn];
   }
+
+  // ---- Codex CLI auth (the deployment notes) ------------------------------------
+  //
+  // Same shape as the Claude Code auth block just above, deliberately kept
+  // as its own separate set of elements/functions rather than generalizing
+  // both tools through one parameterized implementation: this whole file's
+  // existing pattern is one named thing per concept (CLAUDE_TUI_PRESETS vs
+  // SSH_SHELL_PRESETS, etc.), not silent parameter-driven reuse, and Codex
+  // has no ssh:<machine> rows or richer status fields to abstract over
+  // anyway. `codex login status`/`codex logout` have no --json form, so the
+  // status shape is just {loggedIn, text} (or {error}) -- see
+  // codex_auth_status_all's own comment.
+  const codexAuthStatusEls = {
+    container: document.getElementById("codex-auth-status"),
+    host: document.getElementById("codex-auth-status-host"),
+    root: document.getElementById("codex-auth-status-root"),
+  };
+  let codexAuthLoginBtns = [...document.querySelectorAll("button.codex-auth-login")];
+  let codexAuthLogoutBtns = [...document.querySelectorAll("button.codex-auth-logout")];
+  const CODEX_AUTH_SCOPE_LABELS = {
+    container: "sandboxコンテナ内",
+    host: "このホスト(sandbox外・あなた自身)",
+    root: "このホストの root",
+  };
+
+  function renderCodexAuthStatus(el, st) {
+    if (st == null) {
+      el.textContent = "権限なし";
+      el.className = "auth-status-text";
+    } else if (st.error) {
+      el.textContent = st.error;
+      el.className = "auth-status-text err";
+    } else if (st.loggedIn) {
+      el.textContent = st.text || "ログイン済み";
+      el.className = "auth-status-text in";
+    } else {
+      el.textContent = st.text || "未ログイン";
+      el.className = "auth-status-text out";
+    }
+  }
+
+  async function refreshCodexAuthStatus() {
+    Object.values(codexAuthStatusEls).forEach(setChecking);
+    const st = await api("/codex-auth").catch((e) => ({ error: e.message }));
+    if (st.error) {
+      Object.values(codexAuthStatusEls).forEach((el) => renderCodexAuthStatus(el, st));
+      return;
+    }
+    for (const [scope, el] of Object.entries(codexAuthStatusEls)) {
+      renderCodexAuthStatus(el, st[scope]);
+    }
+  }
+
+  async function withCodexAuthButtonsDisabled(fn) {
+    const btns = [...codexAuthLoginBtns, ...codexAuthLogoutBtns];
+    btns.forEach((b) => (b.disabled = true));
+    try {
+      await fn();
+    } finally {
+      btns.forEach((b) => (b.disabled = false));
+    }
+  }
+
+  function wireCodexAuthLogoutButton(btn) {
+    const scope = btn.dataset.scope;
+    btn.addEventListener("click", () => withCodexAuthButtonsDisabled(async () => {
+      if (!confirm(`${CODEX_AUTH_SCOPE_LABELS[scope]}のCodexをログアウトします。よろしいですか?`)) return;
+      const r = await withUnlockRetry(() => api("/codex-auth/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope }),
+      })).catch((e) => ({ error: e.message }));
+      if (r.error) alert(`ログアウトに失敗しました: ${r.error}`);
+      await refreshCodexAuthStatus();
+    }));
+  }
+
+  function wireCodexAuthLoginButton(btn) {
+    const scope = btn.dataset.scope;
+    btn.addEventListener("click", () => withCodexAuthButtonsDisabled(async () => {
+      const meta = await withUnlockRetry(() => api("/codex-auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope }),
+      })).catch((e) => {
+        alert(`ログインを開始できませんでした: ${e.message}`);
+        return null;
+      });
+      if (!meta) return;
+      await refreshSessions();
+      sessionOpenedFromAuth = true;
+      openSession(meta);
+    }));
+  }
+
+  for (const btn of codexAuthLogoutBtns) wireCodexAuthLogoutButton(btn);
+  for (const btn of codexAuthLoginBtns) wireCodexAuthLoginButton(btn);
 
   // ---- Kill Chrome (the deployment notes cleanup) ------------------------
   //
@@ -1614,7 +1909,11 @@
   // immutable copy (`_frozen_...`), not the name the session's tool used.
   // `displayName` (falls back to `filename` for old events with no
   // source_filename) is what a human should see: the clean original name.
-  function renderAttachment(div, sessionId, filename, kind, displayName) {
+  // `mtl` (the deployment notes, 2026-09-22) is only ever set alongside a
+  // kind="model3d" .obj: the same-stem .mtl aigw-backend paired it with,
+  // itself unfrozen (see _scan_outbox_for_attachments's own comment on
+  // why an OBJ+MTL pair is served by its real names instead).
+  function renderAttachment(div, sessionId, filename, kind, displayName, mtl) {
     const url = sessionApiUrl(sessionId, `/files/${encodeURIComponent(filename)}`, currentOwner);
     const label = displayName || filename;
     if (kind === "image") {
@@ -1639,6 +1938,25 @@
       div.appendChild(img);
       return;
     }
+    if (kind === "folder") {
+      // A directory a session dropped in outbox/ (the deployment notes) --
+      // unlike every other kind here, `filename` is a directory name, not
+      // something GET .../files/<filename> can serve. Opens a dedicated
+      // page (own tab, same "give it the whole screen" reasoning as
+      // model3d below) that walks it one level at a time via
+      // GET .../outbox-dirs, rather than a same-page modal.
+      const btn = document.createElement("button");
+      btn.className = "attachment-card";
+      btn.innerHTML = `<span class="attachment-icon">📁</span><span class="attachment-name"></span>`;
+      btn.querySelector(".attachment-name").textContent = label;
+      btn.addEventListener("click", () => {
+        const params = new URLSearchParams({ session: sessionId, dir: filename, name: label });
+        if (currentOwner) params.set("owner", currentOwner);
+        window.open(`/agents/outbox-browse.html?${params}`, "_blank");
+      });
+      div.appendChild(btn);
+      return;
+    }
     if (kind === "model3d") {
       const btn = document.createElement("button");
       btn.className = "attachment-card";
@@ -1652,8 +1970,16 @@
       // that, the plain file just opens as the browser's own default
       // handling for whatever this attachment's mime type is.
       btn.addEventListener("click", () => {
-        if (window.aigwSiteExtras?.openModel3d) window.aigwSiteExtras.openModel3d(url, label);
-        else window.open(url, "_blank");
+        if (!window.aigwSiteExtras?.openModel3d) { window.open(url, "_blank"); return; }
+        // An .obj needs the viewer's separate three.js path, and its mtl
+        // (if aigw-backend found and paired one) alongside it -- everything
+        // else (glb/gltf) keeps the plain two-arg call it always had.
+        if (filename.toLowerCase().endsWith(".obj")) {
+          const mtlUrl = mtl ? sessionApiUrl(sessionId, `/files/${encodeURIComponent(mtl)}`, currentOwner) : null;
+          window.aigwSiteExtras.openModel3d(url, label, { type: "obj", mtl: mtlUrl });
+        } else {
+          window.aigwSiteExtras.openModel3d(url, label);
+        }
       });
       div.appendChild(btn);
       return;
@@ -1757,7 +2083,7 @@
       div.appendChild(img);
     } else if (ev.type === "attachment") {
       div.className = "bubble agent";
-      renderAttachment(div, sessionId, ev.filename, ev.kind, ev.source_filename);
+      renderAttachment(div, sessionId, ev.filename, ev.kind, ev.source_filename, ev.mtl);
     } else if (ev.type === "session_ended") {
       if (sessionId === currentSessionId) {
         chatDotEl.className = "dot stopped";
@@ -1801,6 +2127,93 @@
     if (/^\/[a-z](\/.*)?$/.test(s.cwd)) return ` &middot; ${escapeHtml(mountPathLabel(s.cwd))}`;
     const rel = s.cwd.replace(/^.*\/sandhome(\/|$)/, "");
     return rel ? ` &middot; ${escapeHtml(rel)}` : "";
+  }
+
+  // ---- session links (the deployment notes) --------------------------------
+  //
+  // Lets the user pick two of their own sessions (typically one in the
+  // sandbox container, one on the host or as root -- but any pair) and have
+  // each side's replies relayed to the other automatically, until either
+  // side disconnects or the backend's own turn cap kicks in
+  // (create_link/_relay_agent_output in aigw-backend). Two taps, no new
+  // screen: tap 🔗 on the first session (arms it, shows the banner below),
+  // tap 🔗 on a second session to complete the link, or tap the same 🔗
+  // again (or the banner's キャンセル) to back out.
+  let linkArmedSessionId = null;
+
+  function linkSuffix(s) {
+    if (!s.link) return "";
+    return ` &middot; 🔗${escapeHtml(s.link.partner_label)}(${s.link.turns_used}/${s.link.max_turns})`;
+  }
+
+  function renderLinkArmedBanner() {
+    const armed = lastSessions.find((s) => s.id === linkArmedSessionId);
+    linkArmedBannerEl.classList.toggle("visible", !!armed);
+    if (armed) linkArmedTextEl.textContent = `🔗「${armed.label}」とつなぐ相手をタップしてください`;
+  }
+
+  linkArmedCancelBtn.addEventListener("click", () => {
+    linkArmedSessionId = null;
+    renderLinkArmedBanner();
+    refreshSessions();
+  });
+
+  // "root-shell" is the only preset a root Claude conversation can run in
+  // (there is no dedicated "claude-tui-root" -- the deployment notes): whoever is
+  // driving it typed `claude` into that shell by hand. Used only to suggest
+  // a lower default turn cap below; the backend applies its own default
+  // (and the real backstop, the passkey window) regardless of what the
+  // client suggests.
+  function isRootSession(s) { return s.preset === "root-shell"; }
+
+  async function onLinkButtonTapped(s) {
+    if (s.link) {
+      if (!confirm(`「${s.label}」と「${s.link.partner_label}」の連携を切断します。よろしいですか?`)) return;
+      await api("/sessions/unlink", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: s.id }),
+      }).catch((e) => alert(`切断できませんでした: ${e.message}`));
+      await refreshSessions();
+      return;
+    }
+    if (linkArmedSessionId === s.id) {
+      linkArmedSessionId = null;
+      renderLinkArmedBanner();
+      await refreshSessions();
+      return;
+    }
+    if (linkArmedSessionId === null) {
+      linkArmedSessionId = s.id;
+      renderLinkArmedBanner();
+      await refreshSessions();
+      return;
+    }
+    const other = lastSessions.find((x) => x.id === linkArmedSessionId);
+    linkArmedSessionId = null;
+    renderLinkArmedBanner();
+    if (!other) { await refreshSessions(); return; }
+    const suggested = (isRootSession(s) || isRootSession(other)) ? 6 : 20;
+    const raw = prompt(
+      `「${other.label}」と「${s.label}」をつなぎます。\n` +
+      "何往復かで自動的に切断させる場合は回数を、切断せず手動のみにする場合は空欄のまま OK してください。",
+      String(suggested),
+    );
+    if (raw === null) { await refreshSessions(); return; } // cancelled
+    const maxTurns = raw.trim() === "" ? null : Number(raw);
+    if (raw.trim() !== "" && (!Number.isFinite(maxTurns) || maxTurns <= 0)) {
+      alert("回数は正の整数(または空欄)で入力してください");
+      await refreshSessions();
+      return;
+    }
+    const body = { a: other.id, b: s.id };
+    if (maxTurns !== null) body.max_turns = maxTurns;
+    await api("/sessions/link", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).catch((e) => alert(`連携できませんでした: ${e.message}`));
+    await refreshSessions();
   }
 
   // Sessions previously placed by a drag keep their
@@ -1874,7 +2287,7 @@
           <span class="drag-handle" title="ドラッグで並べ替え">⠿</span>
           <span class="dot ${s.alive ? "alive" : "stopped"}"></span>
           <span class="label">${escapeHtml(s.label)}</span>
-          <div class="meta">${s.preset}${cwdSuffix(s)} &middot; ${fmtTime(s.created_ts)}${ownerBadge}</div>
+          <div class="meta">${s.preset}${cwdSuffix(s)} &middot; ${fmtTime(s.created_ts)}${ownerBadge}${linkSuffix(s)}</div>
         </div>`;
       row.addEventListener("click", () => openSession(s));
       wireSessionDrag(row.querySelector(".drag-handle"), row);
@@ -1889,6 +2302,16 @@
           renameSession(s);
         });
         row.appendChild(editBtn);
+
+        const linkBtn = document.createElement("button");
+        linkBtn.className = "link-btn" + (linkArmedSessionId === s.id ? " armed" : "");
+        linkBtn.textContent = "🔗";
+        linkBtn.title = s.link ? `連携中(「${s.link.partner_label}」)-- タップで切断` : "他のセッションとつなぐ";
+        linkBtn.addEventListener("click", (e) => {
+          e.stopPropagation(); // don't also open the session
+          onLinkButtonTapped(s);
+        });
+        row.appendChild(linkBtn);
 
         const archiveBtn = document.createElement("button");
         archiveBtn.className = "archive-btn";
@@ -2225,7 +2648,7 @@
       div.appendChild(img);
     } else if (ev.type === "attachment") {
       div.className = "bubble agent";
-      renderAttachment(div, sessionId, ev.filename, ev.kind, ev.source_filename);
+      renderAttachment(div, sessionId, ev.filename, ev.kind, ev.source_filename, ev.mtl);
     } else if (ev.type === "session_ended") {
       div.className = "bubble system";
       div.textContent = ev.exit_status
@@ -2576,8 +2999,17 @@
         body.cwd = currentCwd;
         body.resume = resumeEl.value;
       } else if (sshCwdMachines.includes(currentMachine) && preset === `claude-tui-${currentMachine}`) {
-        // No resume counterpart, see create_session.
+        // resume is only meaningful once a drive/folder was actually chosen
+        // (see create_session's own check) -- an empty currentSshCwd sends
+        // resume: "", same as never picking one from #ssh-resume.
         body.cwd = currentSshCwd;
+        body.resume = sshResumeEl.value;
+      } else if (SHELL_CWD_PRESETS.includes(preset)) {
+        // No resume for these (see SHELL_CWD_PRESETS' own comment) -- just
+        // the working directory, already in whatever shape create_session
+        // expects for this preset's scope (sandhome-relative for "shell",
+        // an absolute path for "host-shell"/"root-shell").
+        body.cwd = shellCwdByPreset[preset];
       }
       // Only the claude-tui presets honor this (see aigw-backend's
       // CLAUDE_TUI_PRESETS/create_session) -- the headless "claude" preset
@@ -2601,6 +3033,7 @@
       if (!meta) return;
       document.getElementById("label").value = "";
       resumeEl.value = "";
+      sshResumeEl.value = "";
       await refreshSessions();
       openSession(meta);
     } finally {
