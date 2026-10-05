@@ -64,6 +64,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -236,6 +237,21 @@ SSH_MACHINES_CONFIG_PATH = "/etc/aigw/ssh_machines.json"
 #     (the deployment notes) on that machine's Claude preset -- set it
 #     only for a Windows machine that exposes real drive letters, never
 #     for a plain Linux box (no such concept there).
+#   - "ssh_host" / "tmux_socket" / "start_task" (all optional, used
+#     together): a *desktop variant* of a Windows machine -- an extra entry
+#     (e.g. "winbox-b-desktop") that reaches the same ssh Host ("ssh_host",
+#     default: the entry's own name) but drives a separate tmux server
+#     (`tmux -L <tmux_socket>`) that runs in the logged-on user's
+#     interactive Windows session (session 1) instead of the sshd service's
+#     session 0, so whatever its panes start can see and drive desktop
+#     apps. Being its own entry, it gets its own presets and its own row in
+#     the machine picker for free -- that row *is* the "run on the desktop"
+#     option. A tmux server is a child of whoever starts it, so this one
+#     must never be started from ssh: "start_task" names an interactive
+#     ("run only when user is logged on") Scheduled Task on that machine
+#     that starts it (_ensure_desktop_tmux_server), and new-session refuses
+#     rather than fall back to a session-0 server when that fails (nobody
+#     logged on).
 def _load_ssh_machines():
     try:
         with open(SSH_MACHINES_CONFIG_PATH) as f:
@@ -253,6 +269,88 @@ def _load_ssh_machines():
 
 
 SSH_MACHINES = _load_ssh_machines()
+
+# A second sandbox container, separate from devbox-<user>, for material too
+# sensitive to sit in ~/sandhome -- where every dependency an `npm install`
+# drags into the dev container, and every agent running there, can read it.
+# The motivating case is a mailbox (see that deployment's own notes), hence
+# the default label, but nothing here is mail-specific.
+#
+# Deployment-specific, so it lives in a config file rather than in this
+# file, exactly like SSH_MACHINES above: the container name and directory
+# are one host's local arrangement, not something the published core should
+# carry. Absent or malformed config, or a directory that is not there (a
+# host that simply has no such sandbox), degrades to "no Email preset" --
+# the same graceful degradation _load_ssh_machines chose, and for the same
+# reason: this is a convenience feature, not a security boundary, so it
+# fails quiet rather than refusing to start.
+#
+# What this IS load-bearing for: SESSION STATE LOCATION. See session_roots()
+# -- a session started from this preset keeps its events.jsonl (and outbox/,
+# inbox/) under <dir>/.aigw/ instead of ~/sandhome/.aigw/, so the chat log
+# of what was read lands where only this sandbox can see it. Putting it in
+# SESSIONS_DIR would hand the dev container the very thing the separate
+# sandbox exists to keep away from it.
+MAILBOX_CONFIG_PATH = "/etc/aigw/mailbox.json"
+
+
+def _load_mailbox():
+    try:
+        with open(MAILBOX_CONFIG_PATH) as f:
+            raw = f.read()
+    except OSError:
+        return None  # silent: most hosts have no second sandbox, that is normal
+    try:
+        cfg = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"[aigw-backend] {MAILBOX_CONFIG_PATH}: invalid JSON ({e}) -- "
+              "no Email preset configured", file=sys.stderr, flush=True)
+        return None
+    name, directory = cfg.get("container_name"), cfg.get("dir")
+    if not name or not directory:
+        print(f"[aigw-backend] {MAILBOX_CONFIG_PATH}: needs both "
+              '"container_name" and "dir" -- no Email preset configured',
+              file=sys.stderr, flush=True)
+        return None
+    path = Path(directory)
+    # Must be under this user's own home: `sandbox new` enforces the same
+    # rule itself and would reject anything else, so catching it here only
+    # turns a confusing pane-death into a startup log line. Not a security
+    # check -- the real one is in the sandbox CLI, which this cannot weaken.
+    # The home check comes first and is pure path arithmetic: the config file
+    # is host-wide, so every OTHER user's backend reads a `dir` inside
+    # someone else's (0700) home, where is_dir() itself raises
+    # PermissionError -- which crashed every other user's backend on
+    # startup (2026-10-06).
+    try:
+        usable = HOME in path.parents and path.is_dir()
+    except OSError:
+        usable = False
+    if not usable:
+        print(f"[aigw-backend] {MAILBOX_CONFIG_PATH}: {path} is not a directory "
+              "under this user's home -- no Email preset configured",
+              file=sys.stderr, flush=True)
+        return None
+    return {"container_name": name, "dir": path, "label": cfg.get("label", "Email")}
+
+
+MAILBOX = _load_mailbox()
+# The second session-state root (see session_roots). None when no second
+# sandbox is configured, which is the only case the rest of this file has to
+# branch on.
+MAIL_SESSIONS_DIR = (MAILBOX["dir"] / ".aigw") if MAILBOX else None
+
+
+def _ssh_host(machine):
+    """The ssh config Host to connect to for SSH_MACHINES entry `machine` --
+    itself, unless it is a desktop variant ("ssh_host", see the schema
+    comment above) sharing another entry's Host."""
+    return SSH_MACHINES.get(machine, {}).get("ssh_host", machine)
+
+
+def _tmux_socket_args(machine):
+    sock = SSH_MACHINES.get(machine, {}).get("tmux_socket")
+    return ["-L", sock] if sock else []
 
 
 def _ssh_run(machine, remote_argv, timeout=15, redirect_devnull=False, connect_timeout=10):
@@ -335,7 +433,7 @@ def _ssh_invoke(machine, remote_cmd, timeout=15, text=True, connect_timeout=10):
     control_path = f"{SSH_CONTROL_DIR}/{os.getuid()}-%r@%h:%p"
     ssh_argv = ["ssh", "-F", SSH_CONFIG_PATH,
                 "-o", f"ControlPath={control_path}", "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
-                "-o", f"ConnectTimeout={connect_timeout}", machine, remote_cmd]
+                "-o", f"ConnectTimeout={connect_timeout}", _ssh_host(machine), remote_cmd]
     try:
         return subprocess.run(ssh_argv, capture_output=True, text=text, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -524,6 +622,78 @@ for _machine, _cfg in SSH_MACHINES.items():
         "command": [_tui_claude, "auth", "login"], "location": f"ssh:{_machine}",
     }
 del _machine, _cfg, _tui_claude
+
+# The second-sandbox preset ("Email" in the UI), injected the same way the
+# SSH_MACHINES ones above are: only when this deployment actually configured
+# one (see MAILBOX), so hosts without it simply never see the option.
+#
+# location is "host", NOT a new location string of its own, and that choice
+# is deliberate twice over:
+#
+#  1. Nothing new to teach the unlock gate. _location_requires_unlock() is a
+#     whitelist -- "container" and a recognized ssh:<machine> skip the gate,
+#     everything else fails closed -- and _tier_for_location() falls back to
+#     the strictest tier for anything it does not recognize. A brand-new
+#     location would therefore demand a ROOT-tier passkey to read mail,
+#     which is absurd; teaching both functions about it would mean editing
+#     the two functions whose entire design is "do not edit me per preset".
+#     Riding on "host" gets the host-tier passkey prompt, which is the right
+#     answer here anyway: a stolen session cookie alone must not open
+#     someone's mailbox.
+#  2. No change to the sandbox CLI's privilege boundary. `sandbox exec` can
+#     only address the persistent devbox container, so reaching a second one
+#     "properly" would mean adding named-container exec to restricted-
+#     sandbox -- the one file this host's own docs call the security
+#     boundary itself. Running `sandbox new` as the pane's own command needs
+#     none of that: it is the ordinary CLI, invoked exactly as a human would
+#     from a host shell, under the sudo rule that already exists.
+#
+# The pane's command is the sandbox invocation itself rather than `bash -l`,
+# so when Claude Code exits the pane exits with it -- this never leaves a
+# host shell sitting behind the passkey gate.
+if MAILBOX:
+    TMUX_PRESETS["mail-tui"] = {
+        # Flags BEFORE the `new` subcommand -- the CLI's real grammar is
+        # "sandbox [-r|--root] [--claude [--fg]] <subcmd> ...". Its own
+        # option loop deliberately stops at the first non-flag so that a
+        # chat line passed to `exec` can contain something like "--root"
+        # without being mistaken for a flag, which is why flags after the
+        # subcommand are not accepted. (Measured 2026-10-04: `sandbox new
+        # --claude mail DIR` silently takes "--claude" as the NAME, and
+        # `sandbox new --fg ...` reaches an internal readlink as an
+        # unrecognized option. Note that opt-tools.md and the sandbox
+        # wrapper's own usage comment both still spell it "new --claude";
+        # those are documentation errors, not a code bug.)
+        #
+        # KNOWN LIMITATION, measured the same day: AIGW_OUTBOX and
+        # AIGW_TALKTO do NOT reach Claude Code here. create_session sets
+        # them with `env VAR=... <command>`, which puts them in the HOST
+        # pane -- and this command crosses into a container, where neither
+        # sudo nor `docker run` carries them over (verified: both read back
+        # empty inside). So a session on this preset has no outbox (no
+        # images/attachments surfaced into the chat) and no talkto. The
+        # chat itself is unaffected, because that comes from capture-pane
+        # on the host pane, not from anything inside the container. Fixing
+        # it would mean teaching the sandbox CLI to forward env into the
+        # container, which is a change to the privilege-boundary script
+        # this preset was shaped specifically to avoid touching.
+        "command": ["sandbox", "--claude", "--fg", "new",
+                    MAILBOX["container_name"], str(MAILBOX["dir"])],
+        "location": "host",
+        # Same 100 columns as claude-tui, same reason: the TUI lays itself
+        # out to the pane width and the 220 default forces constant
+        # horizontal scrolling in the screen panel on a phone.
+        "width": 100,
+        # No "remote_control": `sandbox --claude` builds its own claude
+        # command line and already passes --remote-control itself, so there
+        # is nothing for this file to inject.
+    }
+
+# Presets whose session state belongs in the second sandbox's tree rather
+# than ~/sandhome's -- see session_roots()/session_dir(). A set, like
+# CLAUDE_TUI_PRESETS below, so the check stays a membership test rather than
+# a literal "mail-tui" spelled out at each site.
+MAIL_PRESETS = {"mail-tui"} if MAILBOX else set()
 
 # Every preset that runs Claude Code's interactive TUI (as opposed to a plain
 # shell) -- one local, one per SSH machine. Anywhere the local code checked
@@ -1006,7 +1176,59 @@ def container_ip():
     return r.stdout.strip()
 
 
-def session_dir(session_id):
+def session_roots():
+    """Every tree a session's state directory can live in.
+
+    There are two only because a deployment can configure a second sandbox
+    (see MAILBOX): its sessions keep their state under <dir>/.aigw/ so that
+    the chat log, the outbox and the inbox are visible to THAT container and
+    not to devbox-<user>. ~/sandhome/.aigw is bind-mounted read-write into
+    the dev container, so a session parked there is readable by anything
+    running in it -- which for the sensitive-material sandbox is precisely
+    the thing being avoided.
+
+    Both roots have the property the per-session directory relies on: the
+    directory is bind-mounted into its own container at the SAME absolute
+    path, so AIGW_OUTBOX and friends mean the same thing on both sides."""
+    roots = [SESSIONS_DIR]
+    if MAIL_SESSIONS_DIR is not None:
+        roots.append(MAIL_SESSIONS_DIR)
+    return roots
+
+
+def iter_session_dirs():
+    """Every existing per-session directory across session_roots(), for the
+    three callers that enumerate sessions rather than look one up. Skips
+    roots that do not exist yet (a configured second sandbox whose first
+    session has not been created) and non-directories, so callers do not
+    repeat either check."""
+    for root in session_roots():
+        if not root.exists():
+            continue
+        for d in root.iterdir():
+            if d.is_dir():
+                yield d
+
+
+def session_dir(session_id, preset=None):
+    """Where session `session_id` keeps its state.
+
+    Pass `preset` when CREATING a session -- that is the only moment the
+    answer cannot be looked up, because the directory does not exist yet,
+    and getting it wrong would silently file a second-sandbox session under
+    ~/sandhome (losing exactly the isolation it was started for).
+
+    Every other caller omits it and gets the directory found by searching
+    the roots. Session ids are unique across roots (they are random hex), so
+    the search has one answer. The fallback for an id that exists in neither
+    root is SESSIONS_DIR, preserving the original behaviour for callers that
+    build a path to something not yet (or no longer) on disk."""
+    if preset is not None:
+        return (MAIL_SESSIONS_DIR if preset in MAIL_PRESETS else SESSIONS_DIR) / session_id
+    for root in session_roots():
+        p = root / session_id
+        if p.is_dir():
+            return p
     return SESSIONS_DIR / session_id
 
 
@@ -1079,12 +1301,12 @@ def list_tmux_sessions():
     """Set of live tmux session names inside the user's container, or empty
     set if the tmux server isn't running at all (e.g. nothing ever started)."""
     try:
-        r = sandbox_exec(["tmux", "list-sessions", "-F", "#S"])
+        r = tmux_query("container", ["list-sessions", "-F", "#S"])
     except subprocess.TimeoutExpired:
         return set()
     if r.returncode != 0:
         return set()
-    return {line for line in r.stdout.splitlines() if line}
+    return {line for line in r.stdout.splitlines() if line and line != CTL_SESSION}
 
 
 def list_host_tmux_sessions():
@@ -1098,12 +1320,12 @@ def list_host_tmux_sessions():
     when a user's actual long-running sessions turned out to live here,
     not inside devbox-<user> (which "attach" originally assumed exclusively)."""
     try:
-        r = subprocess.run(["tmux", "list-sessions", "-F", "#S"], capture_output=True, text=True, timeout=15)
+        r = tmux_query("host", ["list-sessions", "-F", "#S"])
     except subprocess.TimeoutExpired:
         return set()
     if r.returncode != 0:
         return set()
-    return {line for line in r.stdout.splitlines() if line}
+    return {line for line in r.stdout.splitlines() if line and line != CTL_SESSION}
 
 
 def list_root_tmux_sessions():
@@ -1125,24 +1347,24 @@ def list_root_tmux_sessions():
     if not root_shell_allowed():
         return None
     try:
-        r = tmux_exec("root", ["list-sessions", "-F", "#S"])
+        r = tmux_query("root", ["list-sessions", "-F", "#S"])
     except subprocess.TimeoutExpired:
         return set()
     if r.returncode != 0:
         return set()
-    return {line for line in r.stdout.splitlines() if line}
+    return {line for line in r.stdout.splitlines() if line and line != CTL_SESSION}
 
 
 def list_ssh_tmux_sessions(location):
     """Like list_host_tmux_sessions, but for a `ssh:<machine>` location --
     live tmux session names on that machine, or empty if unreachable."""
     try:
-        r = tmux_exec(location, ["list-sessions", "-F", "#S"])
+        r = tmux_query(location, ["list-sessions", "-F", "#S"])
     except (subprocess.TimeoutExpired, OSError):
         return set()
     if r.returncode != 0:
         return set()
-    return {line for line in r.stdout.splitlines() if line}
+    return {line for line in r.stdout.splitlines() if line and line != CTL_SESSION}
 
 
 def live_tmux_names(location):
@@ -1222,7 +1444,7 @@ def tmux_exec(location, tmux_args, timeout=15):
         return subprocess.run(["tmux", *tmux_args], capture_output=True, text=True, timeout=timeout)
     if location.startswith("ssh:"):
         machine = location.split(":", 1)[1]
-        remote_argv = [SSH_MACHINES[machine]["tmux"], *tmux_args]
+        remote_argv = [SSH_MACHINES[machine]["tmux"], *_tmux_socket_args(machine), *tmux_args]
         # Only "new-session" can make MSYS2 tmux fork a brand-new SERVER
         # process (the very first session on that machine, or the first
         # since a reboot/kill -- every later call just talks to the
@@ -1249,8 +1471,514 @@ def tmux_exec(location, tmux_args, timeout=15):
             # every other tmux_exec call (send-keys, capture-pane, ...) never
             # forks a server so never needs it.
             timeout = max(timeout, 45)
+            # Desktop variant: new-session would otherwise start the server
+            # itself, from ssh -- i.e. in session 0, defeating the point.
+            err = _ensure_desktop_tmux_server(machine)
+            if err:
+                return subprocess.CompletedProcess(remote_argv, 1, "", err)
         return _ssh_run(machine, remote_argv, timeout=timeout, redirect_devnull=is_new_session)
     return sandbox_exec(["tmux", *tmux_args], timeout=timeout)
+
+
+# ---- resident tmux control-mode clients (the deployment notes) ---------------
+#
+# 2026-10-05, at the user's request: every poll above used to start a fresh
+# `tmux` process (and, for "container", a whole sudo -> sandbox CLI ->
+# docker exec -> runc chain), which measured ~2000 processes/s on this host.
+# Instead, each tmux server this backend reads from keeps ONE resident
+# `tmux -C` (control mode) client, attached to a hidden session of its own
+# (CTL_SESSION, running `cat`), and read-only queries -- capture-pane,
+# display-message, list-sessions -- go over that client's stdin/stdout.
+#
+# Read-only by construction: only tmux_query() uses it, and tmux_query()'s
+# callers only ever pass the query commands above. Anything that changes a
+# pane (send-keys, kill-session, respawn-pane, ...) still goes through
+# tmux_exec() exactly as before, so no write path -- and in particular none
+# of send_message()'s unlock gating -- moves onto this channel.
+#
+# "root": the client is only (re)started while root_shell_allowed(), and
+# aigw-root-tmux-grant --revoke's `server-access -d` makes tmux itself drop
+# it ("%exit access not allowed", measured 2026-10-05), so a resident client
+# never outlives a lock.
+#
+# Any failure (no server, locked, timeout, unexpected exit) falls back to
+# tmux_exec() for that call, and the client is retried no sooner than
+# TMUX_CTL_RETRY_INTERVAL later -- the old per-poll path is the safety net.
+# ssh:<machine> is not handled here (the deployment notes' machine agent).
+CTL_SESSION = "_aigw-ctl"
+TMUX_CTL_LOCATIONS = ("container", "host", "root")
+TMUX_CTL_TIMEOUT = 10
+TMUX_CTL_RETRY_INTERVAL = 30
+
+
+class TmuxCtlUnavailable(Exception):
+    pass
+
+
+def _tmux_ctl_quote(arg):
+    """One argv element as a tmux command-line word. Only the bare ";" is
+    left unquoted (tmux's own command separator); everything else is
+    single-quoted. A value that cannot be single-quoted safely (contains a
+    quote or a newline) is refused rather than escaped -- the callers only
+    ever pass fixed formats and validated session names, so that never
+    happens in practice, and refusing just means tmux_exec() is used."""
+    if arg == ";":
+        return ";"
+    if "'" in arg or "\n" in arg or "\r" in arg:
+        raise TmuxCtlUnavailable("argument not representable on the control channel")
+    return "'" + arg + "'"
+
+
+class TmuxControl:
+    def __init__(self, location):
+        self.location = location
+        self.lock = threading.Lock()
+        self.proc = None
+        self.blocks = queue.Queue()
+        self.next_retry = 0.0
+
+    def _argv(self):
+        attach = ["-C", "new-session", "-A", "-s", CTL_SESSION, "-x", "80", "-y", "24", "cat"]
+        if self.location == "container":
+            return ["sandbox", "--stdin", "exec", "--", "tmux", *attach]
+        if self.location == "root":
+            return ["tmux", "-S", ROOT_TMUX_SOCKET, *attach]
+        return ["tmux", *attach]
+
+    def _reader(self, proc):
+        in_block = False
+        buf = []
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip("\n")
+            if line.endswith("\r"):
+                line = line[:-1]
+            if not in_block:
+                if line.startswith("%begin "):
+                    in_block, buf = True, []
+                # Every other line outside a block is a notification
+                # (%output of the hidden cat, %session-changed, ...): not
+                # needed -- change detection is pipe-pane's job (see
+                # _ScreenSignal), since tmux only notifies a control client
+                # about its own attached session.
+                continue
+            if line.startswith("%end ") or line.startswith("%error "):
+                self.blocks.put((line.startswith("%end "), buf))
+                in_block = False
+                continue
+            buf.append(line)
+        self.blocks.put(None)  # EOF: the client exited
+
+    def _start(self):
+        if self.location == "root" and not root_shell_allowed():
+            raise TmuxCtlUnavailable("root window locked")
+        proc = subprocess.Popen(self._argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, bufsize=0)
+        self.proc = proc
+        self.blocks = queue.Queue()
+        threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
+        # The attach itself answers with one block before anything else.
+        self._wait_block()
+        self._roundtrip("refresh-client -f ignore-size")
+
+    def _stop(self):
+        proc, self.proc = self.proc, None
+        self.next_retry = time.time() + TMUX_CTL_RETRY_INTERVAL
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def _wait_block(self):
+        try:
+            item = self.blocks.get(timeout=TMUX_CTL_TIMEOUT)
+        except queue.Empty:
+            raise TmuxCtlUnavailable("control client timed out")
+        if item is None:
+            raise TmuxCtlUnavailable("control client exited")
+        return item
+
+    def _roundtrip(self, line, ncommands=1):
+        """Sends one command line and collects its answer. tmux answers a
+        ";"-chained line with one %begin/%end block PER COMMAND (measured
+        2026-10-05), so all `ncommands` blocks are read -- reading only the
+        first would leave the rest to be mistaken for the next call's
+        answer. Their lines are joined in order; ok only if all were."""
+        try:
+            self.proc.stdin.write((line + "\n").encode("utf-8"))
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            raise TmuxCtlUnavailable("control client stdin closed")
+        ok_all, lines_all = True, []
+        for _ in range(ncommands):
+            ok, lines = self._wait_block()
+            lines_all.extend(lines)
+            if not ok:
+                # A failing command aborts the rest of its ";" list: tmux
+                # sends no blocks for the skipped ones (measured 2026-10-05).
+                ok_all = False
+                break
+        return ok_all, lines_all
+
+    def query(self, tmux_args):
+        line = " ".join(_tmux_ctl_quote(a) for a in tmux_args)
+        ncommands = 1 + sum(1 for a in tmux_args if a == ";")
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None:
+                if self.proc is not None:
+                    self._stop()
+                if time.time() < self.next_retry:
+                    raise TmuxCtlUnavailable("control client in retry backoff")
+                try:
+                    self._start()
+                except TmuxCtlUnavailable:
+                    self._stop()
+                    raise
+                except OSError as e:
+                    self._stop()
+                    raise TmuxCtlUnavailable(str(e))
+            try:
+                ok, lines = self._roundtrip(line, ncommands)
+            except TmuxCtlUnavailable:
+                self._stop()
+                raise
+        out = "\n".join(lines) + ("\n" if lines else "")
+        return subprocess.CompletedProcess(tmux_args, 0 if ok else 1, out if ok else "", "" if ok else out)
+
+
+_tmux_controls = {}
+_tmux_controls_lock = threading.Lock()
+
+
+def tmux_query(location, tmux_args, timeout=15):
+    """tmux_exec() for read-only queries (capture-pane, display-message,
+    list-sessions): over the location's resident control client when one is
+    available, else exactly tmux_exec(). Same return shape either way."""
+    if location.startswith("ssh:"):
+        agent = _ssh_agent(location.split(":", 1)[1])
+        if agent is not None:
+            try:
+                r = agent.request("tmux", args=list(tmux_args))
+                return subprocess.CompletedProcess(tmux_args, r.get("rc", 1), r.get("stdout", ""), r.get("stderr", ""))
+            except SshAgentUnavailable:
+                pass
+    if location in TMUX_CTL_LOCATIONS:
+        with _tmux_controls_lock:
+            ctl = _tmux_controls.get(location)
+            if ctl is None:
+                ctl = _tmux_controls[location] = TmuxControl(location)
+        try:
+            return ctl.query(tmux_args)
+        except TmuxCtlUnavailable:
+            pass
+    return tmux_exec(location, tmux_args, timeout=timeout)
+
+
+# ---- pipe-pane change signal (the deployment notes) ------------------------
+#
+# tmux only sends a control client %output for its own attached session, so
+# the resident client above cannot say *when* a watched pane changed. Each
+# watched pane instead gets `pipe-pane -O 'exec cat > <session dir>/
+# screen.fifo'`: one resident `cat` per pane, started once (not per poll),
+# whose writes into the FIFO wake _ScreenSignal's reader thread here. The
+# session directory is visible at the same absolute path inside the
+# container and on the host (SESSIONS_DIR's bind mount), so this works for
+# "container", "host" and "root" alike; ssh:<machine> has no shared
+# filesystem and keeps polling.
+#
+# The FIFO is also held open for writing by this process itself, so the
+# reader never sees EOF (which would make it spin) while no `cat` happens to
+# be attached -- e.g. between a backend restart and the pane's next output.
+# A `cat` left over from before a restart keeps writing into the same FIFO
+# and simply finds the new reader; one that died (it writes into a FIFO with
+# no reader at all only while this process is down) shows up as
+# #{pane_pipe}=0 and is re-established by the watcher.
+SCREEN_FIFO_NAME = "screen.fifo"
+# After a change signal, keep capturing at TMUX_POLL_INTERVAL for this long,
+# so _watch_tmux_session's "same row seen on two polls" settle check (which
+# commits shell output to the chat) still gets its confirming poll.
+SCREEN_SIGNAL_TAIL = 1.5
+# Capture at least this often regardless of signals -- a safety net for a
+# missed signal or a broken pipe.
+SCREEN_SAFETY_INTERVAL = 5.0
+
+
+class _ScreenSignal:
+    def __init__(self, fifo_path):
+        self.path = fifo_path
+        self.last_signal = time.time()
+        self.closed = False
+        if not os.path.exists(fifo_path):
+            os.mkfifo(fifo_path, 0o600)
+        elif not stat.S_ISFIFO(os.lstat(fifo_path).st_mode):
+            raise OSError(f"{fifo_path} exists and is not a FIFO")
+        self.rfd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+        self.wfd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        os.set_blocking(self.rfd, True)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        while not self.closed:
+            try:
+                chunk = os.read(self.rfd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self.last_signal = time.time()
+        for fd in (self.rfd,):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def close(self):
+        self.closed = True
+        try:
+            os.write(self.wfd, b"\0")  # unblock the reader so it sees `closed`
+            os.close(self.wfd)
+        except OSError:
+            pass
+
+    def want_capture(self, last_capture):
+        now = time.time()
+        return now - self.last_signal <= SCREEN_SIGNAL_TAIL or now - last_capture >= SCREEN_SAFETY_INTERVAL
+
+
+def _start_screen_pipe(location, tmux_name, fifo_path):
+    """(Re)attaches the pane's change-signal pipe. -O: only if the pane has
+    none yet, so an already-running `cat` (or a pipe the user set up
+    themselves) is left alone. A write, so tmux_exec(), not tmux_query()."""
+    if "'" in fifo_path:
+        return False
+    try:
+        r = tmux_exec(location, ["pipe-pane", "-O", "-t", tmux_name, f"exec cat > '{fifo_path}'"])
+    except subprocess.TimeoutExpired:
+        return False
+    return r.returncode == 0
+
+
+# ---- per-machine agent for ssh:<machine> (the deployment notes) -------------
+#
+# The ssh:<machine> counterpart of TmuxControl/_ScreenSignal above: instead
+# of one ssh round trip -- and one remote bash + tmux/stat/tail/find/cygpath
+# process start -- per poll, each such machine entry runs aigw-agent
+# (aigw-priv/bin/aigw-agent, installed there as ~/.local/share/aigw-agent/
+# aigw-agent) on ONE long-lived ssh channel, and the backend asks it over
+# JSON lines. Opt-in per SSH_MACHINES entry ("agent_python": that machine's
+# native Python; "agent_script": MSYS2's `script` on a Windows machine, whose
+# tmux needs a pty for control mode). Anything the agent cannot answer (not
+# configured, not reachable, timed out) falls back to the per-call ssh path,
+# which stays exactly as it was. A failed/died agent is retried no sooner
+# than SSH_AGENT_RETRY_INTERVAL later -- on the Windows machines every
+# reconnect means an MSYS2 process exit, which is what is being avoided.
+SSH_AGENT_PATH = "~/.local/share/aigw-agent/aigw-agent"
+SSH_AGENT_TIMEOUT = 15
+SSH_AGENT_RETRY_INTERVAL = 60
+
+
+class SshAgentUnavailable(Exception):
+    pass
+
+
+class SshAgent:
+    def __init__(self, machine):
+        self.machine = machine
+        self.lock = threading.Lock()          # start/stop and stdin writes
+        self.proc = None
+        self.pending = {}                     # id -> [Event, reply]
+        self.next_id = 0
+        self.next_retry = 0.0
+        self.last_signal = {}                 # tmux session name -> time of last "changed"
+
+    def configured(self):
+        return bool(SSH_MACHINES.get(self.machine, {}).get("agent_python"))
+
+    def _remote_command(self):
+        spec = SSH_MACHINES[self.machine]
+        parts = [shlex.quote(spec["agent_python"]), "-u", SSH_AGENT_PATH]
+        if spec.get("agent_script"):
+            parts += ["--script", shlex.quote(spec["agent_script"])]
+        parts += ["--tmux", shlex.quote(spec["tmux"]), *(shlex.quote(a) for a in _tmux_socket_args(self.machine))]
+        return " ".join(parts)
+
+    def _start(self):
+        control_path = f"{SSH_CONTROL_DIR}/{os.getuid()}-%r@%h:%p"
+        argv = ["ssh", "-F", SSH_CONFIG_PATH,
+                "-o", f"ControlPath={control_path}", "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
+                "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
+                _ssh_host(self.machine), self._remote_command()]
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, bufsize=0)
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+
+    def _reader(self, proc):
+        for raw in proc.stdout:
+            try:
+                msg = json.loads(raw)
+            except ValueError:
+                continue                      # e.g. a login banner line
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("ev") == "changed" and isinstance(msg.get("session"), str):
+                self.last_signal[msg["session"]] = time.time()
+                continue
+            slot = self.pending.get(msg.get("id"))
+            if slot is not None:
+                slot[1] = msg
+                slot[0].set()
+        # EOF: wake every waiter so none sits out its full timeout.
+        for slot in list(self.pending.values()):
+            slot[0].set()
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def request(self, op, timeout=SSH_AGENT_TIMEOUT, **fields):
+        if not self.configured():
+            raise SshAgentUnavailable("no agent configured")
+        with self.lock:
+            if not self.alive():
+                if self.proc is not None:
+                    self._stop_locked()
+                if time.time() < self.next_retry:
+                    raise SshAgentUnavailable("agent in retry backoff")
+                try:
+                    self._start()
+                except OSError as e:
+                    self._stop_locked()
+                    raise SshAgentUnavailable(str(e))
+            self.next_id += 1
+            rid = self.next_id
+            slot = [threading.Event(), None]
+            self.pending[rid] = slot
+            try:
+                self.proc.stdin.write((json.dumps({"op": op, "id": rid, **fields}) + "\n").encode("utf-8"))
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                self.pending.pop(rid, None)
+                self._stop_locked()
+                raise SshAgentUnavailable("agent stdin closed")
+        got = slot[0].wait(timeout)
+        self.pending.pop(rid, None)
+        if not got or slot[1] is None:
+            with self.lock:
+                self._stop_locked()
+            raise SshAgentUnavailable("agent did not answer")
+        return slot[1]
+
+    def _stop_locked(self):
+        proc, self.proc = self.proc, None
+        self.next_retry = time.time() + SSH_AGENT_RETRY_INTERVAL
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+
+_ssh_agents = {}
+_ssh_agents_lock = threading.Lock()
+
+
+def _ssh_agent(machine):
+    """The SshAgent for this SSH_MACHINES entry, or None if it has none
+    configured (then every caller just keeps using its own ssh path)."""
+    if not SSH_MACHINES.get(machine, {}).get("agent_python"):
+        return None
+    with _ssh_agents_lock:
+        agent = _ssh_agents.get(machine)
+        if agent is None:
+            agent = _ssh_agents[machine] = SshAgent(machine)
+    return agent
+
+
+class _RemoteScreenSignal:
+    """_ScreenSignal's ssh:<machine> counterpart: the agent attaches the
+    pipe-pane and reports {"ev": "changed"}; same capture policy. If the
+    agent goes away, every poll captures again (want_capture -> True), so a
+    lost agent never freezes the screen."""
+
+    def __init__(self, agent, tmux_name):
+        self.agent = agent
+        self.name = tmux_name
+        r = agent.request("watch", session=tmux_name)
+        if r.get("rc") != 0:
+            raise SshAgentUnavailable(r.get("stderr") or "watch failed")
+        agent.last_signal[tmux_name] = time.time()
+
+    def want_capture(self, last_capture):
+        if not self.agent.alive():
+            return True
+        now = time.time()
+        last = self.agent.last_signal.get(self.name, 0)
+        return now - last <= SCREEN_SIGNAL_TAIL or now - last_capture >= SCREEN_SAFETY_INTERVAL
+
+    def reattach(self):
+        try:
+            self.agent.request("watch", session=self.name)
+        except SshAgentUnavailable:
+            pass
+
+    def close(self):
+        try:
+            self.agent.request("unwatch", session=self.name, timeout=5)
+        except SshAgentUnavailable:
+            pass
+
+
+# How long _ensure_desktop_tmux_server waits for the Scheduled Task's tmux
+# server to come up (a cold MSYS2 tmux fork: see tmux_exec's comment).
+DESKTOP_TMUX_START_TIMEOUT = 30
+
+
+def _desktop_tmux_server_running(machine):
+    """True/False, or None if the machine could not be asked at all.
+    list-sessions never starts a server (only new-session/start-server do),
+    and with exit-empty off a running server may have no sessions, so this
+    goes by "could it connect" (stderr), not by the exit code alone."""
+    r = _ssh_run(machine, [SSH_MACHINES[machine]["tmux"], *_tmux_socket_args(machine), "list-sessions"],
+                 timeout=15)
+    if r.returncode == 0:
+        return True
+    err = (r.stderr or "").lower()
+    if "no server running" in err or "error connecting" in err:
+        return False
+    if "no sessions" in err:
+        return True
+    return None
+
+
+def _ensure_desktop_tmux_server(machine):
+    """For a desktop variant ("start_task", see the SSH_MACHINES schema
+    comment): make sure its tmux server is running, starting it through the
+    interactive Scheduled Task if not. Returns None when ready (or for an
+    ordinary machine), else a user-facing error string -- never falls back
+    to letting new-session start the server from ssh (session 0)."""
+    task = SSH_MACHINES.get(machine, {}).get("start_task")
+    if not task:
+        return None
+    state = _desktop_tmux_server_running(machine)
+    if state:
+        return None
+    if state is None:
+        return f"{machine}: 画面ありの tmux サーバーの状態を確認できませんでした"
+    # MSYS2 would rewrite "/run", "/tn" into Windows paths without this.
+    # Output discarded and text=False: schtasks prints in the console code
+    # page (cp932 on a Japanese Windows), which a text=True decode raises on
+    # (measured 2026-10-04: UnicodeDecodeError surfaced as the create error).
+    _ssh_invoke(machine, f'MSYS2_ARG_CONV_EXCL="*" schtasks.exe /run /tn {shlex.quote(task)} >/dev/null 2>&1',
+                timeout=20, text=False)
+    deadline = time.time() + DESKTOP_TMUX_START_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(2)
+        if _desktop_tmux_server_running(machine):
+            return None
+    return (f"{machine}: 画面ありの tmux サーバーを起動できませんでした"
+            "(その Windows 機に誰もログオンしていない可能性があります。"
+            "ログオンしてから、もう一度作成してください)")
 
 
 def list_sessions(on_behalf_of=None):
@@ -1259,8 +1987,9 @@ def list_sessions(on_behalf_of=None):
     case this returns only the sessions that user has actually been shared
     with, never the owner's full list. None (the default, used for every
     normal "my own sessions" call) returns everything, unchanged."""
-    if not SESSIONS_DIR.exists():
-        return []
+    # No early return on a missing root any more: iter_session_dirs() skips
+    # roots that are not there, and with two of them "the first one is
+    # missing" no longer means "there are no sessions".
     # Lazily fetched, only if some session actually needs it (the root one
     # costs a sudo call, the ssh: ones cost a network round trip -- and on a
     # machine with no tmux server currently running, "list-sessions" alone
@@ -1276,11 +2005,14 @@ def list_sessions(on_behalf_of=None):
     # for on_behalf_of (a shared collaborator sees the same alive/preset/cwd
     # fields as the owner, but linking is this account's own business, same
     # as session-order).
+    if on_behalf_of is None:
+        expire_links()  # lazily, see its docstring: every list poll is a check
     links = _load_links() if on_behalf_of is None else {}
     out = []
-    for d in sorted(SESSIONS_DIR.iterdir()):
-        if not d.is_dir():
-            continue
+    # Sorted by session id, not by full path: with two roots the latter
+    # would group every second-sandbox session after every ~/sandhome one,
+    # changing the order this used to return within a single root.
+    for d in sorted(iter_session_dirs(), key=lambda p: p.name):
         meta = load_meta(d.name)
         if meta is None:
             continue
@@ -1339,8 +2071,7 @@ def list_sessions(on_behalf_of=None):
                 "id": link_id,
                 "partner": partner_id,
                 "partner_label": (partner_meta or {}).get("label", partner_id),
-                "turns_used": rec["turns_used"],
-                "max_turns": rec["max_turns"],
+                "expires_ts": rec["expires_ts"],
             }
         out.append(meta)
         ensure_watcher(d.name)
@@ -1357,13 +2088,10 @@ def list_untracked_tmux_sessions():
     "0", are especially prone to this) and downstream code needs to know
     which of the two tmux servers a given name actually belongs to."""
     tracked = set()  # {(location, name)}
-    if SESSIONS_DIR.exists():
-        for d in SESSIONS_DIR.iterdir():
-            if not d.is_dir():
-                continue
-            meta = load_meta(d.name)
-            if meta and not meta.get("stopped"):
-                tracked.add((meta.get("tmux_location", "container"), meta.get("tmux_name", d.name)))
+    for d in iter_session_dirs():
+        meta = load_meta(d.name)
+        if meta and not meta.get("stopped"):
+            tracked.add((meta.get("tmux_location", "container"), meta.get("tmux_name", d.name)))
 
     result = []
     for name in sorted(list_tmux_sessions()):
@@ -1727,7 +2455,7 @@ def _root_tmux_capture(shell_command, ready, timeout):
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(0.3)
-            cap = tmux_exec("root", ["capture-pane", "-p", "-J", "-S", "-200", "-t", name])
+            cap = tmux_query("root", ["capture-pane", "-p", "-J", "-S", "-200", "-t", name])
             value = ready((cap.stdout or "").strip())
             if value is not None:
                 return value
@@ -2496,10 +3224,41 @@ def _remote_claude_project_dir_key(machine, posix_cwd):
     unreachable, etc.) -- callers treat that the same as "nothing to show
     yet", not as an error, matching claude_project_dir()'s own OSError
     handling at each call site."""
+    agent = _ssh_agent(machine)
+    if agent is not None:
+        try:
+            r = agent.request("project_key", posix_cwd=posix_cwd)
+            if r.get("rc") == 0 and re.match(r"^[A-Za-z0-9-]+$", r.get("key") or ""):
+                return r["key"]
+        except SshAgentUnavailable:
+            pass
     r = _ssh_run(machine, ["/usr/bin/cygpath", "-w", posix_cwd], timeout=10)
     if r.returncode != 0:
         return None
     return re.sub(r"[^A-Za-z0-9]", "-", r.stdout.strip())
+
+
+def _ssh_jsonl_sizes(machine, key):
+    """{name: size} of the .jsonl files in that remote project dir (for the
+    `claude -r` adoption baseline in _watch_shell_claude), or {}."""
+    agent = _ssh_agent(machine)
+    if agent is not None and re.match(r"^[A-Za-z0-9-]+$", key or ""):
+        try:
+            r = agent.request("list_jsonl", key=key)
+            if r.get("rc") == 0:
+                return {f[0]: int(f[2]) for f in r.get("files") or [] if len(f) > 2}
+        except (SshAgentUnavailable, ValueError, TypeError):
+            pass
+    if not re.match(r"^[A-Za-z0-9-]+$", key or ""):
+        return {}
+    r = _ssh_invoke(machine, f"/usr/bin/find $HOME/.claude/projects/{key} -maxdepth 1 -name '*.jsonl' "
+                             "-printf '%s %f\\n' 2>/dev/null", timeout=10)
+    out = {}
+    for line in (r.stdout or "").splitlines():
+        size, _, name = line.partition(" ")
+        if size.isdigit() and name.endswith(".jsonl"):
+            out[name] = int(size)
+    return out
 
 
 def _ssh_list_jsonl(machine, key):
@@ -2541,6 +3300,16 @@ def _ssh_list_jsonl(machine, key):
     # command none of those needed before. stat/tail/cat below do not
     # collide with any Windows-native command of the same name (checked
     # empirically), so only this one needs the absolute path.
+    agent = _ssh_agent(machine)
+    if agent is not None and re.match(r"^[A-Za-z0-9-]+$", key or ""):
+        try:
+            r = agent.request("list_jsonl", key=key)
+            if r.get("rc") == 0:
+                return [(f[0], float(f[1])) for f in r.get("files") or []
+                        if isinstance(f[0], str) and f[0].endswith(".jsonl")
+                        and CLAUDE_CONV_ID_RE.match(f[0][:-len(".jsonl")])]
+        except (SshAgentUnavailable, ValueError, TypeError):
+            pass
     cmd = f"/usr/bin/find $HOME/.claude/projects/{key} -maxdepth 1 -name '*.jsonl' -printf '%T@ %f\\n' 2>/dev/null"
     r = _ssh_invoke(machine, cmd, timeout=10)
     if r.returncode != 0:
@@ -2592,6 +3361,15 @@ def _ssh_read_new(machine, key, filename, offset):
     conv_id = filename[:-len(".jsonl")] if filename.endswith(".jsonl") else filename
     if not CLAUDE_CONV_ID_RE.match(conv_id):
         return b"", None
+    agent = _ssh_agent(machine)
+    if agent is not None and re.match(r"^[A-Za-z0-9-]+$", key or ""):
+        try:
+            r = agent.request("read", path=f".claude/projects/{key}/{filename}", offset=offset)
+            if r.get("rc") != 0 or r.get("size") is None:
+                return b"", None
+            return base64.b64decode(r.get("data_b64") or ""), int(r["size"])
+        except (SshAgentUnavailable, ValueError, TypeError):
+            pass
     path = f"$HOME/.claude/projects/{key}/{filename}"
     cmd = f'sz=$(stat -c%s "{path}" 2>/dev/null) || exit 1; echo "$sz"; tail -c +{offset + 1} "{path}" 2>/dev/null'
     r = _ssh_invoke(machine, cmd, timeout=10, text=False)
@@ -2705,11 +3483,7 @@ def _claude_session_labels():
     so this is just recomputed on every call rather than cached -- a session
     renamed a moment ago should show up immediately, not go stale."""
     labels = {}
-    if not SESSIONS_DIR.exists():
-        return labels
-    for d in SESSIONS_DIR.iterdir():
-        if not d.is_dir():
-            continue
+    for d in iter_session_dirs():
         meta = load_meta(d.name)
         if meta is None:
             continue
@@ -2718,6 +3492,27 @@ def _claude_session_labels():
         if cid and label:
             labels[cid] = label
     return labels
+
+
+def _claude_session_last_locations():
+    """{claude_session_id: tmux_location} of the most recently created aigw
+    session that used each conversation -- so resuming one from the ssh
+    "続きから" list can put the 🐚/🪟 toggle back to how it last ran
+    (2026-10-05, at the user's request: "再開時にセッションを選んだら、Win
+    かShellかも復元する"). Same cheap meta.json walk as
+    _claude_session_labels."""
+    newest = {}
+    for d in iter_session_dirs():
+        meta = load_meta(d.name)
+        if meta is None:
+            continue
+        cid = meta.get("claude_session_id")
+        if not cid:
+            continue
+        ts = meta.get("created_ts", 0)
+        if cid not in newest or ts >= newest[cid][0]:
+            newest[cid] = (ts, meta.get("tmux_location", ""))
+    return {cid: loc for cid, (_, loc) in newest.items()}
 
 
 def list_claude_conversations(abs_cwd, limit=40):
@@ -2773,13 +3568,20 @@ def list_ssh_claude_conversations(machine, posix_cwd, limit=40):
     files.sort(key=lambda e: e[1], reverse=True)
     del files[limit:]
     aigw_labels = _claude_session_labels()
+    last_locations = _claude_session_last_locations()
     out = []
     for name, mtime in files:
         conv_id = name[:-len(".jsonl")]
+        last_loc = last_locations.get(conv_id, "")
+        last_machine = last_loc[4:] if last_loc.startswith("ssh:") else None
         out.append({
             "id": conv_id,
             "mtime": mtime,
             "aigw_label": aigw_labels.get(conv_id),
+            # True/False when an aigw session last ran it on this machine as
+            # a desktop variant (🪟) or not (🐚); None when aigw never did.
+            "aigw_desktop": (bool(SSH_MACHINES.get(last_machine, {}).get("ssh_host"))
+                             if last_machine in SSH_MACHINES else None),
             "summary": _ssh_conversation_summary(machine, key, name),
         })
     return out
@@ -2890,7 +3692,7 @@ def _accept_workspace_trust_if_shown(location, tmux_name):
     session create request cannot hang indefinitely on this."""
     deadline = time.time() + TRUST_DIALOG_POLL_TIMEOUT
     while time.time() < deadline:
-        r = tmux_exec(location, ["capture-pane", "-p", "-t", tmux_name])
+        r = tmux_query(location, ["capture-pane", "-p", "-t", tmux_name])
         if r.returncode == 0:
             if TRUST_DIALOG_MARKER in r.stdout:
                 # Never assume which option is highlighted: newer Claude Code
@@ -3037,7 +3839,12 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
             # check above, just network-reachability instead of a socket.
             raise ValueError(f"{machine} is not reachable over SSH right now")
     session_id = uuid.uuid4().hex[:12]
-    sdir = session_dir(session_id)
+    # The one call that passes `preset`: the directory does not exist yet,
+    # so session_dir() cannot find it by searching and has to be told which
+    # root this session belongs in (see its docstring). adopt_session's own
+    # mkdir deliberately does NOT pass one -- an adopted pane is always an
+    # already-running container/host/ssh pane, never a second-sandbox one.
+    sdir = session_dir(session_id, preset=preset)
     (sdir / "outbox").mkdir(parents=True)
     (sdir / "output.log").touch()
     (sdir / "events.jsonl").touch()
@@ -3247,7 +4054,14 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         shutil.rmtree(sdir, ignore_errors=True)
         raise RuntimeError(f"failed to start tmux session: {r.stderr.strip()}")
     tmux_exec(location, ["set-option", "-t", session_id, "remain-on-exit", "on"])
-    r = tmux_exec(location, ["respawn-pane", "-k", "-t", session_id, *start_dir, "--", *command])
+    # ssh:<machine> panes get no AIGW_TALKTO path (no shared filesystem, see
+    # the env_pairs comment above) -- only the session id, via tmux's own
+    # `respawn-pane -e` (tmux >= 3.0; every SSH_MACHINES entry has 3.4+), so
+    # no "env" binary is needed there. The remote talkto (aigw-priv/bin/
+    # talkto-remote) turns it into $HOME/.aigw-talkto/<id>.jsonl, which
+    # _ssh_take_talkto reads back (the deployment notes).
+    pane_env = ["-e", f"AIGW_TALKTO_ID={session_id}"] if location.startswith("ssh:") else []
+    r = tmux_exec(location, ["respawn-pane", "-k", "-t", session_id, *pane_env, *start_dir, "--", *command])
     if r.returncode != 0:
         tmux_exec(location, ["kill-session", "-t", session_id])
         shutil.rmtree(sdir, ignore_errors=True)
@@ -3829,7 +4643,7 @@ def save_inbox_attachment(session_id, meta, filename, data):
             scp = subprocess.run(
                 ["scp", "-F", SSH_CONFIG_PATH,
                  "-o", f"ControlPath={control_path}", "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
-                 "-o", "ConnectTimeout=10", tmp_path, f"{machine}:{remote_rel}"],
+                 "-o", "ConnectTimeout=10", tmp_path, f"{_ssh_host(machine)}:{remote_rel}"],
                 capture_output=True, timeout=60,
             )
             if scp.returncode != 0:
@@ -4121,7 +4935,9 @@ def events_page(session_id, before=None, limit=50):
 # User request: let the Claude Code running in this user's own sandbox
 # container converse with one running on the host (or as root) -- the user
 # picks which two of their own sessions to connect, and disconnects when
-# done. A "link" is nothing but {a, b, max_turns, turns_used}.
+# done. A "link" is nothing but {a, b, created_ts, expires_ts}: it lasts for
+# a fixed time, not a number of turns (2026-10-04, at the user's request --
+# it used to be {a, b, max_turns, turns_used}).
 #
 # What actually triggers a relayed message is deliberately NOT "every reply
 # this session produces" -- an earlier version of this hooked append_event's
@@ -4143,12 +4959,11 @@ def events_page(session_id, before=None, limit=50):
 # still goes through send_message()'s own require_unlock_if_outside_sandbox
 # gate below, unchanged. A relay attempt made while that window is closed
 # raises UnlockRequired same as any human-typed message would -- caught here
-# and turned into a skipped hop (not consumed against max_turns, not a
-# disconnect), so a link touching host/root can only make progress while a
-# human keeps that tier's passkey window open. This is intentional and is
-# the real backstop against an unsupervised root loop, more than max_turns
-# below -- max_turns guards the everyday container<->container/host case
-# where no such window exists to rate-limit it.
+# and turned into a skipped hop (not a disconnect), so a link touching
+# host/root can only make progress while a human keeps that tier's passkey
+# window open. This is intentional and is the real backstop against an
+# unsupervised root loop, more than the time limit below -- that one guards
+# the everyday container<->container/host case where no such window exists.
 #
 # Single-user-scoped by construction: this whole process is one user's own
 # aigw-backend (see BACKEND_SOCKET_PATH), so any session_id that load_meta()
@@ -4163,20 +4978,37 @@ LINKS_PATH = STATE_DIR / "session_links.json"
 # process running *inside* whatever pane the session is, which only ever
 # has ~/sandhome, not this backend's private state directory.
 TALKTO_FILENAME = "talkto_out.jsonl"
-DEFAULT_LINK_MAX_TURNS = 20
-# Lower default when either side is "root": still capped by the unlock
-# window above, but a much shorter leash by default for the one location
-# whose commands run as root.
-DEFAULT_LINK_MAX_TURNS_ROOT = 6
+# How long a link lasts before it disconnects by itself (seconds).
+DEFAULT_LINK_DURATION = 4 * 3600
+# Shorter when either side is "root": still capped by the unlock window
+# above, but a much shorter leash by default for the one location whose
+# commands run as root.
+DEFAULT_LINK_DURATION_ROOT = 30 * 60
+# Upper bound on what a client may ask for (POST /sessions/link's
+# duration_minutes), so a typo can't make a link effectively permanent.
+MAX_LINK_DURATION = 24 * 3600
+
+
+def _default_link_duration(meta_a, meta_b):
+    locations = {(meta_a or {}).get("tmux_location"), (meta_b or {}).get("tmux_location")}
+    return DEFAULT_LINK_DURATION_ROOT if "root" in locations else DEFAULT_LINK_DURATION
 
 
 def _load_links():
     if not LINKS_PATH.exists():
         return {}
     try:
-        return json.loads(LINKS_PATH.read_text())
+        links = json.loads(LINKS_PATH.read_text())
     except (ValueError, OSError):
         return {}
+    # Records from before the time limit (max_turns/turns_used, no
+    # expires_ts): give them the default duration counted from when they
+    # were made, so an old link doesn't become unlimited.
+    for rec in links.values():
+        if "expires_ts" not in rec:
+            dur = _default_link_duration(load_meta(rec["a"]), load_meta(rec["b"]))
+            rec["expires_ts"] = rec.get("created_ts", time.time()) + dur
+    return links
 
 
 def _save_links(links):
@@ -4195,6 +5027,38 @@ def _link_for_session(links, session_id):
     return None, None
 
 
+def _session_is_linked(session_id):
+    with _links_lock:
+        return _link_for_session(_load_links(), session_id)[0] is not None
+
+
+def expire_links():
+    """Disconnects every link whose time is up. Called lazily -- from
+    list_sessions (every session-list poll) and before every relay -- rather
+    than from a timer of its own: nothing is lost by a link outliving its
+    deadline by a few seconds, as long as no message crosses it after."""
+    now = time.time()
+    with _links_lock:
+        expired = [rec["a"] for rec in _load_links().values() if rec["expires_ts"] <= now]
+    for sid in expired:
+        break_link(sid, reason="制限時間に達したため自動切断")
+
+
+def _fmt_duration(sec):
+    sec = max(0, int(sec))
+    h, m = divmod(round(sec / 60), 60)
+    if h and m:
+        return f"{h}時間{m}分"
+    return f"{h}時間" if h else f"{m}分"
+
+
+# How often a linked ssh:<machine> session's remote talkto file is checked
+# (_ssh_take_talkto) -- an ssh round trip each, so much slower than
+# TMUX_POLL_INTERVAL; a talkto message is a conversational turn, not
+# something that needs sub-second latency.
+SSH_TALKTO_POLL_INTERVAL = 2.0
+
+
 def _other_side(rec, session_id):
     return rec["b"] if session_id == rec["a"] else rec["a"]
 
@@ -4205,7 +5069,7 @@ def list_links():
     return [{"id": link_id, **rec} for link_id, rec in links.items()]
 
 
-def create_link(session_a, session_b, max_turns=None):
+def create_link(session_a, session_b, duration_sec=None):
     if session_a == session_b:
         raise ValueError("a session cannot be linked to itself")
     meta_a, meta_b = load_meta(session_a), load_meta(session_b)
@@ -4218,14 +5082,14 @@ def create_link(session_a, session_b, max_turns=None):
         for sid in (session_a, session_b):
             if _link_for_session(links, sid)[0] is not None:
                 raise ValueError(f"session {sid} is already linked -- disconnect it first")
-        if max_turns is None:
-            locations = {meta_a.get("tmux_location"), meta_b.get("tmux_location")}
-            max_turns = DEFAULT_LINK_MAX_TURNS_ROOT if "root" in locations else DEFAULT_LINK_MAX_TURNS
+        if duration_sec is None:
+            duration_sec = _default_link_duration(meta_a, meta_b)
+        duration_sec = max(60, min(int(duration_sec), MAX_LINK_DURATION))
         link_id = uuid.uuid4().hex[:12]
+        now = time.time()
         rec = {
             "a": session_a, "b": session_b,
-            "max_turns": int(max_turns), "turns_used": 0,
-            "created_ts": time.time(),
+            "created_ts": now, "expires_ts": now + duration_sec,
         }
         links[link_id] = rec
         _save_links(links)
@@ -4235,7 +5099,7 @@ def create_link(session_a, session_b, max_turns=None):
     # itself has no other way to learn `talkto` exists or who the other side
     # is.
     note = (f"🔗「{meta_a.get('label', session_a)}」と「{meta_b.get('label', session_b)}」を"
-            f"つなぎました(上限{rec['max_turns']}往復)。")
+            f"つなぎました({_fmt_duration(duration_sec)}で自動切断)。")
     append_event(session_a, {"type": "system", "text": note})
     append_event(session_b, {"type": "system", "text": note})
     # Best-effort: an actual turn in each pane (not just the cosmetic note
@@ -4247,17 +5111,28 @@ def create_link(session_a, session_b, max_turns=None):
     # stance as _relay_to_partner's own UnlockRequired handling. The link
     # itself still exists either way; the human can prime that side by hand
     # (or reopen it once unlocked and prime it themselves).
-    for sid, other_label, other_agent in (
-        (session_a, meta_b.get("label", session_b), _agent_persona_label(meta_b.get("preset"))),
-        (session_b, meta_a.get("label", session_a), _agent_persona_label(meta_a.get("preset"))),
+    for sid, sid_meta, other_label, other_agent in (
+        (session_a, meta_a, meta_b.get("label", session_b), _agent_persona_label(meta_b.get("preset"))),
+        (session_b, meta_b, meta_a.get("label", session_a), _agent_persona_label(meta_a.get("preset"))),
     ):
+        # ssh:<machine> side: drop whatever an earlier talkto left on that
+        # machine while unlinked (the local file's equivalent is consumed and
+        # dropped by every poll, linked or not; the remote one is only polled
+        # while linked), and spell out the absolute path -- ~/.local/bin is
+        # not on every shell's PATH there (a non-login bash on linuxbox,
+        # measured 2026-10-04).
+        location = sid_meta.get("tmux_location", "")
+        ssh_note = ""
+        if location.startswith("ssh:") and location.split(":", 1)[1] in SSH_MACHINES:
+            _ssh_take_talkto(location.split(":", 1)[1], sid)
+            ssh_note = "(`talkto`が見つからない場合は`~/.local/bin/talkto`)"
         priming = (
             f"[aigwセッション連携] このセッションは「{other_label}」という別の{other_agent}"
             f"のセッションとつながりました。相手に話しかけたいときは、内容を引数にして"
-            f"`talkto \"内容\"` を実行してください -- そのテキストがそのまま相手への次の"
+            f"`talkto \"内容\"` を実行してください{ssh_note} -- そのテキストがそのまま相手への次の"
             "メッセージとして届きます(あなたの応答を自動転送する仕組みではないので、"
             "送りたい内容は自分でtalktoに渡してください)。最大"
-            f"{rec['max_turns']}往復で自動的に切断されます。"
+            f"{_fmt_duration(duration_sec)}で自動的に切断されます。"
         )
         try:
             send_message(sid, priming, submit=True)
@@ -4294,7 +5169,7 @@ def _relay_to_partner(session_id, text):
     """Called from _watch_talkto_file, below, for every line Claude itself
     chose to write via `talkto`. Best-effort and silent about anything other
     than the two outcomes described in this section's own comment above
-    (skipped hop / cap reached) -- a relay failure must never take down the
+    (skipped hop / time limit reached) -- a relay failure must never take down the
     tailer thread that triggered it."""
     with _links_lock:
         links = _load_links()
@@ -4302,20 +5177,19 @@ def _relay_to_partner(session_id, text):
         if link_id is None:
             return
         partner = _other_side(rec, session_id)
-        next_count = rec["turns_used"] + 1
     partner_meta = load_meta(partner)
     if partner_meta is None or partner_meta.get("stopped"):
         break_link(session_id, reason="相手のセッションが終了しました")
         return
-    if next_count > rec["max_turns"]:
-        break_link(session_id, reason=f"上限{rec['max_turns']}往復に達したため自動切断")
+    if time.time() >= rec["expires_ts"]:
+        break_link(session_id, reason="制限時間に達したため自動切断")
         return
     origin_meta = load_meta(session_id)
     origin_label = (origin_meta or {}).get("label", session_id)
     try:
         send_message(partner, text, submit=True, from_user=f"🔗 {origin_label}")
     except UnlockRequired:
-        # Skipped, not consumed against max_turns or disconnected -- see this
+        # Skipped, not disconnected -- see this
         # section's own comment on why this is the real backstop for a link
         # touching host/root.
         append_event(session_id, {
@@ -4326,11 +5200,6 @@ def _relay_to_partner(session_id, text):
     except (RuntimeError, subprocess.TimeoutExpired) as e:
         break_link(session_id, reason=f"相手への送信に失敗したため自動切断: {e}")
         return
-    with _links_lock:
-        links = _load_links()
-        if link_id in links:
-            links[link_id]["turns_used"] = next_count
-            _save_links(links)
 
 
 def _read_new_talkto_lines(path, offset):
@@ -4353,18 +5222,64 @@ def _read_new_talkto_lines(path, offset):
         chunk = f.read(size - offset)
     *complete, remainder = chunk.split(b"\n")
     new_offset = size - len(remainder)
+    return new_offset, _parse_talkto_lines(complete)
+
+
+def _parse_talkto_lines(lines):
+    """Texts from complete talkto JSON lines (bytes). Two shapes: the local
+    talkto's {"ts", "text"}, and the ssh:<machine> talkto-remote's
+    {"ts", "b64"} (base64 of the UTF-8 text -- plain bash on MSYS2 has no
+    JSON encoder, see that script's own comment)."""
     texts = []
-    for raw in complete:
+    for raw in lines:
         if not raw.strip():
             continue
         try:
             obj = json.loads(raw)
         except ValueError:
             continue
-        text = obj.get("text") if isinstance(obj, dict) else None
+        if not isinstance(obj, dict):
+            continue
+        text = obj.get("text")
+        if text is None and isinstance(obj.get("b64"), str):
+            try:
+                text = base64.b64decode(obj["b64"], validate=True).decode("utf-8", errors="replace")
+            except ValueError:
+                continue
         if isinstance(text, str) and text.strip():
             texts.append(text)
-    return new_offset, texts
+    return texts
+
+
+def _ssh_take_talkto(machine, session_id):
+    """ssh:<machine> counterpart of _read_new_talkto_lines: returns the texts
+    talkto-remote has appended to $HOME/.aigw-talkto/<session_id>.jsonl on
+    that machine since the last call, or [] (missing file, unreachable).
+
+    Take-and-delete rather than an offset: the file is renamed to .taking
+    (atomic, so a concurrent talkto append lands either in the renamed file
+    or in a fresh one) and printed, then removed. With no offset to lose,
+    a backend restart neither replays already-relayed lines nor needs to
+    skip anything. A .taking left behind by an interrupted call is printed
+    first on the next one (at worst a duplicate, never a loss)."""
+    if not SESSION_ID_RE.match(session_id):
+        return []
+    agent = _ssh_agent(machine)
+    if agent is not None:
+        try:
+            r = agent.request("take_talkto", session=session_id)
+            if r.get("rc") == 0:
+                data = base64.b64decode(r.get("data_b64") or "")
+                return _parse_talkto_lines(data.split(b"\n")) if data else []
+        except (SshAgentUnavailable, ValueError):
+            pass
+    cmd = (f'f="$HOME/.aigw-talkto/{session_id}.jsonl"; t="$f.taking"; '
+           'if [ ! -f "$t" ]; then [ -f "$f" ] || exit 0; mv -f "$f" "$t" || exit 0; fi; '
+           'cat "$t" && rm -f "$t"')
+    r = _ssh_invoke(machine, cmd, timeout=10, text=False)
+    if r.returncode != 0 or not r.stdout:
+        return []
+    return _parse_talkto_lines(r.stdout.split(b"\n"))
 
 
 def _poll_talkto_file(session_id, talkto_path, offset):
@@ -4494,7 +5409,12 @@ def ensure_watcher(session_id):
     # (see _tail_claude_transcript) -- a second, independent thread, not a
     # replacement for it, since the tmux watcher above still owns the screen
     # panel and dead-pane detection either way.
-    if meta and meta.get("preset") == "claude-tui":
+    # The Email preset (MAIL_PRESETS) runs the same interactive Claude Code,
+    # just inside the second sandbox: its log is readable from here too
+    # (_tail_claude_transcript's MAIL_PRESETS branch), so it gets the same
+    # transcript-fed chat instead of capture-pane guesswork, which dropped
+    # replies (2026-10-04, user report "チャットに全部のClaudeの応答がのらない").
+    if meta and (meta.get("preset") == "claude-tui" or meta.get("preset") in MAIL_PRESETS):
         ensure_transcript_tailer(session_id)
     elif meta and meta.get("preset") not in HEADLESS_PRESETS:
         # "shell"/"host-shell"/"root-shell"/"attach": no fixed cwd or fixed
@@ -4721,7 +5641,7 @@ def _live_pane_cwd(location, tmux_name):
     that has not finished starting up, say) -- exactly as good as not
     seeding at all, which is what happens without this."""
     try:
-        r = tmux_exec(location, ["display-message", "-p", "-t", tmux_name, "#{pane_current_path}"])
+        r = tmux_query(location, ["display-message", "-p", "-t", tmux_name, "#{pane_current_path}"])
     except subprocess.TimeoutExpired:
         return None
     if r.returncode != 0:
@@ -4828,11 +5748,26 @@ def _watch_tmux_session(session_id):
     # this is only the one-time value used to seed _screen_backlog before
     # that loop has queried anything of its own.
     static_cwd = meta.get("cwd")
+    if not static_cwd and preset in MAIL_PRESETS:
+        # The pane's foreground process is `sudo` (root-owned), so tmux
+        # cannot report its pane_current_path at all -- without a fixed cwd
+        # _screen_log_path had nothing to key on and the screen panel's
+        # scrolled-off history was never persisted (2026-10-04, user report
+        # "ターミナル画面の履歴が残らない"). The mailbox dir is where Claude
+        # Code runs in there anyway.
+        static_cwd = str(MAILBOX["dir"])
     cwd = static_cwd if static_cwd else _live_pane_cwd(location, tmux_name)
     sdir = session_dir(session_id)
     outbox = sdir / "outbox"
     talkto_path = sdir / TALKTO_FILENAME
     talkto_offset = 0
+    # ssh:<machine>: talkto lands on that machine instead (_ssh_take_talkto),
+    # polled only while linked and at its own slower cadence -- each poll is
+    # an ssh round trip, unlike the local stat above.
+    ssh_machine = location.split(":", 1)[1] if location.startswith("ssh:") else None
+    if ssh_machine not in SSH_MACHINES:
+        ssh_machine = None
+    last_ssh_talkto_poll = 0.0
     seen_files = _already_announced_attachments(session_id)
     committed_lines = []
     pending_line = None
@@ -4850,12 +5785,40 @@ def _watch_tmux_session(session_id):
         with _screen_backlog_lock:
             _screen_backlog[session_id] = _seed_lines
     last_liveness_check = 0.0
+    # Change signal for this pane (see _ScreenSignal): with it, the capture
+    # below only runs while the pane is producing output (plus
+    # SCREEN_SIGNAL_TAIL after) and every SCREEN_SAFETY_INTERVAL; without it
+    # (ssh:<machine>, or the pipe could not be set up -- a locked root
+    # window, say), every poll captures, as before.
+    screen_signal = None
+    if location in TMUX_CTL_LOCATIONS:
+        try:
+            screen_signal = _ScreenSignal(str(sdir / SCREEN_FIFO_NAME))
+            if not _start_screen_pipe(location, tmux_name, screen_signal.path):
+                screen_signal.close()
+                screen_signal = None
+        except OSError as e:
+            log(f"screen signal for {session_id} unavailable ({e}); polling instead")
+            screen_signal = None
+    elif ssh_machine is not None and _ssh_agent(ssh_machine) is not None:
+        try:
+            screen_signal = _RemoteScreenSignal(_ssh_agent(ssh_machine), tmux_name)
+        except SshAgentUnavailable as e:
+            log(f"agent screen signal for {session_id} unavailable ({e}); polling instead")
+            screen_signal = None
+    last_capture = 0.0
+    dead_wait_until = None
     try:
         while True:
             time.sleep(TMUX_POLL_INTERVAL)
 
             _scan_outbox_for_attachments(session_id, outbox, seen_files)
             talkto_offset = _poll_talkto_file(session_id, talkto_path, talkto_offset)
+            if ssh_machine is not None and time.time() - last_ssh_talkto_poll > SSH_TALKTO_POLL_INTERVAL:
+                last_ssh_talkto_poll = time.time()
+                if _session_is_linked(session_id):
+                    for text in _ssh_take_talkto(ssh_machine, session_id):
+                        _relay_to_partner(session_id, text)
 
             # -J joins lines the pane wrapped, so what comes back is what the
             # program printed rather than what happened to fit. Without it a
@@ -4890,30 +5853,34 @@ def _watch_tmux_session(session_id):
             # timed this out and the session looked frozen for hours).
             # Anything other than a timeout is still a genuine bug and
             # still fatal to this thread, via the existing outer handler.
-            try:
-                r = tmux_exec(location, [
-                    "capture-pane", "-p", "-J", "-S", f"-{TMUX_CAPTURE_HISTORY_LINES}", "-t", tmux_name,
-                    # "|" not " ": #{pane_dead_status} is the empty string
-                    # (not "0") on a live pane, and a plain str.split() with
-                    # no separator collapses that run of two spaces into one
-                    # delimiter -- silently shifting #{pane_height} into
-                    # dead_fields[1] instead of [2] (measured 2026-08-31,
-                    # while adding pane_height: a live pane's screen was
-                    # coming back at SCREEN_LINES/50 lines regardless of its
-                    # real height). Same fix the deployment notes
-                    # already made for the same class of bug with a literal
-                    # tab (which tmux silently mangles into "_" instead --
-                    # "|" has neither problem: not whitespace, not touched).
-                    ";", "display-message", "-p", "-t", tmux_name,
-                    "#{pane_dead}|#{pane_dead_status}|#{pane_height}|#{pane_current_path}",
-                ])
-            except subprocess.TimeoutExpired:
-                log(f"tmux capture-pane for {session_id} timed out; skipping this poll")
-                continue
-            if r.returncode == 0:
+            r = None
+            if screen_signal is None or screen_signal.want_capture(last_capture):
+                last_capture = time.time()
+                try:
+                    r = tmux_query(location, [
+                        "capture-pane", "-p", "-J", "-S", f"-{TMUX_CAPTURE_HISTORY_LINES}", "-t", tmux_name,
+                        # "|" not " ": #{pane_dead_status} is the empty string
+                        # (not "0") on a live pane, and a plain str.split() with
+                        # no separator collapses that run of two spaces into one
+                        # delimiter -- silently shifting #{pane_height} into
+                        # dead_fields[1] instead of [2] (measured 2026-08-31,
+                        # while adding pane_height: a live pane's screen was
+                        # coming back at SCREEN_LINES/50 lines regardless of its
+                        # real height). Same fix the deployment notes
+                        # already made for the same class of bug with a literal
+                        # tab (which tmux silently mangles into "_" instead --
+                        # "|" has neither problem: not whitespace, not touched).
+                        ";", "display-message", "-p", "-t", tmux_name,
+                        "#{pane_dead}|#{pane_dead_status}|#{pane_height}|#{pane_pipe}|#{pane_current_path}",
+                    ])
+                except subprocess.TimeoutExpired:
+                    log(f"tmux capture-pane for {session_id} timed out; skipping this poll")
+                    continue
+            if r is not None and r.returncode == 0:
                 stdout = r.stdout[:-1] if r.stdout.endswith("\n") else r.stdout
                 capture_text, _, dead_line = stdout.rpartition("\n")
-                dead_fields = dead_line.split("|")
+                # maxsplit: pane_current_path is last and may itself contain "|".
+                dead_fields = dead_line.split("|", 4)
                 pane_dead = bool(dead_fields) and dead_fields[0] == "1"
                 pane_dead_status = int(dead_fields[1]) if len(dead_fields) > 1 and dead_fields[1].isdigit() else None
                 # This session's *actual current* pane height, not the
@@ -4933,8 +5900,15 @@ def _watch_tmux_session(session_id):
                 # value at all, and even one that does can still `cd`
                 # elsewhere by hand over its life, so this is re-read every
                 # poll rather than cached once.
-                pane_cwd = dead_fields[3] if len(dead_fields) > 3 and dead_fields[3] else None
+                pane_cwd = dead_fields[4] if len(dead_fields) > 4 and dead_fields[4] else None
                 cwd = static_cwd if static_cwd else pane_cwd
+                # The change-signal `cat` died (e.g. it wrote while this
+                # backend was down and had no reader): reattach it.
+                if screen_signal is not None and not pane_dead and len(dead_fields) > 3 and dead_fields[3] == "0":
+                    if isinstance(screen_signal, _RemoteScreenSignal):
+                        screen_signal.reattach()
+                    else:
+                        _start_screen_pipe(location, tmux_name, screen_signal.path)
 
                 new_lines = [l.rstrip() for l in clean_terminal_text(capture_text).split("\n")]
                 while new_lines and new_lines[-1] == "":
@@ -4959,7 +5933,22 @@ def _watch_tmux_session(session_id):
                 # i.e. genuinely unknown, since some exit status beats
                 # reporting this session as still alive forever).
                 if dead_status is None and pane_dead:
-                    dead_status = pane_dead_status if pane_dead_status is not None else 0
+                    # tmux can report the pane dead a moment before it has
+                    # reaped the process and filled in #{pane_dead_status}
+                    # (seen as "1||..." with no "Pane is dead" line yet).
+                    # Capturing right on the change signal hits that window
+                    # every time (measured 2026-10-05: exit 4 recorded as 0),
+                    # so give it up to 2s of further polls before
+                    # defaulting to 0.
+                    if pane_dead_status is not None:
+                        dead_status = pane_dead_status
+                    else:
+                        if dead_wait_until is None:
+                            dead_wait_until = time.time() + 2
+                        if time.time() >= dead_wait_until:
+                            dead_status = 0
+                        else:
+                            last_capture = 0.0  # capture again on the next poll
 
                 # Record whatever just permanently scrolled off the top of
                 # this pane into _screen_backlog, before it is gone for
@@ -5066,7 +6055,7 @@ def _watch_tmux_session(session_id):
                 # poll after it exits (the row-count reset that follows is
                 # the same "pane shrank" recovery already used for a bare
                 # `clear`, not special-cased here).
-                if preset != "claude-tui" and not _claude_foreground.get(session_id):
+                if preset != "claude-tui" and preset not in MAIL_PRESETS and not _claude_foreground.get(session_id):
                     baseline_len = len(committed_lines) + (1 if pending_line is not None else 0)
 
                     if not new_lines:
@@ -5152,6 +6141,9 @@ def _watch_tmux_session(session_id):
                     return
     except Exception as e:  # watcher must never crash the process
         log(f"attach watcher for {session_id} exiting on error: {e}")
+    finally:
+        if screen_signal is not None:
+            screen_signal.close()
 
 
 CLAUDE_TRANSCRIPT_POLL_INTERVAL = 0.5
@@ -5293,7 +6285,16 @@ def _tail_claude_transcript(session_id):
     meta = load_meta(session_id)
     if meta is None:
         return
-    proj_dir = claude_project_dir(meta.get("cwd"))
+    if meta.get("preset") in MAIL_PRESETS:
+        # Inside the second sandbox $HOME is the mailbox dir itself and
+        # Claude Code runs in it as its cwd (`sandbox new <name> <dir>`), so
+        # the log is <dir>/.claude/projects/<dir-key>/ on this side of the
+        # bind mount. No --session-id can be passed through `sandbox
+        # --claude`, so claude_session_id starts out None and the "newest
+        # fresh .jsonl" discovery below finds it.
+        proj_dir = claude_project_dir(str(MAILBOX["dir"]), home=MAILBOX["dir"])
+    else:
+        proj_dir = claude_project_dir(meta.get("cwd"))
     claude_session_id = meta.get("claude_session_id")
     # A pre-assigned id (create_session's assigned_claude_session_id,
     # the deployment notes) leaves claude_session_id
@@ -5375,8 +6376,17 @@ def _tail_claude_transcript(session_id):
         # existed) falls back to scanning the directory for whichever new
         # .jsonl appears.
         if claude_session_id is None:
+            # A mail-tui session never has its id up front (see the
+            # MAIL_PRESETS branch above), so after a backend restart its
+            # already-existing log would count as "known" and never be
+            # picked up again. For it, only logs untouched since the session
+            # was created count as known; one written to since is a
+            # candidate (offset still starts at its current end below, so
+            # nothing is replayed).
+            created = meta.get("created_ts", 0) if meta.get("preset") in MAIL_PRESETS else None
             try:
-                known = {p.name for p in proj_dir.iterdir() if p.suffix == ".jsonl"}
+                known = {p.name for p in proj_dir.iterdir() if p.suffix == ".jsonl"
+                         and (created is None or p.stat().st_mtime < created)}
             except OSError:
                 known = set()
         target_path = None
@@ -5633,6 +6643,10 @@ def _watch_shell_claude(session_id):
     preassigned_id = meta.get("claude_session_id")
 
     active = False
+    active_since = 0.0
+    ssh_adopt_baseline = None
+    ssh_adopt_sizes = None
+    local_adopt_sizes = None
     target_path = None  # local Path -- only used when not is_ssh
     target_name = None  # remote filename -- only used when is_ssh
     remote_key = None   # cached [A-Za-z0-9-] project-dir key -- only when is_ssh
@@ -5665,7 +6679,7 @@ def _watch_shell_claude(session_id):
             # transient timeout must not permanently end this watcher (no
             # supervisor ever restarts it within this process's lifetime).
             try:
-                r = tmux_exec(location, ["display-message", "-p", "-t", tmux_name,
+                r = tmux_query(location, ["display-message", "-p", "-t", tmux_name,
                                           "#{pane_current_command}|#{pane_current_path}"])
             except subprocess.TimeoutExpired:
                 log(f"tmux display-message for {session_id} timed out; skipping this poll")
@@ -5686,6 +6700,7 @@ def _watch_shell_claude(session_id):
 
             if not active:
                 active = True
+                active_since = time.time()
                 with _claude_foreground_lock:
                     _claude_foreground[session_id] = True
                 # 2026-09-01 (the deployment notes): a
@@ -5896,7 +6911,39 @@ def _watch_shell_claude(session_id):
                     if target_name is None:
                         continue  # every fresh candidate already belongs to another session
                 chunk, size = _ssh_read_new(machine, remote_key, target_name, offset)
-                if size is None or size <= offset:
+                if size is None:
+                    # ssh:<machine> counterpart of the FileNotFoundError
+                    # branch below (`claude -r` resumed instead of using the
+                    # pre-assigned id). That machine's clock need not match
+                    # this host's, so "written since claude came to the
+                    # foreground" is judged by comparing two listings of its
+                    # own mtimes rather than against active_since.
+                    if (preassigned_id and remote_key and target_name == f"{preassigned_id}.jsonl"
+                            and time.time() - active_since >= PREASSIGNED_GRACE_SECONDS):
+                        snap = dict(_ssh_list_jsonl(machine, remote_key))
+                        if ssh_adopt_baseline is None:
+                            ssh_adopt_sizes = _ssh_jsonl_sizes(machine, remote_key)
+                        if ssh_adopt_baseline is not None:
+                            moved = sorted(((mt, n) for n, mt in snap.items()
+                                            if n != target_name and mt > ssh_adopt_baseline.get(n, -1.0)),
+                                           reverse=True)
+                            for _, name in moved:
+                                if _claim_transcript(f"ssh:{machine}:{remote_key}", name, session_id):
+                                    # From its size when the grace period began, so the
+                                    # very write that revealed it is not skipped.
+                                    target_name, buf = name, b""
+                                    offset = (ssh_adopt_sizes or {}).get(name, 0)
+                                    preassigned_id = name[:-len(".jsonl")]
+                                    meta = load_meta(session_id)
+                                    if meta is not None:
+                                        meta["claude_session_id"] = preassigned_id
+                                        save_meta(session_id, meta)
+                                    log(f"shell-claude watcher for {session_id}: following resumed conversation "
+                                        f"{preassigned_id} on {machine}")
+                                    break
+                        ssh_adopt_baseline = snap
+                    continue
+                if size <= offset:
                     continue
                 offset = size
                 buf += chunk
@@ -5928,6 +6975,29 @@ def _watch_shell_claude(session_id):
 
                 try:
                     size = target_path.stat().st_size
+                except FileNotFoundError:
+                    # The pre-assigned id's file never appearing means
+                    # `claude` was started some other way than the
+                    # --session-id the injected wrapper adds -- typically
+                    # `claude -r`/`--resume`, which the wrapper deliberately
+                    # leaves alone (2026-10-05: a root-shell resumed this
+                    # way waited on a file that would never exist and ended
+                    # up warning about a "permission error"). A missing
+                    # file is not an ACL problem, so it no longer counts
+                    # toward _note_transcript_read_failure; after a grace
+                    # period, follow the conversation actually being
+                    # written instead (see _adopt_resumed_transcript).
+                    if (preassigned_id and target_path.name == f"{preassigned_id}.jsonl"
+                            and time.time() - active_since >= PREASSIGNED_GRACE_SECONDS):
+                        if local_adopt_sizes is None:
+                            local_adopt_sizes = _local_jsonl_sizes(target_path.parent)
+                        adopted = _adopt_resumed_transcript(session_id, target_path.parent, active_since,
+                                                            local_adopt_sizes)
+                        if adopted is not None:
+                            target_path, offset = adopted
+                            buf = b""
+                            preassigned_id = target_path.stem
+                    continue
                 except OSError:
                     acl_fail_since, acl_regrant_idx, acl_error_sent = _note_transcript_read_failure(
                         session_id, location, acl_fail_since, acl_regrant_idx, acl_error_sent)
@@ -5968,6 +7038,48 @@ def _watch_shell_claude(session_id):
             _claude_foreground.pop(session_id, None)
 
 
+# How long a pre-assigned conversation id may stay without its file before
+# _watch_shell_claude concludes `claude` was resumed some other way.
+PREASSIGNED_GRACE_SECONDS = 10
+
+
+def _local_jsonl_sizes(proj_dir):
+    try:
+        return {p.name: p.stat().st_size for p in proj_dir.iterdir() if p.suffix == ".jsonl"}
+    except OSError:
+        return {}
+
+
+def _adopt_resumed_transcript(session_id, proj_dir, since, start_sizes=None):
+    """The conversation this pane's `claude` is really writing, when it is
+    not the pre-assigned one: the newest .jsonl in the same project dir that
+    has been written since `since` (when claude came to the foreground) and
+    that no other aigw session has claimed. Returns (path, offset) with
+    offset at its size in `start_sizes` (taken when the grace period began)
+    if given, else at its current end -- either way a resumed
+    conversation's earlier turns are not replayed into the chat -- and
+    records it as the session's claude_session_id, or None if nothing
+    qualifies yet."""
+    try:
+        candidates = sorted(((p, p.stat()) for p in proj_dir.iterdir()
+                             if p.suffix == ".jsonl" and CLAUDE_CONV_ID_RE.match(p.stem)),
+                            key=lambda e: e[1].st_mtime, reverse=True)
+    except OSError:
+        return None
+    for path, st in candidates:
+        if st.st_mtime < since:
+            break
+        if _claim_transcript(str(proj_dir), path.name, session_id):
+            meta = load_meta(session_id)
+            if meta is not None:
+                meta["claude_session_id"] = path.stem
+                save_meta(session_id, meta)
+            log(f"shell-claude watcher for {session_id}: following resumed conversation {path.stem}")
+            start = (start_sizes or {}).get(path.name)
+            return path, (start if start is not None and start <= st.st_size else st.st_size)
+    return None
+
+
 def _resolve_claude_conversation(session_id):
     """Which Claude Code conversation (project dir + conversation id,
     local or on an ssh:<machine>) an aigw session is currently driving, for
@@ -6006,7 +7118,7 @@ def _resolve_claude_conversation(session_id):
 
     location = meta.get("tmux_location", "container")
     tmux_name = meta.get("tmux_name", session_id)
-    r = tmux_exec(location, ["display-message", "-p", "-t", tmux_name,
+    r = tmux_query(location, ["display-message", "-p", "-t", tmux_name,
                               "#{pane_current_command}|#{pane_current_path}"])
     if r.returncode != 0:
         return None
@@ -6610,9 +7722,26 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["capabilities"]:
             unlock = _unlockd_call("status")
             reachable = reachable_ssh_machines()
+            # Desktop variants (SSH_MACHINES schema comment) are not machines
+            # of their own in the picker: the frontend shows their base
+            # machine once, with a 🐚/🪟 toggle that swaps the preset to the
+            # variant's (the deployment notes). So they are left out of
+            # ssh_machines and reported as {base: variant} instead.
+            desktop = {SSH_MACHINES[m]["ssh_host"]: m for m in reachable
+                       if SSH_MACHINES[m].get("ssh_host") and SSH_MACHINES[m]["ssh_host"] in reachable}
+            reachable = [m for m in reachable if not SSH_MACHINES[m].get("ssh_host")]
             return self._json(200, {
                 "root_shell": root_shell_allowed(),
+                # The second-sandbox preset, reported the same way
+                # root_shell is and for the same reason: the option must not
+                # appear on a host that has no such sandbox configured,
+                # where picking it could only ever fail with "unknown
+                # preset". Carries the label so the config file names it
+                # ("Email" here) rather than this file hard-coding what a
+                # given deployment uses its second sandbox for.
+                "mailbox": {"label": MAILBOX["label"]} if MAILBOX else None,
                 "ssh_machines": reachable,
+                "ssh_desktop": desktop,
                 # Which of the reachable machines also offer the drive/folder
                 # picker on their Claude preset (the deployment notes) --
                 # winbox-a/winbox-b, not linuxbox. The frontend only shows
@@ -6997,7 +8126,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": str(e)})
             return self._json(201, meta)
 
-        # {"a": id, "b": id, "max_turns": int?} -- see create_link's own
+        # {"a": id, "b": id, "duration_minutes": number?} -- see create_link's own
         # comment for validation/defaults. No unlock gate here: creating the
         # record itself does nothing outside the sandbox on its own, that
         # happens (and is gated) per relayed message, in send_message via
@@ -7005,7 +8134,11 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["sessions", "link"]:
             body = self._read_json_body() or {}
             try:
-                rec = create_link(body.get("a"), body.get("b"), body.get("max_turns"))
+                mins = body.get("duration_minutes")
+                if mins is not None and (isinstance(mins, bool) or not isinstance(mins, (int, float)) or mins <= 0):
+                    raise ValueError("duration_minutes must be a positive number")
+                rec = create_link(body.get("a"), body.get("b"),
+                                  None if mins is None else int(mins * 60))
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
             return self._json(201, rec)
@@ -7576,6 +8709,11 @@ class UnixHTTPServer(ThreadingHTTPServer):
 
 def main():
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    if MAIL_SESSIONS_DIR is not None:
+        # 0700: this tree holds the chat log of whatever the second sandbox
+        # exists to keep private. Its parent is the user's own directory
+        # already, so this only stops a future umask from widening it.
+        MAIL_SESSIONS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     list_sessions()  # starts watchers for any pre-existing sessions
 

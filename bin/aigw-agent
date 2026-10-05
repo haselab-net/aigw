@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""aigw-agent -- runs on an ssh:<machine> (the deployment notes), started by
+aigw-backend over one long-lived ssh channel and spoken to in JSON lines on
+stdin/stdout, so that the backend's polling no longer starts a remote bash +
+tmux (or stat/tail) per poll -- on the Windows machines each such MSYS2
+process start/exit was both the load and, on one of them, the trigger of a
+recurring bugcheck (2026-10-05).
+
+Standard library only; runs under the machine's native Python (python.org's
+on Windows, NOT an MSYS2/Cygwin one, whose process exits are exactly what
+this avoids).
+
+Requests (one JSON object per line, "id" echoed back in the reply):
+  {"op": "hello"}
+  {"op": "tmux", "args": [...]}        read-only tmux query, over a resident
+                                       `tmux -C` client (see TmuxCtl)
+  {"op": "watch", "session": NAME}     attach a change signal to that pane
+  {"op": "unwatch", "session": NAME}
+  {"op": "read", "path": REL, "offset": N, "max": N}
+                                       bytes of $HOME/REL from offset (base64)
+  {"op": "take_talkto", "session": SID} talkto-remote's queued lines, removed
+  {"op": "project_key", "posix_cwd": P} Claude Code's ~/.claude/projects key
+                                       for that cwd (no `cygpath` process)
+  {"op": "list_jsonl", "key": K}       [[name, mtime, size], ...] in that project dir
+Events (no "id"): {"ev": "changed", "session": NAME}
+
+Change signal: tmux runs `pipe-pane -O 'exec cat >> <file>'` for the pane and
+this process watches the file's size (an in-process os.stat, no child
+process) -- a FIFO would be cheaper still, but a native Windows Python cannot
+open an MSYS2 FIFO, so a plain file is used on every platform alike, and
+truncated once it grows (cat appends, so it simply continues at the new end).
+"""
+import base64
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+
+CTL_SESSION = "_aigw-ctl"
+CTL_TIMEOUT = 10
+SIGNAL_POLL = 0.2
+SIGNAL_TRUNCATE = 1 << 20
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+IS_WINDOWS = os.name == "nt"
+
+_out_lock = threading.Lock()
+
+
+def emit(obj):
+    line = json.dumps(obj, ensure_ascii=True) + "\n"
+    with _out_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+def home_native():
+    return os.path.expanduser("~")
+
+
+def to_posix(path):
+    """C:\\Users\\x\\f -> /c/Users/x/f (what MSYS2's sh, which runs pipe-pane's
+    command, understands). Identity on POSIX."""
+    if not IS_WINDOWS:
+        return path
+    p = path.replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        p = "/" + p[0].lower() + p[2:]
+    return p
+
+
+class TmuxCtl:
+    """One resident `tmux -C` client attached to CTL_SESSION. Same protocol
+    handling as aigw-backend's TmuxControl: one %begin/%end (or %error) block
+    per ";"-separated command, a failing command ends the list early."""
+
+    def __init__(self, tmux_argv, script):
+        self.tmux_argv = tmux_argv          # e.g. ["/usr/bin/tmux", "-L", "aigw-desktop"]
+        self.script = script                # MSYS2 `script` for a pty on Windows, or None
+        self.lock = threading.Lock()
+        self.proc = None
+        self.blocks = queue.Queue()
+        self.next_retry = 0.0
+
+    def _argv(self):
+        attach = ["-C", "new-session", "-A", "-s", CTL_SESSION, "-x", "80", "-y", "24", "cat"]
+        if self.script:
+            # MSYS2 tmux in control mode answers nothing on a plain pipe; under
+            # `script` (a pty) it works (measured 2026-10-05). Lines then end
+            # in CRLF, handled in _reader.
+            cmd = " ".join(_sh_quote(a) for a in [*self.tmux_argv, *attach])
+            return [self.script, "-qfc", f"stty -echo; exec {cmd}", "/dev/null"]
+        return [*self.tmux_argv, *attach]
+
+    def _reader(self, proc):
+        in_block, buf = False, []
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").rstrip("\n").rstrip("\r")
+            if not in_block:
+                if line.startswith("%begin "):
+                    in_block, buf = True, []
+                continue
+            if line.startswith("%end ") or line.startswith("%error "):
+                self.blocks.put((line.startswith("%end "), buf))
+                in_block = False
+                continue
+            buf.append(line)
+        self.blocks.put(None)
+
+    def _wait(self):
+        try:
+            item = self.blocks.get(timeout=CTL_TIMEOUT)
+        except queue.Empty:
+            raise RuntimeError("control client timed out")
+        if item is None:
+            raise RuntimeError("control client exited")
+        return item
+
+    def _send(self, line, n):
+        self.proc.stdin.write((line + "\n").encode("utf-8"))
+        self.proc.stdin.flush()
+        ok_all, lines_all = True, []
+        for _ in range(n):
+            ok, lines = self._wait()
+            lines_all.extend(lines)
+            if not ok:
+                ok_all = False
+                break
+        return ok_all, lines_all
+
+    def _start(self):
+        # Never be the one to start the tmux server: `new-session -A` would,
+        # and for a desktop variant (the deployment notes) that server must only
+        # ever be started inside the user's interactive session, never from
+        # ssh (session 0). If no server is running there is nothing to watch
+        # anyway; the backend's new-session (which handles the desktop case)
+        # starts it, and the next query attaches.
+        r = subprocess.run([*self.tmux_argv, "list-sessions"], capture_output=True, text=True,
+                           timeout=30, stdin=subprocess.DEVNULL)
+        err = (r.stderr or "").lower()
+        if r.returncode != 0 and ("no server running" in err or "error connecting" in err):
+            raise RuntimeError("no tmux server running")
+        self.proc = subprocess.Popen(self._argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.DEVNULL, bufsize=0)
+        self.blocks = queue.Queue()
+        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+        self._wait()                                   # the attach's own block
+        self._send("refresh-client -f ignore-size", 1)
+
+    def _stop(self, retry_after=30):
+        proc, self.proc = self.proc, None
+        self.next_retry = time.time() + retry_after
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+    def query(self, args):
+        for a in args:
+            if a != ";" and ("'" in a or "\n" in a or "\r" in a):
+                raise ValueError("argument not representable on the control channel")
+        line = " ".join(a if a == ";" else "'" + a + "'" for a in args)
+        n = 1 + sum(1 for a in args if a == ";")
+        with self.lock:
+            if self.proc is None or self.proc.poll() is not None:
+                if self.proc is not None:
+                    self._stop()
+                if time.time() < self.next_retry:
+                    raise RuntimeError("control client in retry backoff")
+                try:
+                    self._start()
+                except Exception as e:
+                    # "no server yet" clears up as soon as a session is
+                    # created, so retry soon; anything else waits longer.
+                    self._stop(3 if "no tmux server" in str(e) else 30)
+                    raise
+            try:
+                return self._send(line, n)
+            except Exception:
+                self._stop()
+                raise
+
+
+def _sh_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+class Agent:
+    def __init__(self, tmux_argv, script):
+        self.tmux_argv = tmux_argv
+        self.ctl = TmuxCtl(tmux_argv, script)
+        self.signal_dir = os.path.join(home_native(), ".aigw-agent", "signals")
+        os.makedirs(self.signal_dir, exist_ok=True)
+        self.watched = {}                              # session -> last seen size
+        self.watched_lock = threading.Lock()
+        threading.Thread(target=self._watch_loop, daemon=True).start()
+
+    # -- tmux
+    def tmux_direct(self, args):
+        # stdin=DEVNULL: otherwise the child inherits this agent's own stdin
+        # (the ssh channel requests arrive on) -- an MSYS2 tmux client then
+        # swallowed the following requests and the agent saw EOF and exited
+        # (measured 2026-10-05 on winbox-a).
+        r = subprocess.run([*self.tmux_argv, *args], capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout, r.stderr
+
+    def op_tmux(self, req):
+        args = req["args"]
+        try:
+            ok, lines = self.ctl.query(args)
+            out = "\n".join(lines) + ("\n" if lines else "")
+            return {"rc": 0 if ok else 1, "stdout": out if ok else "", "stderr": "" if ok else out}
+        except (RuntimeError, ValueError, OSError):
+            rc, out, err = self.tmux_direct(args)
+            return {"rc": rc, "stdout": out, "stderr": err, "fallback": True}
+
+    # -- change signal
+    def _signal_path(self, session):
+        return os.path.join(self.signal_dir, session + ".out")
+
+    def op_watch(self, req):
+        session = req["session"]
+        if not SESSION_RE.match(session):
+            return {"rc": 1, "stderr": "bad session name"}
+        path = self._signal_path(session)
+        open(path, "ab").close()
+        rc, _, err = self.tmux_direct(["pipe-pane", "-O", "-t", session,
+                                       f"exec cat >> '{to_posix(path)}'"])
+        with self.watched_lock:
+            self.watched[session] = os.path.getsize(path)
+        return {"rc": rc, "stderr": err}
+
+    def op_unwatch(self, req):
+        with self.watched_lock:
+            self.watched.pop(req.get("session"), None)
+        return {"rc": 0}
+
+    def _watch_loop(self):
+        while True:
+            time.sleep(SIGNAL_POLL)
+            with self.watched_lock:
+                items = list(self.watched.items())
+            for session, last in items:
+                path = self._signal_path(session)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size != last:
+                    if size > SIGNAL_TRUNCATE:
+                        try:
+                            with open(path, "r+b") as f:
+                                f.truncate(0)
+                            size = 0
+                        except OSError:
+                            pass
+                    with self.watched_lock:
+                        if session in self.watched:
+                            self.watched[session] = size
+                    emit({"ev": "changed", "session": session})
+
+    # -- files
+    def _resolve(self, rel):
+        rel = rel.replace("\\", "/")
+        if rel.startswith("/") or ".." in rel.split("/"):
+            raise ValueError("path must be relative to $HOME, without ..")
+        return os.path.join(home_native(), *rel.split("/"))
+
+    def op_read(self, req):
+        path = self._resolve(req["path"])
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return {"rc": 1, "size": None}
+        offset = max(0, int(req.get("offset", 0)))
+        limit = int(req.get("max", 4 << 20))
+        data = b""
+        if offset < size:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                data = f.read(min(size - offset, limit))
+        return {"rc": 0, "size": size, "data_b64": base64.b64encode(data).decode("ascii")}
+
+    def op_take_talkto(self, req):
+        sid = req["session"]  # not "id": that one is the request's own
+        if not SESSION_RE.match(sid):
+            return {"rc": 1}
+        base = os.path.join(home_native(), ".aigw-talkto", sid + ".jsonl")
+        taking = base + ".taking"
+        if not os.path.exists(taking):
+            if not os.path.exists(base):
+                return {"rc": 0, "data_b64": ""}
+            try:
+                os.replace(base, taking)
+            except OSError:
+                return {"rc": 0, "data_b64": ""}
+        with open(taking, "rb") as f:
+            data = f.read()
+        os.remove(taking)
+        return {"rc": 0, "data_b64": base64.b64encode(data).decode("ascii")}
+
+    def op_project_key(self, req):
+        """Same key aigw-backend's _remote_claude_project_dir_key used to get
+        from `cygpath -w` + "every non-alphanumeric -> '-'": on Windows the
+        Windows form of the MSYS2 path (/c/Users/x -> C:\\Users\\x), else the
+        path itself."""
+        p = req["posix_cwd"]
+        if IS_WINDOWS:
+            m = re.match(r"^/([A-Za-z])(/.*)?$", p)
+            if not m:
+                return {"rc": 1, "stderr": "not a drive path"}
+            p = m.group(1).upper() + ":" + (m.group(2) or "\\").replace("/", "\\")
+        return {"rc": 0, "key": re.sub(r"[^A-Za-z0-9]", "-", p)}
+
+    def op_list_jsonl(self, req):
+        key = req["key"]
+        if not re.match(r"^[A-Za-z0-9-]+$", key):
+            return {"rc": 1, "stderr": "bad key"}
+        d = os.path.join(home_native(), ".claude", "projects", key)
+        out = []
+        try:
+            for name in os.listdir(d):
+                if name.endswith(".jsonl"):
+                    try:
+                        st = os.stat(os.path.join(d, name))
+                        out.append([name, st.st_mtime, st.st_size])
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return {"rc": 0, "files": out}
+
+    def op_hello(self, req):
+        return {"rc": 0, "pid": os.getpid(), "platform": sys.platform, "home": home_native()}
+
+    def handle(self, req):
+        op = req.get("op")
+        fn = getattr(self, f"op_{op}", None)
+        try:
+            reply = fn(req) if fn else {"rc": 1, "stderr": f"unknown op {op!r}"}
+        except Exception as e:  # never let one request take the agent down
+            reply = {"rc": 1, "stderr": f"{type(e).__name__}: {e}"}
+        reply["id"] = req.get("id")
+        emit(reply)
+
+
+def main():
+    argv = sys.argv[1:]
+    script = None
+    if "--script" in argv:
+        i = argv.index("--script")
+        script = argv[i + 1]
+        del argv[i:i + 2]
+    if not argv or argv[0] != "--tmux":
+        print("usage: aigw-agent [--script <msys2 script>] --tmux <tmux> [tmux args...]", file=sys.stderr)
+        return 2
+    agent = Agent(argv[1:], script)
+    # Requests are served on their own threads, so a slow one (a capture of
+    # a big pane, a large file read) does not hold up a quick one behind it;
+    # replies carry their "id", so order does not matter to the backend.
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        threading.Thread(target=agent.handle, args=(req,), daemon=True).start()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

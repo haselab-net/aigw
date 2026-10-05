@@ -1,0 +1,54 @@
+#!/bin/bash
+# talkto "message" -- ssh:<machine> counterpart of /usr/local/bin/talkto
+# (aigw workspace doc, `the deployment notes`), installed on each SSH_MACHINES
+# entry as ~/.local/bin/talkto.
+#
+# Same contract as the Python original: append one JSON line, never touch
+# the network. The difference is where the file lives. An ssh:<machine>
+# pane shares no filesystem with the aigw host, so instead of a full
+# $AIGW_TALKTO path the backend hands the pane only $AIGW_TALKTO_ID (its
+# session id, via `tmux respawn-pane -e`), and this script writes to
+# $HOME/.aigw-talkto/<id>.jsonl on this machine; the backend reads that file
+# back over ssh while the session is linked.
+#
+# "#!/bin/bash", not "#!/usr/bin/env bash": on winbox-a a non-login MSYS2
+# bash has C:\Windows\System32 ahead of /usr/bin, so `env bash` found the
+# WSL launcher (measured 2026-10-04). /bin/bash resolves to MSYS2/Git Bash/
+# Linux bash alike.
+#
+# Plain bash + base64 rather than Python: on the Windows (MSYS2) machines
+# `python3` is only the Microsoft Store stub. The text travels base64-encoded
+# ({"ts":..,"b64":".."}), so no JSON escaping is needed here at all.
+set -u
+
+if [ "$#" -ne 1 ]; then
+    echo 'usage: talkto "message to send to the linked session"' >&2
+    exit 1
+fi
+if [ -z "${1//[[:space:]]/}" ]; then
+    echo "talkto: message is empty" >&2
+    exit 1
+fi
+
+if [ -n "${AIGW_TALKTO:-}" ]; then
+    # Should not happen on an ssh:<machine> (the backend never sets it
+    # there), but honour it if some future setup does.
+    path="$AIGW_TALKTO"
+elif [ -n "${AIGW_TALKTO_ID:-}" ]; then
+    case "$AIGW_TALKTO_ID" in
+        *[!A-Za-z0-9_-]*)
+            echo "talkto: invalid \$AIGW_TALKTO_ID" >&2
+            exit 1 ;;
+    esac
+    dir="$HOME/.aigw-talkto"
+    mkdir -p "$dir" || exit 1
+    path="$dir/$AIGW_TALKTO_ID.jsonl"
+else
+    echo "talkto: \$AIGW_TALKTO_ID is not set -- this shell was not started by aigw, " \
+         "or this session was started before ssh:<machine> talkto support" >&2
+    exit 1
+fi
+
+b64=$(printf '%s' "$1" | base64 | tr -d '\r\n') || exit 1
+printf '{"ts":%s,"b64":"%s"}\n' "$(date +%s)" "$b64" >> "$path" || exit 1
+echo "talkto: queued"

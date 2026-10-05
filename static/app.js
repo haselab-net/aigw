@@ -72,6 +72,15 @@
   const sshCwdUpBtn = document.getElementById("ssh-cwd-up");
   const sshCwdChildEl = document.getElementById("ssh-cwd-child");
   const sshResumeEl = document.getElementById("ssh-resume");
+  // 🐚/🪟 toggle on the #ssh-resume row (the deployment notes): 🐚 runs the new
+  // session in the Windows machine's sshd session 0 (no desktop), 🪟 in the
+  // logged-on user's desktop session 1, via that machine's desktop variant
+  // (GET /capabilities' ssh_desktop, {base: variant}). One row in the
+  // machine picker per machine either way. Two copies of the button: one on
+  // the Claude preset's #ssh-resume row, one in #ssh-shell-opts for "Shell"
+  // (which has no such row) -- both show and flip the same desktopMode.
+  const desktopToggleEls = document.querySelectorAll(".desktop-toggle");
+  const sshShellOptsEl = document.getElementById("ssh-shell-opts");
   const shellCwdOptsEl = document.getElementById("shell-cwd-opts");
   const shellCwdCrumbEl = document.getElementById("shell-cwd-crumb");
   const shellCwdUpBtn = document.getElementById("shell-cwd-up");
@@ -160,6 +169,12 @@
   // whenever the machine selector changes (applyMachineFilter) so switching
   // machines never carries over a path from a different one.
   let currentSshCwd = "";
+  // {base machine: desktop variant} and its inverse, from GET /capabilities'
+  // ssh_desktop; desktopMode is the 🐚(false)/🪟(true) toggle's state, reset
+  // to 🐚 whenever the machine changes.
+  let sshDesktop = {};
+  let desktopBase = {};
+  let desktopMode = false;
 
   // "local" means aigw-backend's own container/host/root locations -- the
   // machine selector's other options are aigw-backend's SSH_MACHINES,
@@ -201,7 +216,56 @@
   // to know that scheme to answer "which machine is this session's".
   function sessionMachine(meta) {
     const loc = meta.tmux_location || "";
-    return loc.startsWith("ssh:") ? loc.slice(4) : "local";
+    if (!loc.startsWith("ssh:")) return "local";
+    const m = loc.slice(4);
+    // A desktop variant's sessions belong to its base machine's list
+    // (the deployment notes) -- screenBadge below tells the two kinds apart.
+    return desktopBase[m] || m;
+  }
+
+  // The list view's own location.hash: "" for this host, "machine=<name>"
+  // for any other, so a reload (or a shared link) comes back to the same
+  // machine's list instead of always this host's (2026-10-04, at the
+  // user's request: "マシンを選んでもurlのハッシュ部分が変わらない").
+  function listHash() {
+    return currentMachine === "local" ? "" : `machine=${encodeURIComponent(currentMachine)}`;
+  }
+
+  // Makes `m` the selected machine (state + <select> + preset list).
+  // Usable before applyCapabilities() has built the <select> (init()'s
+  // applyHash() runs first): the <select>/presets are then brought in line
+  // by syncMachineSelect() once it has.
+  function selectMachine(m) {
+    if (m !== currentMachine) {
+      currentMachine = m;
+      currentSshCwd = "";
+      desktopMode = false;
+      if (localPresetOptionsHtml !== null) rebuildPresetOptions();
+    }
+    syncMachineSelect();
+  }
+
+  // Shows currentMachine in the <select> once it exists; a machine that is
+  // not offered (unreachable right now, or gone) falls back to this host.
+  function syncMachineSelect() {
+    if (localPresetOptionsHtml === null) return; // capabilities not loaded yet
+    if (![...machineSelectEl.options].some((o) => o.value === currentMachine)) {
+      currentMachine = "local";
+      rebuildPresetOptions();
+    }
+    machineSelectEl.value = currentMachine;
+  }
+
+  // "🪟 " / "🐚 " in front of a session's name on a machine that has a
+  // desktop variant (the deployment notes), so desktop and no-desktop sessions
+  // are distinguishable at a glance; "" everywhere else.
+  function screenBadge(meta) {
+    const loc = meta.tmux_location || "";
+    if (!loc.startsWith("ssh:")) return "";
+    const m = loc.slice(4);
+    if (desktopBase[m]) return "🪟 ";
+    if (sshDesktop[m]) return "🐚 ";
+    return "";
   }
 
   // Rebuilds the new-session preset dropdown for whichever machine is
@@ -226,14 +290,15 @@
     }
     currentMachine = machineSelectEl.value;
     currentSshCwd = ""; // a path on the previous machine means nothing on this one
+    desktopMode = false; // 🐚 is the default on every machine
     if (viewAuth.style.display !== "none") {
       // Was viewing the auth page -- picking any real machine here is now
       // the only way to leave it (no back button there
       // any more, 2026-08-15, at the user's request).
       viewAuth.style.display = "none";
       viewList.style.display = "block";
-      setHash("");
     }
+    setHash(listHash());
     rebuildPresetOptions();
     await refreshSessions();
     await refreshTmuxSessions();
@@ -289,9 +354,27 @@
       document.getElementById("auth-row-root").classList.add("visible");
       document.getElementById("codex-auth-row-root").classList.add("visible");
     }
+    // The second-sandbox preset (aigw-backend's MAILBOX): a Claude Code TUI
+    // in a sandbox container separate from devbox-<user>, for material that
+    // must not sit in ~/sandhome. Added dynamically for the same reason
+    // root-shell is -- a host with no such sandbox configured reports
+    // caps.mailbox as null and never shows the option. The label comes from
+    // that host's own config file, not from here.
+    if (caps.mailbox && caps.mailbox.label) {
+      const opt = document.createElement("option");
+      opt.value = "mail-tui";
+      opt.textContent = caps.mailbox.label;
+      // Before the Shell entries rather than appended: it belongs with the
+      // agent presets (Claude/Codex) it sits alongside, not after the
+      // shells. Falls back to appending if that anchor ever goes away.
+      presetEl.insertBefore(opt, presetEl.querySelector('option[value="shell"]'));
+    }
     localPresetOptionsHtml = presetEl.innerHTML;
 
     sshCwdMachines = caps.ssh_machines_drives || [];
+    sshDesktop = caps.ssh_desktop || {};
+    desktopBase = {};
+    for (const [base, variant] of Object.entries(sshDesktop)) desktopBase[variant] = base;
 
     machineSelectEl.innerHTML = "";
     const localOpt = document.createElement("option");
@@ -339,10 +422,31 @@
     // machine gets no picker either, same as the local "shell" preset.
     const showSshCwd = sshCwdMachines.includes(currentMachine) && presetEl.value === `claude-tui-${currentMachine}`;
     sshCwdOptsEl.classList.toggle("visible", showSshCwd);
+    sshShellOptsEl.classList.toggle("visible",
+      !!sshDesktop[currentMachine] && presetEl.value === `shell-${currentMachine}`);
+    updateDesktopToggle();
     if (showSshCwd) refreshSshWorkdirs();
     const showShellCwd = SHELL_CWD_PRESETS.includes(presetEl.value);
     shellCwdOptsEl.classList.toggle("visible", showShellCwd);
     if (showShellCwd) refreshShellCwdWorkdirs();
+  }
+
+  function updateDesktopToggle() {
+    const available = !!sshDesktop[currentMachine];
+    if (!available) desktopMode = false;
+    for (const el of desktopToggleEls) {
+      el.style.display = available ? "" : "none";
+      el.textContent = desktopMode ? "🪟" : "🐚";
+      el.title = desktopMode
+        ? "画面あり(デスクトップのセッション1で動く)。タップで画面なしに"
+        : "画面なし(セッション0で動く)。タップで画面ありに";
+    }
+  }
+  for (const el of desktopToggleEls) {
+    el.addEventListener("click", () => {
+      desktopMode = !desktopMode;
+      updateDesktopToggle();
+    });
   }
 
   // Re-reads the level `currentCwd` points at. A directory that has since
@@ -583,6 +687,9 @@
       // is visible/editable *before* tapping 開始, not what actually makes
       // it carry over (the deployment notes, 2026-09-24).
       if (c.aigw_label) opt.dataset.aigwLabel = c.aigw_label;
+      // ssh list only (the deployment notes): how an aigw session last ran this
+      // conversation, read back by the 🐚/🪟 restore below.
+      if (typeof c.aigw_desktop === "boolean") opt.dataset.desktop = c.aigw_desktop ? "1" : "0";
       selectEl.appendChild(opt);
     }
   }
@@ -648,6 +755,16 @@
   }
   wireResumeLabelPrefill(resumeEl);
   wireResumeLabelPrefill(sshResumeEl);
+  // Picking a conversation to resume also puts the 🐚/🪟 toggle back to how
+  // it last ran (2026-10-05, at the user's request) -- only when aigw knows
+  // (it ran there before) and this machine has a desktop variant at all.
+  // Still just a default: the toggle can be flipped again before 開始.
+  sshResumeEl.addEventListener("change", () => {
+    const d = sshResumeEl.selectedOptions[0]?.dataset.desktop;
+    if (d === undefined || !sshDesktop[currentMachine]) return;
+    desktopMode = d === "1";
+    updateDesktopToggle();
+  });
 
   presetEl.addEventListener("change", applyPresetOptions);
 
@@ -1427,14 +1544,40 @@
     return d.toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
   }
 
+  // Auto-scroll only while the reader is already at (or near) the bottom
+  // (2026-10-05, at the user's request: "新着があると自動で一番下にスクロール
+  // してしまうのが不便"). Scrolled up to read something, new output no longer
+  // yanks the view down -- the "↓ 新着" button appears instead and takes
+  // them there on tap. Must be read BEFORE appending, since the append
+  // itself changes scrollHeight.
+  const NEAR_BOTTOM_PX = 80;
+  const newMsgBtnEl = document.getElementById("new-msg-btn");
+  function chatNearBottom() {
+    return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < NEAR_BOTTOM_PX;
+  }
+  function scrollChatToBottom() {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    newMsgBtnEl.classList.remove("visible");
+  }
+  // follow: chatNearBottom() as measured before the append.
+  function afterChatAppend(follow) {
+    if (follow) scrollChatToBottom();
+    else newMsgBtnEl.classList.add("visible");
+  }
+  newMsgBtnEl.addEventListener("click", scrollChatToBottom);
+  messagesEl.addEventListener("scroll", () => {
+    if (chatNearBottom()) newMsgBtnEl.classList.remove("visible");
+  });
+
   function addThinkingIndicator() {
     removeThinkingIndicator();
     const div = document.createElement("div");
     div.className = "bubble agent thinking";
     div.id = "thinking-indicator";
     div.textContent = "考え中…";
+    const follow = chatNearBottom();
     messagesEl.appendChild(div);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (follow) scrollChatToBottom();
   }
 
   function removeThinkingIndicator() {
@@ -1454,8 +1597,83 @@
   // markdown renderer).
   const INLINE_RE = /(https?:\/\/[^\s<>"']+)|\*\*([^\n*]+?)\*\*/g;
 
+  // Markdown tables (2026-10-05, at the user's request: Claude Code writes
+  // them often and they read badly as raw pipes on a phone) are the one
+  // block-level construct rendered for real: a "| a | b |" header line
+  // immediately followed by a "|---|:--:|" separator line, then every
+  // following line that still contains a "|". Built with DOM calls like the
+  // rest of this function -- never innerHTML -- and each cell goes through
+  // the same inline link/bold handling.
+  const TABLE_SEP_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+
+  function splitTableRow(line) {
+    let t = line.trim();
+    if (t.startsWith("|")) t = t.slice(1);
+    if (t.endsWith("|") && !t.endsWith("\\|")) t = t.slice(0, -1);
+    return t.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+  }
+
+  function buildTable(headerLine, sepLine, bodyLines) {
+    const header = splitTableRow(headerLine);
+    const aligns = splitTableRow(sepLine).map((c) =>
+      c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : "");
+    const wrap = document.createElement("div");
+    wrap.className = "md-table-wrap";
+    const table = document.createElement("table");
+    table.className = "md-table";
+    const addRow = (parent, cells, tag) => {
+      const tr = document.createElement("tr");
+      for (let i = 0; i < header.length; i++) {
+        const cell = document.createElement(tag);
+        if (aligns[i]) cell.style.textAlign = aligns[i];
+        appendInline(cell, cells[i] ?? "");
+        tr.appendChild(cell);
+      }
+      parent.appendChild(tr);
+    };
+    const thead = document.createElement("thead");
+    addRow(thead, header, "th");
+    table.appendChild(thead);
+    const tbody = document.createElement("tbody");
+    for (const line of bodyLines) addRow(tbody, splitTableRow(line), "td");
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    return wrap;
+  }
+
   function setTextWithLinks(el, text) {
     el.textContent = "";
+    const lines = text.split("\n");
+    let plain = [];
+    const flushPlain = () => {
+      if (plain.length) appendInline(el, plain.join("\n"));
+      plain = [];
+    };
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // GFM's own rule: the separator must have exactly as many cells as
+      // the header (which also keeps a lone "--" line from counting).
+      if (line.includes("|") && i + 1 < lines.length && TABLE_SEP_RE.test(lines[i + 1])
+          && splitTableRow(line).length >= 2
+          && splitTableRow(lines[i + 1]).length === splitTableRow(line).length) {
+        // The newline that ended the text before the table is the table's
+        // own block break now -- keeping it would add an empty line.
+        flushPlain();
+        const body = [];
+        let j = i + 2;
+        while (j < lines.length && lines[j].includes("|") && lines[j].trim() !== "") body.push(lines[j++]);
+        el.appendChild(buildTable(line, lines[i + 1], body));
+        i = j - 1;
+        // Same for the line break right after it.
+        if (i + 1 < lines.length && lines[i + 1].trim() === "") i++;
+        continue;
+      }
+      plain.push(line);
+    }
+    flushPlain();
+  }
+
+  function appendInline(el, text) {
     let last = 0;
     for (const m of text.matchAll(INLINE_RE)) {
       if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
@@ -2018,13 +2236,14 @@
       // (including a settled agent_output for the same session) means this
       // particular live bubble is done changing, so the next live_tail
       // should start a fresh one instead of resuming this one.
+      const follow = chatNearBottom();
       if (!liveBubbleEl) {
         liveBubbleEl = document.createElement("div");
         liveBubbleEl.className = "bubble agent live";
         messagesEl.appendChild(liveBubbleEl);
       }
       setTextWithLinks(liveBubbleEl, ev.text);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      afterChatAppend(follow);
       return;
     }
     // The live bubble was only ever a preview of not-yet-settled content --
@@ -2112,8 +2331,11 @@
     } else {
       return;
     }
+    // One's own message always scrolls down (it was just sent from the
+    // composer below); a relayed/shared one (ev.from) follows the rule.
+    const follow = chatNearBottom() || (ev.type === "user_message" && !ev.from);
     messagesEl.appendChild(div);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    afterChatAppend(follow);
   }
 
   // Where a claude session was started, shown in the list because two
@@ -2141,9 +2363,18 @@
   // again (or the banner's キャンセル) to back out.
   let linkArmedSessionId = null;
 
+  // Remaining time of a link, as "残り1時間23分" -- links are time-limited
+  // (2026-10-04; they used to count turns). Refreshed with every session-list
+  // poll, which is also when the backend disconnects an expired one.
+  function linkRemaining(expiresTs) {
+    const min = Math.max(0, Math.ceil((expiresTs - Date.now() / 1000) / 60));
+    const h = Math.floor(min / 60), m = min % 60;
+    return h ? `残り${h}時間${m ? m + "分" : ""}` : `残り${m}分`;
+  }
+
   function linkSuffix(s) {
     if (!s.link) return "";
-    return ` &middot; 🔗${escapeHtml(s.link.partner_label)}(${s.link.turns_used}/${s.link.max_turns})`;
+    return ` &middot; 🔗${escapeHtml(s.link.partner_label)}(${linkRemaining(s.link.expires_ts)})`;
   }
 
   function renderLinkArmedBanner() {
@@ -2161,7 +2392,7 @@
   // "root-shell" is the only preset a root Claude conversation can run in
   // (there is no dedicated "claude-tui-root" -- the deployment notes): whoever is
   // driving it typed `claude` into that shell by hand. Used only to suggest
-  // a lower default turn cap below; the backend applies its own default
+  // a shorter default time limit below; the backend applies its own default
   // (and the real backstop, the passkey window) regardless of what the
   // client suggests.
   function isRootSession(s) { return s.preset === "root-shell"; }
@@ -2193,21 +2424,23 @@
     linkArmedSessionId = null;
     renderLinkArmedBanner();
     if (!other) { await refreshSessions(); return; }
-    const suggested = (isRootSession(s) || isRootSession(other)) ? 6 : 20;
+    // Same defaults as the backend's DEFAULT_LINK_DURATION(_ROOT): 30 min
+    // when root is involved, 4 hours otherwise. Blank also means "default".
+    const suggested = (isRootSession(s) || isRootSession(other)) ? 30 : 240;
     const raw = prompt(
       `「${other.label}」と「${s.label}」をつなぎます。\n` +
-      "何往復かで自動的に切断させる場合は回数を、切断せず手動のみにする場合は空欄のまま OK してください。",
+      "何分で自動的に切断するかを入力してください(最大1440分=24時間)。",
       String(suggested),
     );
     if (raw === null) { await refreshSessions(); return; } // cancelled
-    const maxTurns = raw.trim() === "" ? null : Number(raw);
-    if (raw.trim() !== "" && (!Number.isFinite(maxTurns) || maxTurns <= 0)) {
-      alert("回数は正の整数(または空欄)で入力してください");
+    const minutes = raw.trim() === "" ? null : Number(raw);
+    if (raw.trim() !== "" && (!Number.isFinite(minutes) || minutes <= 0)) {
+      alert("分数は正の数で入力してください");
       await refreshSessions();
       return;
     }
     const body = { a: other.id, b: s.id };
-    if (maxTurns !== null) body.max_turns = maxTurns;
+    if (minutes !== null) body.duration_minutes = minutes;
     await api("/sessions/link", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2286,7 +2519,7 @@
         <div>
           <span class="drag-handle" title="ドラッグで並べ替え">⠿</span>
           <span class="dot ${s.alive ? "alive" : "stopped"}"></span>
-          <span class="label">${escapeHtml(s.label)}</span>
+          <span class="label">${screenBadge(s)}${escapeHtml(s.label)}</span>
           <div class="meta">${s.preset}${cwdSuffix(s)} &middot; ${fmtTime(s.created_ts)}${ownerBadge}${linkSuffix(s)}</div>
         </div>`;
       row.addEventListener("click", () => openSession(s));
@@ -2360,7 +2593,7 @@
       row.innerHTML = `
         <div>
           <span class="dot ${s.alive ? "alive" : "stopped"}"></span>
-          <span class="label">${escapeHtml(s.label)}</span>
+          <span class="label">${screenBadge(s)}${escapeHtml(s.label)}</span>
           <div class="meta">${s.preset}${cwdSuffix(s)} &middot; ${fmtTime(s.created_ts)}${ownerBadge}</div>
         </div>`;
       row.addEventListener("click", () => openSession(s));
@@ -2733,6 +2966,10 @@
   }
 
   function openSession(meta) {
+    // Going back from here should land on this session's own machine's
+    // list -- matters when it was opened by a notification or a reload's
+    // hash rather than by tapping it in that list.
+    selectMachine(sessionMachine(meta));
     currentSessionId = meta.id;
     currentPreset = meta.preset;
     currentSessionMeta = meta;
@@ -2741,7 +2978,7 @@
     // for one's own sessions, which is the only case sessionPath()/
     // sessionApiUrl() need to tell apart.
     currentOwner = meta.owner || null;
-    chatLabelEl.textContent = meta.label;
+    chatLabelEl.textContent = screenBadge(meta) + meta.label;
     chatOwnerBadgeEl.textContent = currentOwner ? `${currentOwner}さんと共有中` : "";
     // The panel itself is now always reachable (2026-08-28): it also holds
     // 💾 save, which a shared viewer needs too. The sharing *management*
@@ -2754,6 +2991,7 @@
     setShareVisible(false);
     chatDotEl.className = `dot ${meta.alive ? "alive" : "stopped"}`;
     messagesEl.innerHTML = "";
+    newMsgBtnEl.classList.remove("visible"); // belonged to the previous session
     messagesEl.appendChild(historyTopEl);
     setHistoryTopText("");
     liveBubbleEl = null;
@@ -2804,7 +3042,7 @@
       openAuthView();
     } else {
       viewList.style.display = "block";
-      setHash("");
+      setHash(listHash());
       refreshAuthStatus();
     }
     refreshSessions();
@@ -2990,7 +3228,7 @@
     const originalLabel = createBtn.textContent;
     createBtn.textContent = "起動中…";
     try {
-      const preset = presetEl.value;
+      let preset = presetEl.value;
       const label = document.getElementById("label").value;
       const body = { preset, label, cols: computeScreenCols(), rows: computeScreenRows() };
       // The backend rejects these outright for the plain shells rather than
@@ -3010,6 +3248,18 @@
         // expects for this preset's scope (sandhome-relative for "shell",
         // an absolute path for "host-shell"/"root-shell").
         body.cwd = shellCwdByPreset[preset];
+      }
+      // 🪟: the same preset on the machine's desktop variant
+      // (the deployment notes) -- cwd/resume above stay valid as-is, since the
+      // variant is the same machine and filesystem.
+      // Only while a toggle is actually on screen (the Claude preset's
+      // #ssh-resume row, or #ssh-shell-opts for "Shell"): a 🪟 left on from
+      // before must not silently apply to a preset that doesn't show it.
+      const variant = sshDesktop[currentMachine];
+      const toggleShown = sshCwdOptsEl.classList.contains("visible") || sshShellOptsEl.classList.contains("visible");
+      if (desktopMode && variant && toggleShown && preset.endsWith(`-${currentMachine}`)) {
+        preset = preset.slice(0, -currentMachine.length) + variant;
+        body.preset = preset;
       }
       // Only the claude-tui presets honor this (see aigw-backend's
       // CLAUDE_TUI_PRESETS/create_session) -- the headless "claude" preset
@@ -3325,6 +3575,19 @@
     await applyHash();
 
     await applyCapabilities();
+    // applyHash() above may have picked a machine (a "machine=" hash, or an
+    // opened session's own) before the <select> existed -- and, for a
+    // session, before ssh_desktop was known, so a desktop variant's session
+    // was attributed to the variant itself rather than its base machine,
+    // and shown without its 🐚/🪟 badge. Redo both now.
+    if (currentSessionMeta) {
+      currentMachine = sessionMachine(currentSessionMeta);
+      chatLabelEl.textContent = screenBadge(currentSessionMeta) + currentSessionMeta.label;
+    }
+    const wanted = currentMachine;
+    syncMachineSelect();
+    if (currentMachine !== "local") rebuildPresetOptions();
+    if (wanted !== currentMachine && !currentSessionId) setHash(listHash());
     initUnlockUI();
     initSiteExtras();
     applyPresetOptions();
@@ -3358,8 +3621,10 @@
       openAuthView();
       return;
     }
-    if (!hashId) {
+    if (!hashId || hashId.startsWith("machine=")) {
+      selectMachine(hashId ? decodeURIComponent(hashId.slice("machine=".length)) : "local");
       if (currentSessionId) closeSession();
+      else await refreshSessions();
       return;
     }
     if (hashId === currentSessionId) return; // already there
@@ -3370,6 +3635,19 @@
   }
 
   window.addEventListener("hashchange", applyHash);
+  // sw.js's notificationclick posts {type: "open-session"} to an already-open
+  // window rather than relying on WindowClient.navigate(), which not every
+  // browser has (iOS Safari) -- 2026-10-04, at the user's request
+  // ("通知を開いたときに、当該セッションが開きません").
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.addEventListener("message", (e) => {
+      const d = e.data || {};
+      if (d.type === "open-session" && typeof d.session_id === "string") {
+        setHash(d.session_id);
+        applyHash();
+      }
+    });
+  }
 
   init();
 })();

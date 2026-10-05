@@ -153,7 +153,14 @@ def notify(message):
                 log(f"push to {user} failed: {e}")
 
 
-def check(machine, spec, state):
+def _is_other_socket(cmd, sockets):
+    """True if this tmux process belongs to one of `sockets` (a desktop
+    variant's `tmux -L <socket>` server or its clients -- see the SSH_MACHINES
+    schema comment in aigw-backend), not to the machine's default server."""
+    return any(f"/{s})" in cmd or f"-L {s} " in cmd or cmd.endswith(f"-L {s}") for s in sockets)
+
+
+def check(machine, spec, state, other_sockets=()):
     tmux_bin = spec["tmux"]
     r = ssh(machine, "true", timeout=CONNECT_TIMEOUT + 10)
     if r is None or r.returncode != 0:
@@ -166,6 +173,9 @@ def check(machine, spec, state):
     if procs is None:
         log(f"{machine}: could not list processes")
         return state
+    # A desktop variant's server runs in the user's interactive session and
+    # can only be restarted from there, so never count or kill it here.
+    procs = [p for p in procs if not _is_other_socket(p["cmd"], other_sockets)]
 
     wedge = state.get("wedge", 0) + 1 if hung else 0
     stale = {p["pid"] for p in procs if p["kind"] in ("client", "new-session") and not p["interactive"]}
@@ -199,13 +209,20 @@ def main():
     for machine, spec in machines.items():
         if only and machine not in only:
             continue
+        if spec.get("ssh_host"):
+            # Desktop variant (aigw-backend's SSH_MACHINES schema comment):
+            # same ssh Host as its base entry, which is checked on its own;
+            # its own server is left alone, see check()'s other_sockets.
+            continue
+        other_sockets = [s["tmux_socket"] for s in machines.values()
+                         if s.get("ssh_host") == machine and s.get("tmux_socket")]
         state_path = STATE_DIR / f"{machine}.json"
         try:
             state = json.loads(state_path.read_text())
         except (OSError, ValueError):
             state = {}
         try:
-            state = check(machine, spec, state)
+            state = check(machine, spec, state, other_sockets)
         except Exception as e:  # one machine must never stop the others
             log(f"{machine}: check failed: {e}")
             continue
