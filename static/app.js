@@ -2954,15 +2954,47 @@
       // fetch failing at all should be rare.
     }
     if (meta.id !== currentSessionId) return;
-    if (currentEventSource) currentEventSource.close();
-    currentEventSource = new EventSource(sessionApiUrl(meta.id, `/events?since=${since}`, currentOwner));
-    currentEventSource.onmessage = (e) => {
-      try {
-        renderEvent(meta.id, JSON.parse(e.data));
-      } catch (err) {
-        console.error("bad event", err);
-      }
+    // Survives backend restarts (2026-10-06, user report "この会話がチャットに
+    // 出てません"): while aigw-backend restarts the gateway answers this
+    // stream with an error status, and EventSource then gives up for good
+    // (readyState CLOSED) -- the chat silently stopped updating until the
+    // page was reloaded. On CLOSED, reopen after a short delay from the last
+    // seq actually received. The browser's own automatic reconnect (for a
+    // dropped-but-200 stream) reuses the original ?since=, so events are
+    // de-duplicated by seq here too. Ephemeral ones (no seq: "screen") are
+    // always passed through.
+    let lastSeq = since;
+    const open = () => {
+      if (meta.id !== currentSessionId) return;
+      if (currentEventSource) currentEventSource.close();
+      const es = new EventSource(sessionApiUrl(meta.id, `/events?since=${lastSeq}`, currentOwner));
+      currentEventSource = es;
+      es.onmessage = (e) => {
+        let ev;
+        try {
+          ev = JSON.parse(e.data);
+        } catch (err) {
+          console.error("bad event", err);
+          return;
+        }
+        if (typeof ev.seq === "number") {
+          if (ev.seq <= lastSeq) return;
+          lastSeq = ev.seq;
+        }
+        try {
+          renderEvent(meta.id, ev);
+        } catch (err) {
+          console.error("bad event", err);
+        }
+      };
+      es.onerror = () => {
+        if (es.readyState !== EventSource.CLOSED) return; // the browser is retrying by itself
+        setTimeout(() => {
+          if (currentEventSource === es && meta.id === currentSessionId) open();
+        }, 3000);
+      };
     };
+    open();
   }
 
   function openSession(meta) {
