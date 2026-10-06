@@ -1367,13 +1367,35 @@ def list_ssh_tmux_sessions(location):
     return {line for line in r.stdout.splitlines() if line and line != CTL_SESSION}
 
 
+def _ssh_tmux_names_or_unknown(location):
+    """list_ssh_tmux_sessions for the one caller that *acts* on absence --
+    _watch_tmux_session's liveness check, which marks a session ended when
+    its name is missing. A failed or timed-out listing (a slow ssh hop, the
+    agent reconnecting, a busy machine) used to come back as an empty set,
+    i.e. "nothing is running", and the session was declared ended while its
+    tmux pane -- and the Claude Code in it -- kept running unwatched
+    (2026-10-05/06 on winbox-c: four such sessions left behind). Like
+    list_root_tmux_sessions, this returns None for "could not tell"; only
+    tmux's own "no server running" counts as a confirmed empty answer."""
+    try:
+        r = tmux_query(location, ["list-sessions", "-F", "#S"])
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        err = (r.stderr or "").lower()
+        if "no server running" in err or "error connecting" in err:
+            return set()
+        return None
+    return {line for line in r.stdout.splitlines() if line and line != CTL_SESSION}
+
+
 def live_tmux_names(location):
     if location == "host":
         return list_host_tmux_sessions()
     if location == "root":
         return list_root_tmux_sessions()
     if location.startswith("ssh:"):
-        return list_ssh_tmux_sessions(location)
+        return _ssh_tmux_names_or_unknown(location)
     return list_tmux_sessions()
 
 
@@ -1407,7 +1429,7 @@ def _wait_for_ssh_session(location, session_id):
     genuine failure either way."""
     deadline = time.time() + SSH_NEW_SESSION_POLL_TIMEOUT
     while time.time() < deadline:
-        if session_id in live_tmux_names(location):
+        if session_id in (live_tmux_names(location) or ()):
             return True
         time.sleep(SSH_NEW_SESSION_POLL_INTERVAL)
     return False
@@ -2259,7 +2281,7 @@ def adopt_session(tmux_name, location, label, cols=None, rows=None):
     require_unlock_if_outside_sandbox(location)
     if not tmux_name or not TMUX_NAME_RE.match(tmux_name):
         raise ValueError("invalid tmux session name")
-    if tmux_name not in live_tmux_names(location):
+    if tmux_name not in (live_tmux_names(location) or ()):
         raise ValueError("no such live tmux session")
     session_id = uuid.uuid4().hex[:12]
     sdir = session_dir(session_id)
@@ -5791,7 +5813,15 @@ def _watch_tmux_session(session_id):
     # (ssh:<machine>, or the pipe could not be set up -- a locked root
     # window, say), every poll captures, as before.
     screen_signal = None
-    if location in TMUX_CTL_LOCATIONS:
+    # Not for "root": the pipe's `cat` runs as root and streams the pane's
+    # output verbatim into a FIFO this (non-root) user owns -- and it keeps
+    # running after the root window is locked, so any process running as
+    # this user could read a root pane's live output without the passkey,
+    # which the lock exists to prevent (security review, 2026-10-06). Root
+    # panes keep the plain TMUX_POLL_INTERVAL capture instead -- over the
+    # resident control client, so still no process per poll, and that client
+    # is dropped by tmux itself on lock.
+    if location in TMUX_CTL_LOCATIONS and location != "root":
         try:
             screen_signal = _ScreenSignal(str(sdir / SCREEN_FIFO_NAME))
             if not _start_screen_pipe(location, tmux_name, screen_signal.path):

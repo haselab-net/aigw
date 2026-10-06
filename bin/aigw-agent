@@ -28,7 +28,7 @@ Change signal: tmux runs `pipe-pane -O 'exec cat >> <file>'` for the pane and
 this process watches the file's size (an in-process os.stat, no child
 process) -- a FIFO would be cheaper still, but a native Windows Python cannot
 open an MSYS2 FIFO, so a plain file is used on every platform alike, and
-truncated once it grows (cat appends, so it simply continues at the new end).
+emptied each time it grows (cat appends, so it simply continues at the new end).
 """
 import base64
 import json
@@ -43,7 +43,6 @@ import time
 CTL_SESSION = "_aigw-ctl"
 CTL_TIMEOUT = 10
 SIGNAL_POLL = 0.2
-SIGNAL_TRUNCATE = 1 << 20
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 IS_WINDOWS = os.name == "nt"
 
@@ -253,7 +252,11 @@ class Agent:
                 except OSError:
                     continue
                 if size != last:
-                    if size > SIGNAL_TRUNCATE:
+                    # Emptied on every change, not only past a size limit:
+                    # only *that* it grew matters, and the bytes are the
+                    # pane's own output, which should not sit on disk
+                    # (security review, 2026-10-06).
+                    if size > 0:
                         try:
                             with open(path, "r+b") as f:
                                 f.truncate(0)
