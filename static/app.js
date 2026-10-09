@@ -70,6 +70,7 @@
   const sshCwdOptsEl = document.getElementById("ssh-cwd-opts");
   const sshCwdCrumbEl = document.getElementById("ssh-cwd-crumb");
   const sshCwdUpBtn = document.getElementById("ssh-cwd-up");
+  const sshCwdNewBtn = document.getElementById("ssh-cwd-new");
   const sshCwdChildEl = document.getElementById("ssh-cwd-child");
   const sshResumeEl = document.getElementById("ssh-resume");
   // 🐚/🪟 toggle on the #ssh-resume row (the deployment notes): 🐚 runs the new
@@ -90,6 +91,12 @@
   // ("" = ~/sandhome itself). Walked one level at a time, so it can go as
   // deep as the tree does.
   let currentCwd = "";
+  // Which tree #claude-opts is walking: "sandhome" (claude-tui) or "mail"
+  // (the Email preset's own MAILBOX dir, the deployment notes, 2026-10-06) --
+  // same picker, same resume list, each tree keeping its own position.
+  let cwdScope = "sandhome";
+  const cwdByScope = { sandhome: "", mail: "" };
+  let mailboxLabel = "Email";
 
   let currentSessionId = null;
   let currentPreset = null;
@@ -361,6 +368,7 @@
     // caps.mailbox as null and never shows the option. The label comes from
     // that host's own config file, not from here.
     if (caps.mailbox && caps.mailbox.label) {
+      mailboxLabel = caps.mailbox.label;
       const opt = document.createElement("option");
       opt.value = "mail-tui";
       opt.textContent = caps.mailbox.label;
@@ -416,7 +424,18 @@
   // then comes from whichever directory you stopped at.
 
   function applyPresetOptions() {
-    claudeOptsEl.classList.toggle("visible", CWD_PRESETS.includes(presetEl.value));
+    const isMail = presetEl.value === "mail-tui";
+    claudeOptsEl.classList.toggle("visible", CWD_PRESETS.includes(presetEl.value) || isMail);
+    // The Email sandbox always runs with --dangerously-skip-permissions
+    // (the sandbox CLI builds that command line), so no checkbox for it.
+    skipPermissionsEl.closest(".nsb-row").style.display = isMail ? "none" : "";
+    const scope = isMail ? "mail" : "sandhome";
+    if (scope !== cwdScope && (isMail || CWD_PRESETS.includes(presetEl.value))) {
+      cwdByScope[cwdScope] = currentCwd;
+      cwdScope = scope;
+      currentCwd = cwdByScope[scope];
+      refreshWorkdirs();
+    }
     // #ssh-cwd-opts: only for a drives-capable machine's
     // own Claude preset ("claude-tui-<machine>") -- "Shell" on the same
     // machine gets no picker either, same as the local "shell" preset.
@@ -452,17 +471,37 @@
   // Re-reads the level `currentCwd` points at. A directory that has since
   // been renamed or deleted answers 400, which drops us back to ~/sandhome
   // rather than leaving the UI pointing at something that isn't there.
-  async function refreshWorkdirs() {
+  // interactive=false: a background re-read (back from a session, page
+  // load) -- for "mail" that must not pop a passkey prompt out of nowhere,
+  // so a locked window just leaves the picker as it was.
+  async function refreshWorkdirs(interactive = true) {
     const asked = currentCwd;
-    const r = await api(`/workdirs?dir=${encodeURIComponent(asked)}`).catch(() => null);
-    if (asked !== currentCwd) return; // a later navigation already won
+    const scope = cwdScope;
+    // "mail" is host-tier gated (it lists mail-derived folders), so it can
+    // ask for the passkey right here, like root-shell's own picker does.
+    const fetchIt = () => api(`/workdirs?scope=${scope}&dir=${encodeURIComponent(asked)}`);
+    let unlockNeeded = false;
+    const r = await (scope === "mail" && interactive ? withUnlockRetry(fetchIt) : fetchIt())
+      .catch((e) => { unlockNeeded = !!e.unlockRequired; return null; });
+    if (!r && unlockNeeded && !interactive) return;
+    if (asked !== currentCwd || scope !== cwdScope) return; // a later navigation already won
+    const top = scope === "mail" ? mailboxLabel : "sandhome";
     if (!r) {
-      if (currentCwd === "") return;
+      if (currentCwd === "") {
+        if (scope === "mail") {
+          cwdCrumbEl.textContent = top;
+          cwdUpBtn.disabled = true;
+          cwdChildEl.innerHTML = '<option value="">(一覧を取得できません)</option>';
+          cwdChildEl.disabled = true;
+          populateConversationSelect(resumeEl, []);
+        }
+        return;
+      }
       currentCwd = "";
-      return refreshWorkdirs();
+      return refreshWorkdirs(interactive);
     }
     currentCwd = r.dir;
-    cwdCrumbEl.textContent = currentCwd ? `sandhome/${currentCwd}` : "sandhome";
+    cwdCrumbEl.textContent = currentCwd ? `${top}/${currentCwd}` : top;
     cwdUpBtn.disabled = !currentCwd;
 
     cwdChildEl.innerHTML = "";
@@ -477,7 +516,7 @@
       opt.textContent = name;
       cwdChildEl.appendChild(opt);
     }
-    await refreshConversations();
+    await refreshConversations(interactive);
   }
 
   async function navigateTo(rel) {
@@ -495,6 +534,24 @@
     if (!currentCwd) return;
     const cut = currentCwd.lastIndexOf("/");
     navigateTo(cut === -1 ? "" : currentCwd.slice(0, cut));
+  });
+
+  // ＋: a new, empty folder under the one shown, then straight into it
+  // (POST /workdirs, the deployment notes). Both trees -- the user asked for it
+  // on Email, and the two pickers are meant to behave the same.
+  document.getElementById("cwd-new").addEventListener("click", async () => {
+    const name = (prompt("新しいフォルダの名前") || "").trim();
+    if (!name) return;
+    const scope = cwdScope;
+    const parent = currentCwd;
+    const post = () => api("/workdirs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope, dir: parent, name }),
+    });
+    const r = await (scope === "mail" ? withUnlockRetry(post) : post()).catch((e) => ({ error: e.message }));
+    if (r.error) return alert(`フォルダを作れませんでした: ${r.error}`);
+    if (scope === cwdScope) navigateTo(r.dir);
   });
 
   // ---- drive/folder picker, for a drives-capable ssh machine's Claude
@@ -530,6 +587,7 @@
     const atRoot = currentSshCwd === "";
     sshCwdCrumbEl.textContent = atRoot ? "ドライブを選択…" : mountPathLabel(currentSshCwd);
     sshCwdUpBtn.disabled = atRoot;
+    sshCwdNewBtn.disabled = atRoot; // a folder needs a drive to go in
 
     sshCwdChildEl.innerHTML = "";
     const items = atRoot ? r.drives : r.subdirs;
@@ -567,6 +625,23 @@
     if (!currentSshCwd) return;
     const cut = currentSshCwd.lastIndexOf("/");
     navigateSshTo(cut === -1 ? "" : currentSshCwd.slice(0, cut));
+  });
+
+  // ＋ on a Windows machine (2026-10-08, user request): the same new-folder
+  // move as #claude-opts' own, created on that machine over ssh.
+  sshCwdNewBtn.addEventListener("click", async () => {
+    if (!currentSshCwd) return;
+    const name = (prompt("新しいフォルダの名前") || "").trim();
+    if (!name) return;
+    const machine = currentMachine;
+    const parent = currentSshCwd;
+    const r = await api("/workdirs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "ssh", machine, dir: parent, name }),
+    }).catch((e) => ({ error: e.message }));
+    if (r.error) return alert(`フォルダを作れませんでした: ${r.error}`);
+    if (machine === currentMachine && parent === currentSshCwd) navigateSshTo(r.dir);
   });
 
   // ---- working-directory-only picker, for "shell"/"host-shell"/
@@ -696,13 +771,15 @@
 
   // Conversations are per-directory (Claude Code files them under the cwd
   // they ran in), so this reruns on every navigation.
-  async function refreshConversations() {
+  async function refreshConversations(interactive = true) {
     const cwd = currentCwd;
-    const { conversations } = await api(`/claude-conversations?cwd=${encodeURIComponent(cwd)}`)
+    const scope = cwdScope;
+    const fetchIt = () => api(`/claude-conversations?scope=${scope}&cwd=${encodeURIComponent(cwd)}`);
+    const { conversations } = await (scope === "mail" && interactive ? withUnlockRetry(fetchIt) : fetchIt())
       .catch(() => ({ conversations: [] }));
     // A slow directory read could land after the user has already picked
     // another directory; that answer belongs to the old one, so drop it.
-    if (currentCwd !== cwd) return;
+    if (currentCwd !== cwd || cwdScope !== scope) return;
     populateConversationSelect(resumeEl, conversations);
   }
 
@@ -919,7 +996,11 @@
         <button class="auth-login" data-scope="${scope}">ログイン</button>
         <button class="auth-logout" data-scope="${scope}">ログアウト</button>
       </div>`;
-    document.getElementById("claude-auth-section").appendChild(row);
+    // Under their own "Other hosts" heading, after the Codex group
+    // (2026-10-06, at the user's request) -- the heading stays hidden on a
+    // host with no reachable ssh machine at all.
+    document.getElementById("ssh-auth-rows").appendChild(row);
+    document.getElementById("ssh-auth-heading").hidden = false;
     authStatusEls[scope] = row.querySelector(".auth-status-text");
     const loginBtn = row.querySelector("button.auth-login");
     const logoutBtn = row.querySelector("button.auth-logout");
@@ -1129,7 +1210,7 @@
     // on textEl further down).
     const attachBtn = document.createElement("button");
     attachBtn.textContent = "📎";
-    attachBtn.title = "画像を添付";
+    attachBtn.title = "ファイルを添付";
     attachBtn.addEventListener("click", () => attachFileInputEl.click());
     modRowEl.appendChild(attachBtn);
 
@@ -1595,7 +1676,48 @@
   // etc. are left as plain text -- this is deliberately just the one marker
   // that shows up constantly and reads badly as literal asterisks, not a
   // markdown renderer).
-  const INLINE_RE = /(https?:\/\/[^\s<>"']+)|\*\*([^\n*]+?)\*\*/g;
+  const INLINE_RE = /(https?:\/\/[^\s<>"'`、。，．（）［］｛｝「」『』【】〔〕〈〉《》“”‘’！？：；]+)|\*\*([^\n*]+?)\*\*/g;
+
+  // The URL pattern above is greedy, so prose like "(see https://x/y)" or
+  // 「https://x/y」 used to link "https://x/y)" and the page failed to open
+  // (2026-10-07, at the user's request). If the URL is preceded by an opening
+  // bracket or quote, it ends at the first matching closer. Otherwise trailing
+  // sentence punctuation and closers with no opener inside the URL are dropped
+  // (so a Wikipedia-style ".../Foo_(bar)" keeps its ")"). Japanese
+  // punctuation never belongs to a URL typed in prose, so INLINE_RE already
+  // stops there ("https://x/y、次は").
+  const URL_PAIRS = {
+    "(": ")", "[": "]", "{": "}", "<": ">", "\"": "\"", "'": "'", "`": "`",
+    "（": "）", "［": "］", "｛": "｝", "「": "」", "『": "』", "【": "】",
+    "〔": "〕", "〈": "〉", "《": "》", "“": "”", "‘": "’",
+  };
+  const URL_CLOSERS = { ")": "(", "]": "[", "}": "{" };
+  const URL_TRAILING_RE = /[.,;:!?*]+$/;
+
+  function trimUrl(url, before) {
+    const closer = URL_PAIRS[before];
+    if (closer) {
+      // Skip closers balanced by an opener inside the URL itself.
+      let depth = 0;
+      for (let i = 0; i < url.length; i++) {
+        if (url[i] === closer && depth === 0) { url = url.slice(0, i); break; }
+        if (closer !== before && url[i] === before) depth++;
+        else if (url[i] === closer) depth--;
+      }
+    }
+    for (;;) {
+      const t = url.replace(URL_TRAILING_RE, "");
+      const last = t.slice(-1);
+      const opener = URL_CLOSERS[last];
+      if (opener && t.split(opener).length < t.split(last).length) {
+        url = t.slice(0, -1);
+      } else if (t === url) {
+        return url;
+      } else {
+        url = t;
+      }
+    }
+  }
 
   // Markdown tables (2026-10-05, at the user's request: Claude Code writes
   // them often and they read badly as raw pipes on a phone) are the one
@@ -1678,17 +1800,19 @@
     for (const m of text.matchAll(INLINE_RE)) {
       if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
       if (m[1]) {
+        const url = trimUrl(m[1], text[m.index - 1]);
         const a = document.createElement("a");
-        a.href = m[1];
-        a.textContent = m[1];
+        a.href = url;
+        a.textContent = url;
         a.target = "_blank";
         a.rel = "noopener noreferrer";
         el.appendChild(a);
-      } else {
-        const strong = document.createElement("strong");
-        strong.textContent = m[2];
-        el.appendChild(strong);
+        last = m.index + url.length;
+        continue;
       }
+      const strong = document.createElement("strong");
+      strong.textContent = m[2];
+      el.appendChild(strong);
       last = m.index + m[0].length;
     }
     if (last < text.length) el.appendChild(document.createTextNode(text.slice(last)));
@@ -3081,7 +3205,7 @@
     refreshTmuxSessions();
     // A finished conversation is itself resumable, and an agent may have
     // created directories -- so both pickers are re-read on the way back.
-    refreshWorkdirs();
+    refreshWorkdirs(false);
   }
 
   // Swipe right to go back, replacing the ← button (2026-08-15, at the
@@ -3265,7 +3389,7 @@
       const body = { preset, label, cols: computeScreenCols(), rows: computeScreenRows() };
       // The backend rejects these outright for the plain shells rather than
       // ignoring them, so only send them for the presets they apply to.
-      if (CWD_PRESETS.includes(preset)) {
+      if (CWD_PRESETS.includes(preset) || preset === "mail-tui") {
         body.cwd = currentCwd;
         body.resume = resumeEl.value;
       } else if (sshCwdMachines.includes(currentMachine) && preset === `claude-tui-${currentMachine}`) {
@@ -3443,7 +3567,7 @@
   // Kept in sync with aigw-backend's MAX_INBOX_BYTES -- this is only a fast
   // client-side rejection so a large pick fails immediately instead of after
   // a slow upload; the backend enforces the real limit regardless.
-  const MAX_ATTACH_BYTES = 15 * 1024 * 1024;
+  const MAX_ATTACH_BYTES = 100 * 1024 * 1024;
 
   function fileToBase64(file) {
     return new Promise((resolve, reject) => {
@@ -3454,14 +3578,12 @@
     });
   }
 
-  async function attachImageFile(file) {
+  // Any file type since 2026-10-07 (user request) -- the session only ever
+  // gets a path, so what the file is doesn't matter to anything here.
+  async function attachFile(file) {
     if (!currentSessionId) return;
-    if (!file.type || !file.type.startsWith("image/")) {
-      alert("画像ファイルのみ添付できます。");
-      return;
-    }
     if (file.size > MAX_ATTACH_BYTES) {
-      alert(`画像が大きすぎます(上限${Math.floor(MAX_ATTACH_BYTES / (1024 * 1024))}MB)。`);
+      alert(`ファイルが大きすぎます(上限${Math.floor(MAX_ATTACH_BYTES / (1024 * 1024))}MB)。`);
       return;
     }
     let path;
@@ -3473,10 +3595,10 @@
       ({ path } = await withUnlockRetry(() => api(sessionPath(currentSessionId, "/attach", currentOwner), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name || "image.png", data_base64 }),
+        body: JSON.stringify({ filename: file.name || (file.type.startsWith("image/") ? "image.png" : "upload"), data_base64 }),
       })));
     } catch (e) {
-      alert(`画像の添付に失敗しました: ${e.message}`);
+      alert(`ファイルの添付に失敗しました: ${e.message}`);
       return;
     }
     const sep = textEl.value && !/[\s]$/.test(textEl.value) ? " " : "";
@@ -3488,7 +3610,7 @@
   attachFileInputEl.addEventListener("change", () => {
     const file = attachFileInputEl.files[0];
     attachFileInputEl.value = ""; // so picking the same file again still fires "change"
-    if (file) attachImageFile(file);
+    if (file) attachFile(file);
   });
 
   // Clipboard-paste is the other half of "両方で" (2026-09-08): works in
@@ -3498,11 +3620,14 @@
     const items = e.clipboardData && e.clipboardData.items;
     if (!items) return;
     for (const item of items) {
-      if (item.type && item.type.startsWith("image/")) {
-        e.preventDefault();
+      // Any pasted file (not just images, 2026-10-07); plain text pastes
+      // have kind "string" and fall through to the normal paste.
+      if (item.kind === "file") {
         const file = item.getAsFile();
-        if (file) attachImageFile(file);
-        break; // one image per paste, same as the file picker's one-file flow
+        if (!file) continue;
+        e.preventDefault();
+        attachFile(file);
+        break; // one file per paste, same as the file picker's one-file flow
       }
     }
   });
@@ -3623,7 +3748,7 @@
     initUnlockUI();
     initSiteExtras();
     applyPresetOptions();
-    await refreshWorkdirs();
+    await refreshWorkdirs(false);
     await refreshSessions();
     await refreshTmuxSessions();
     // Not awaited: it shells into the container, which is slower than

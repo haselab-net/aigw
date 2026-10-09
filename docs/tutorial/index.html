@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aigw チュートリアル</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5b6575; --line: #dde2ea; --card: #f5f7fa;
+    --accent: #2f6fdf; --accent-soft: #e6eefc; --warn: #a15c00; --warn-soft: #fff4e0;
+    --code-bg: #eef1f5; --shot-border: #c9d0da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151b; --fg: #e4e8ee; --muted: #9aa5b4; --line: #2a313b; --card: #182029;
+      --accent: #6f9ff5; --accent-soft: #1d2b44; --warn: #f0b35a; --warn-soft: #33270f;
+      --code-bg: #1d2530; --shot-border: #343d49;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.75 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 1.9rem; line-height: 1.3; margin: 8px 0 4px; }
+  h2 { font-size: 1.4rem; margin: 56px 0 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; margin: 28px 0 8px; }
+  p, li { max-width: 72ch; }
+  a { color: var(--accent); }
+  code, kbd, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 6px; background: var(--card); }
+  .lead { color: var(--muted); margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: .95rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .scroll { overflow-x: auto; }
+  .note { background: var(--accent-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn { background: var(--warn-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn strong { color: var(--warn); }
+  nav.toc { background: var(--card); border-radius: 10px; padding: 12px 18px; margin: 20px 0; }
+  nav.toc ol { margin: 4px 0; padding-left: 1.4em; }
+  .shot { display: flex; gap: 20px; align-items: flex-start; margin: 16px 0; flex-wrap: wrap; }
+  .shot figure { margin: 0; flex: 0 0 auto; }
+  .shot img { width: 260px; max-width: 100%; border: 1px solid var(--shot-border); border-radius: 14px; display: block; }
+  .shot figcaption { font-size: .85rem; color: var(--muted); margin-top: 4px; max-width: 260px; }
+  .shot .side { flex: 1 1 280px; min-width: 0; }
+  ol.steps > li { margin-bottom: 6px; }
+  .diagram { margin: 16px 0; }
+  .diagram svg { width: 100%; height: auto; display: block; }
+  .diagram svg text { fill: var(--fg); font-family: inherit; }
+  .diagram .q { fill: var(--muted); }
+  .diagram .box { fill: none; stroke: var(--muted); stroke-width: 1.25; }
+  .diagram .acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+  .diagram .wrn { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+  .diagram .ln { stroke: var(--muted); stroke-width: 1.25; fill: none; }
+  .diagram .mk { fill: var(--muted); }
+  .badge { display: inline-block; font-size: .8rem; padding: 0 8px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
+  footer { margin-top: 64px; color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>aigw チュートリアル</h1>
+<p class="lead">スマホや PC のブラウザから、サーバー上の AI エージェント(Claude Code など)を使うための手引きです。2026-10-09 時点の画面で説明します。サーバーごとに入っている機能が少し違うので、分からないところは管理者に確認してください。</p>
+
+<p>aigw は <code>https://&lt;サーバー&gt;/agents/</code> で開くチャット風の画面です。チャットに書いた指示は、サーバー上の自分専用のコンテナで動く Claude Code に届き、返事がチャットに戻ってきます。</p>
+
+<nav class="toc">
+<strong>目次</strong>
+<ol>
+  <li><a href="#account">アカウントを作る</a></li>
+  <li><a href="#screens">画面の見方</a></li>
+  <li><a href="#coding">普段の AI コーディングのしかた</a></li>
+  <li><a href="#keys">キー入力</a></li>
+  <li><a href="#screen-vs-chat">ターミナル画面とチャットの関係</a></li>
+  <li><a href="#where">砂場・ホスト・ルート・Email の違い</a></li>
+  <li><a href="#settings">設定画面と Claude へのログイン</a></li>
+  <li><a href="#passkey">Email とパスキー(鍵)の登録</a></li>
+  <li><a href="#root">ルートになるための手順</a></li>
+  <li><a href="#faq">困ったとき</a></li>
+</ol>
+</nav>
+
+<!-- ===================================================================== -->
+<h2 id="account">1. アカウントを作る</h2>
+
+<p>管理者が許可したドメインの Google アカウントがあれば、aigw の画面から自分でアカウントを作れます(この機能を有効にしているサーバーの場合)。そうでなければ管理者に作ってもらいます。</p>
+
+<ol class="steps">
+  <li>ブラウザで <code>https://&lt;サーバー&gt;/agents/</code> を開き、「Google でログイン」から<strong>許可されたドメインのアカウント</strong>を選びます。</li>
+  <li>まだアカウントが無いと「アカウント作成」のフォームが出ます。<strong>ユーザー名</strong>を決めて送信します。
+    <ul>
+      <li>使える文字は英小文字・数字・<code>-</code>・<code>_</code>。先頭は英小文字か <code>_</code>。32文字まで。</li>
+      <li>あとから自分では変えられません。</li>
+    </ul>
+  </li>
+  <li>送信すると <strong>SSH の秘密鍵が1回だけ表示</strong>されます。画面を閉じる前に必ず保存してください。二度と表示されません。</li>
+  <li>これで aigw が使えます。次回からは Google でログインするだけです。</li>
+</ol>
+
+<h3>SSH でも入れるようにする(パスキー登録に必要)</h3>
+<p>aigw だけを使うなら SSH は不要です。ただし、<a href="#passkey">Email やホストのシェルに使うパスキーの登録</a>には SSH ログインが1回要るので、早めに済ませておくと楽です。</p>
+<pre><code># 自分の PC で: もらった鍵を保存して権限を絞る
+mv ~/Downloads/id_ed25519_<ユーザー名> ~/.ssh/
+chmod 600 ~/.ssh/id_ed25519_<ユーザー名>
+
+# 初回ログイン。ログイン直後にパスワードの設定を求められる
+ssh -i ~/.ssh/id_ed25519_<ユーザー名> <ユーザー名>@<サーバー></code></pre>
+<p>パスワードは、この初回ログインで決めるまで誰にも使えない状態になっています。2回目からは同じコマンドで入れます。</p>
+
+<div class="note">管理者に作ってもらったアカウントで aigw にログインできないときは、SSH で入って <code>aigw-set-email you@example.com</code> を1回実行してください。そのメールアドレスの Google アカウントでログインできるようになります。</div>
+
+<!-- ===================================================================== -->
+<h2 id="screens">2. 画面の見方</h2>
+
+<p>aigw の画面は「セッション一覧」と「チャット」の2枚です。セッションとは、サーバー上で動き続ける1つの作業場所(Claude Code やシェル)のことです。</p>
+
+<h3>セッション一覧(トップ画面)</h3>
+<div class="shot">
+  <figure><img src="img/01-top.png" alt="aigw のトップ画面。上にマシン選択とユーザー名、その下に新しいセッションの作成欄とセッションの一覧"><figcaption>トップ画面。上の作成欄で「Claude」を選んだところ</figcaption></figure>
+  <div class="side">
+    <table>
+      <tr><th>場所</th><th>意味</th></tr>
+      <tr><td><code>server</code> の選択欄</td><td>どのマシンで動かすか(ssh でつないだ他のマシンがあればここに並びます)。<strong>設定</strong>画面もここから選びます</td></tr>
+      <tr><td>ユーザー名</td><td>タップするとログアウト</td></tr>
+      <tr><td><code>Doc</code></td><td>サーバーのドキュメントを読む画面(サーバーによっては無い)</td></tr>
+      <tr><td><code>⟳</code></td><td>再読み込み(上のバーを下にスワイプしても同じ)</td></tr>
+      <tr><td>🔑 / 🔓</td><td>パスキーで解錠中の印。🔑 はホストまで、🔓 はルートまで。タップするとすぐ施錠</td></tr>
+      <tr><td>作成欄</td><td>種類・フォルダ・名前を選んで <strong>開始</strong></td></tr>
+      <tr><td>各行の ● </td><td>緑は動いている、灰色は終了したセッション</td></tr>
+      <tr><td>⠿ ✏️ 🔗 🗄 🗑</td><td>並べ替え・名前の変更・他のセッションとつなぐ・アーカイブ(一覧から隠すだけ)・削除</td></tr>
+    </table>
+  </div>
+</div>
+
+<h3>チャット画面</h3>
+<div class="shot">
+  <figure><img src="img/02-chat.png" alt="チャット画面。上に戻るボタンとセッション名、中央に会話、下にキーの列と入力欄"><figcaption>Claude に hello.py を作らせたところ</figcaption></figure>
+  <div class="side">
+    <table>
+      <tr><th>場所</th><th>意味</th></tr>
+      <tr><td><code>←</code></td><td>一覧へ戻る(画面を右へスワイプしても戻れます)</td></tr>
+      <tr><td>● (名前の左)</td><td>動いているか。<strong>長押しで強制終了</strong>(確認が出ます)</td></tr>
+      <tr><td>🖥️</td><td>ターミナル画面(画面パネル)を開く・閉じる。<a href="#screen-vs-chat">5章</a></td></tr>
+      <tr><td>🧑‍🤝‍🧑</td><td>このセッションを他の人と共有する。会話の保存(💾)もこの中</td></tr>
+      <tr><td>キーの列</td><td><kbd>Ctrl</kbd> <kbd>⇧</kbd> <kbd>Alt</kbd> <kbd>↑</kbd> <kbd>↓</kbd> … 横にスクロールでき、右端に 📎(ファイル添付)。<a href="#keys">4章</a></td></tr>
+      <tr><td><strong>送信</strong> / <strong>実行</strong></td><td>実行は Enter 付き、送信は Enter なし。<a href="#keys">4章</a></td></tr>
+    </table>
+    <p>セッションはブラウザを閉じても動き続けます。一覧から開き直せば、そのまま続きを見られます。スマホでは「ホーム画面に追加」しておくと、返事が来たときに通知が届きます(iPhone ではこれが必須です)。</p>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="coding">3. 普段の AI コーディングのしかた</h2>
+
+<p>普段は <strong>Claude</strong> を選んでセッションを作り、チャットで指示するだけです。Claude は自分専用のコンテナ(砂場)の中で、ファイルを作り、コマンドを実行します。</p>
+
+<h3>セッションを作る</h3>
+<ol class="steps">
+  <li>作成欄の種類で <strong>Claude</strong> を選びます。</li>
+  <li>📁 の行で作業フォルダを選びます。最初は <code>sandhome</code>(コンテナの中のホーム)です。
+    <ul>
+      <li>「サブフォルダを開く…」で1段ずつ下へ、<code>↑</code> で上へ移動します。</li>
+      <li><code>＋</code> で今いる場所に新しいフォルダを作れます。</li>
+    </ul>
+  </li>
+  <li>⏱ の欄は普段は「新規」のまま。前の会話を続けたいときは、ここで選びます(下の「続きから」)。</li>
+  <li>「権限確認をスキップ」は普段はオンのままでかまいません。コンテナの中なので、Claude がファイルを書き換えても外には影響しません。</li>
+  <li>名前を付けて(任意)<strong>開始</strong>を押すとチャット画面になります。</li>
+</ol>
+
+<h3>指示を出す・結果を受け取る</h3>
+<ul>
+  <li>入力欄に日本語で書いて <strong>実行</strong>。スマホのキーボードの改行キーも実行と同じです(入力欄の中で改行したいときは Shift+Enter)。</li>
+  <li>Claude が考えている間も、続けて指示を送れます。</li>
+  <li><strong>手元のファイルを渡す</strong>: 📎 で選ぶか、入力欄に貼り付けます。サーバー上に保存され、そのパスが入力欄に入るので、「このファイルを見て…」と続けて送ります。1ファイル 100MB まで。</li>
+  <li><strong>画像やファイルを見せてもらう</strong>: 「結果のグラフをチャットに表示して」と頼むと、Claude が所定の場所に置き、チャットに画像やダウンロードのリンクが出ます。3D モデル(.glb など)はタップするとビューアが開きます。</li>
+</ul>
+
+<h3>後で続きをする</h3>
+<ul>
+  <li>セッションは動いたままなので、一覧から開けば続けられます。使わないものは 🗄 でアーカイブすると一覧がすっきりします。</li>
+  <li>セッションを終了・削除しても、会話は残っています。新しく作るときに同じフォルダを選び、⏱ の欄で日時と内容の要約から選ぶと<strong>続きから</strong>再開できます。</li>
+  <li>Claude のセッションは claude.ai/code や Claude の公式アプリからも同じものを操作できます(画面パネルに出る <code>/remote-control</code> の案内)。</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="keys">4. キー入力</h2>
+
+<h3>送信と実行</h3>
+<div class="scroll"><table>
+  <tr><th>ボタン</th><th>送るもの</th><th>使うとき</th></tr>
+  <tr><td><strong>実行</strong></td><td>文字 + Enter。入力欄が空なら Enter だけ</td><td>普段の指示。選択メニューで今の項目に決めたいときは、空のまま実行</td></tr>
+  <tr><td><strong>送信</strong></td><td>文字だけ(Enter なし)</td><td>メニューが出ている最中に文字を入れたいとき、コマンドを途中まで打って Tab 補完したいとき</td></tr>
+</table></div>
+
+<h3>キーの列(ソフトキーボード)</h3>
+<div class="shot">
+  <figure><img src="img/05-menu-down.png" alt="画面パネルに Claude のモデル選択メニューが出ていて、カーソル記号が3番目の項目にある"><figcaption><code>/model</code> のメニューで <kbd>↓</kbd> を押したところ。❯ が動いたのは画面パネルでだけ見えます</figcaption></figure>
+  <figure><img src="img/06-ctrl.png" alt="Ctrl を押して青くなり、英数字のキーが並んだ状態"><figcaption><kbd>Ctrl</kbd> を押すと英数字が並びます。続けて <kbd>c</kbd> で Ctrl+C</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd> <kbd>Tab</kbd> <kbd>⇧Tab</kbd> <kbd>Esc</kbd> <kbd>⏎</kbd>(Enter)<kbd>⌫</kbd> <kbd>Del</kbd> <kbd>🏡</kbd>(Home)<kbd>End</kbd> <kbd>PgU</kbd> <kbd>PgD</kbd> <kbd>Spc</kbd> はタップするとすぐ送られます。</li>
+      <li><kbd>Ctrl</kbd> <kbd>⇧</kbd> <kbd>Alt</kbd> は<strong>押しっぱなし扱い</strong>です。タップすると色が付き、次に押したキーと組み合わせて送られ、元に戻ります。Ctrl を押すと英数字のキーが現れます。</li>
+    </ul>
+    <h3>よく使う組み合わせ</h3>
+    <table>
+      <tr><th>したいこと</th><th>押すキー</th></tr>
+      <tr><td>Claude の作業を止める</td><td><kbd>Esc</kbd></td></tr>
+      <tr><td>シェルのコマンドを中断</td><td><kbd>Ctrl</kbd> → <kbd>c</kbd></td></tr>
+      <tr><td>メニューの項目を選ぶ</td><td><kbd>↑</kbd> <kbd>↓</kbd> で動かし <kbd>⏎</kbd>(または空のまま <strong>実行</strong>)</td></tr>
+      <tr><td>メニューを閉じる</td><td><kbd>Esc</kbd></td></tr>
+      <tr><td>Claude のモード(権限確認・計画モード)を切り替える</td><td><kbd>⇧Tab</kbd></td></tr>
+      <tr><td>前に送った指示を呼び出す</td><td><kbd>↑</kbd></td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="screen-vs-chat">5. ターミナル画面とチャットの関係</h2>
+
+<p>サーバー上では、Claude やシェルは<strong>本物のターミナルの中</strong>で動いています。aigw はその様子を2つの形で見せます。</p>
+
+<div class="diagram" role="img" aria-label="ターミナルの中身は、チャットには記録として追記され、画面パネルにはそのままの姿で映る">
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mk"/></marker></defs>
+  <text x="24" y="28" font-size="15" font-weight="600">ターミナルの中身が、2つの形で見える</text>
+  <rect class="acc" x="24" y="88" width="210" height="96" rx="8"/>
+  <text x="129" y="122" text-anchor="middle" font-weight="600">サーバー上のターミナル</text>
+  <text x="129" y="146" text-anchor="middle" class="q" font-size="12">Claude Code やシェルが</text>
+  <text x="129" y="164" text-anchor="middle" class="q" font-size="12">実際に動いている場所</text>
+  <rect class="box" x="436" y="52" width="300" height="72" rx="8"/>
+  <text x="586" y="80" text-anchor="middle" font-weight="600">チャット(吹き出し)</text>
+  <text x="586" y="104" text-anchor="middle" class="q" font-size="12">出力を順に書き足す記録。後から読み返せる</text>
+  <rect class="box" x="436" y="150" width="300" height="72" rx="8"/>
+  <text x="586" y="178" text-anchor="middle" font-weight="600">画面パネル(🖥️)</text>
+  <text x="586" y="202" text-anchor="middle" class="q" font-size="12">今の画面そのもの。メニューのカーソルも見える</text>
+  <path class="ln" d="M234 120 C 330 120, 330 88, 434 88" marker-end="url(#ar1)"/>
+  <path class="ln" d="M234 156 C 330 156, 330 186, 434 186" marker-end="url(#ar1)"/>
+  <text x="334" y="96" text-anchor="middle" class="q" font-size="12">新しく出た行</text>
+  <text x="334" y="196" text-anchor="middle" class="q" font-size="12">0.3秒ごとの画面</text>
+  <text x="129" y="226" text-anchor="middle" class="q" font-size="12">キーの列と入力欄から操作が届く</text>
+</svg>
+</div>
+
+<div class="shot">
+  <figure><img src="img/03-screen.png" alt="画面パネルを開いたチャット画面。上半分が等幅のターミナル画面、下半分がチャットの吹き出し"><figcaption>🖥️ を押すと上に画面パネルが開く。下はいつものチャット</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li><strong>チャット</strong>は記録です。新しく出た出力が吹き出しとして順に積み重なり、あとで読み返したり、🧑‍🤝‍🧑 の中の 💾 で保存したりできます。</li>
+      <li><strong>画面パネル</strong>は今の画面そのものです。選択メニューの ❯ が動く、進み具合の表示が変わる、といった「その場での書き換え」はチャットには出ないので、画面パネルで見ます。</li>
+      <li>キーは両方に効きます。メニューが出たら画面パネルを開いて、キーの列で操作してください。</li>
+      <li>画面パネルをいちばん上までスクロールすると、過去に消えていった画面を遡れます。左上の「● ライブに戻る」で今の画面に戻ります。</li>
+      <li>右上の 🤖 は、Claude が裏で動かしているサブエージェントの様子です。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="where">6. 砂場・ホスト・ルート・Email の違い</h2>
+
+<p>作成欄の種類は「どこで動くか」が違います。普段使うのは<strong>砂場</strong>(Claude・Codex・Shell (sandbox内))だけです。</p>
+
+<div class="diagram" role="img" aria-label="砂場と Email の箱はサーバーの中の別々のコンテナ、ホストとルートはコンテナの外で、外に出るにはパスキーが要る">
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="24" y="28" font-size="15" font-weight="600">コンテナの外(ホスト・ルート・Email)に出るにはパスキーが要る</text>
+  <rect class="box" x="24" y="48" width="712" height="262" rx="10"/>
+  <text x="40" y="72" font-weight="600">サーバー</text>
+  <rect class="acc" x="48" y="92" width="300" height="96" rx="8"/>
+  <text x="64" y="118" font-weight="600">砂場(自分専用のコンテナ)</text>
+  <text x="64" y="140" class="q" font-size="12">Claude / Codex / Shell (sandbox内)</text>
+  <text x="64" y="158" class="q" font-size="12">見えるのは ~/sandhome だけ</text>
+  <text x="64" y="176" class="q" font-size="12">パスキー不要。普段はここ</text>
+  <rect class="wrn" x="412" y="92" width="300" height="96" rx="8"/>
+  <text x="428" y="118" font-weight="600">Email の箱(もう1つのコンテナ)</text>
+  <text x="428" y="140" class="q" font-size="12">Email(設定されたサーバーだけ)</text>
+  <text x="428" y="158" class="q" font-size="12">見えるのは ~/mailbox だけ。砂場からは見えない</text>
+  <text x="428" y="176" class="q" font-size="12">🔑 ホスト階層のパスキーで解錠</text>
+  <rect class="wrn" x="48" y="208" width="300" height="84" rx="8"/>
+  <text x="64" y="234" font-weight="600">ホスト(コンテナの外、自分の権限)</text>
+  <text x="64" y="256" class="q" font-size="12">Shell (sandbox外・ホスト)。本物のホームが見える</text>
+  <text x="64" y="274" class="q" font-size="12">🔑 ホスト階層のパスキーで解錠</text>
+  <rect class="wrn" x="412" y="208" width="300" height="84" rx="8"/>
+  <text x="428" y="234" font-weight="600">ルート(サーバーの管理者権限)</text>
+  <text x="428" y="256" class="q" font-size="12">Shell (root・sandbox外)。許可された人だけに出る</text>
+  <text x="428" y="274" class="q" font-size="12">🔓 ルート階層のパスキーで解錠</text>
+</svg>
+</div>
+
+<div class="scroll"><table>
+  <tr><th>種類(作成欄の表示)</th><th>動く場所</th><th>見えるもの</th><th>パスキー</th><th>使いどころ</th></tr>
+  <tr><td><strong>Claude</strong> / Codex / Shell (sandbox内)</td><td>砂場: 自分専用のコンテナ</td><td><code>~/sandhome</code> だけ</td><td>不要</td><td>普段の開発すべて</td></tr>
+  <tr><td><strong>Email</strong></td><td>Email の箱: 砂場とは別のコンテナ(設定されたサーバーだけ)</td><td><code>~/mailbox</code> だけ</td><td>🔑 ホスト階層</td><td>メールや個人情報など、開発用の砂場に置きたくないもの</td></tr>
+  <tr><td>Shell (sandbox外・ホスト)</td><td>サーバーそのもの、自分の権限</td><td>本物のホーム(<code>~/</code>)など</td><td>🔑 ホスト階層</td><td>コンテナの外のファイルを触るとき</td></tr>
+  <tr><td>Shell (root・sandbox外)</td><td>サーバーそのもの、root</td><td>すべて</td><td>🔓 ルート階層</td><td>サーバーの管理。許可された人だけに表示</td></tr>
+</table></div>
+
+<ul>
+  <li><strong>なぜ砂場が普段使いなのか</strong>: コンテナの中では、Claude が何を実行しても自分の <code>~/sandhome</code> の外には届きません。だから権限確認をスキップしても安全です。</li>
+  <li><strong>Email の箱を分ける理由</strong>: 砂場では、<code>npm install</code> で入ってきた他人のパッケージも動きます。メールのような情報をそこに置くと、それらからも読めてしまいます。Email の箱は砂場から見えない別のコンテナで、会話の記録も <code>~/mailbox</code> の側に残ります。</li>
+  <li>マシン選択で ssh でつないだ他のマシンを選ぶと、その機械の Claude やシェルも使えます。砂場とはファイルを共有しません。</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="settings">7. 設定画面と Claude へのログイン</h2>
+
+<p>Claude を初めて使う前に、<strong>使う場所ごとに1回ずつ</strong> Claude にログインします。砂場・ホスト・ルート・他のマシンでログイン情報は別々です。Email の箱だけは設定画面に行が無く、<a href="#passkey">箱の中で</a>ログインします。</p>
+
+<div class="shot">
+  <figure><img src="img/07-settings.png" alt="設定画面。Accounts の見出しの下に sandbox内・sandbox外(host)・root の行があり、それぞれにログインとログアウトのボタン"><figcaption>設定画面。各行にログイン中のアカウントが出る</figcaption></figure>
+  <div class="side">
+    <h3>開き方</h3>
+    <p>トップ画面のマシン選択(<code>server</code> の欄)で<strong>設定</strong>を選びます。戻るときは、同じ欄で <code>server</code>(このサーバー)を選び直します。</p>
+    <h3>ログインの手順</h3>
+    <ol class="steps">
+      <li>「Accounts」の <strong>sandbox内</strong> の行(ホストや他のマシンで使うならその行)の <strong>ログイン</strong> を押します。ログイン用のチャット画面が開きます。</li>
+      <li>チャットに URL が出るので、タップしてブラウザで開き、Claude のアカウントで承認します。</li>
+      <li>表示されたコードをコピーし、チャットの入力欄に貼り付けて <strong>実行</strong>。<strong>貼ったコードは画面に表示されません</strong>が、それで正常です。</li>
+      <li>成功・失敗の1行が出てログイン用のセッションは自動で消えます。設定画面の行にメールアドレスが出ていれば完了です。</li>
+    </ol>
+    <ul>
+      <li>行の文字が「Not logged in」(黄色)のところでは、その場所の Claude は動きません。</li>
+      <li><strong>Codex</strong> の欄も同じ手順です(ChatGPT のアカウント)。</li>
+      <li>見出しの横の ⟳ で状態を取り直せます。</li>
+      <li>いちばん下の <strong>Kill Chrome</strong> は、自分用のテスト用ブラウザ(ヘッドフル Chrome)を止めるボタンです。重くなったときに押してかまいません。次に使えば自動でまた起動します。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="passkey">8. Email とパスキー(鍵)の登録</h2>
+
+<p>Email・ホスト・ルートのようにコンテナの外へ出るときは、<strong>パスキー</strong>(スマホの指紋・顔認証や PC の PIN で守られた鍵)で解錠します。aigw のログインが盗まれても、手元の端末が無ければ外には出られないようにするためです。</p>
+
+<h3>パスキーを登録する(最初の1回)</h3>
+<ol class="steps">
+  <li>PC から SSH でサーバーに入ります(<a href="#account">1章</a>)。<pre><code>ssh <ユーザー名>@<サーバー>
+aigw-passkey register</code></pre></li>
+  <li>URL が表示されます。<strong>5分以内</strong>に、パスキーを置きたい端末(普段 aigw を使うスマホなど)のブラウザで開きます。</li>
+  <li>「パスキー登録」のページで <strong>パスキーを登録する</strong> を押し、指紋・顔認証・PIN で確認します。</li>
+  <li>完了の表示が出たら終わりです。端末を増やしたいときは、その端末でもう一度同じ手順を行います。</li>
+</ol>
+<div class="note">パスキーはサーバーごとです。別のサーバーでも使うなら、そちらでも登録します。登録済みの一覧は <code>aigw-passkey list</code>、今の状態は <code>aigw-passkey status</code> で見られます。</div>
+
+<h3>Email を使う</h3>
+<div class="shot">
+  <figure><img src="img/08-email-bar.png" alt="作成欄で Email を選んだところ。フォルダは Email、続きからの欄は新規"><figcaption>作成欄で Email を選んだところ</figcaption></figure>
+  <div class="side">
+    <ol class="steps">
+      <li>作成欄で <strong>Email</strong> を選びます(設定されたサーバーにだけあります)。フォルダは自分の <code>~/mailbox</code> から始まり、Claude と同じように下のフォルダを選んだり、<code>＋</code> で作ったりできます。</li>
+      <li><strong>開始</strong>を押すと、端末のパスキーの確認が出ます。指紋などで確認すると、右上に 🔑 が付いて解錠され、セッションが始まります。</li>
+      <li><strong>初めての Email セッションだけ</strong>、箱の中の Claude がログインを求めます。🖥️ で画面パネルを開き、キーの列の <kbd>↑</kbd> <kbd>↓</kbd> <kbd>⏎</kbd> でログイン方法(Claude のアカウント)を選び、出てきた URL を開いて承認し、表示されたコードを入力欄に貼って <strong>実行</strong> します。続けて権限確認をスキップしてよいかの確認が出たら、同意する方を選びます。2回目からは出ません。</li>
+      <li>あとは砂場の Claude と同じ使い方です。<code>~/mailbox</code> は最初は空なので、使いたい道具(メールを読むスクリプトなど)は自分で、または Claude に頼んで用意します。</li>
+    </ol>
+    <ul>
+      <li>解錠は、施錠するか<strong>2時間</strong>たつまで続きます。</li>
+      <li>右上の 🔑 をタップすると、すぐに施錠できます。施錠中に Email のセッションを開くと「🔒 … 解錠する」の帯が出るので、タップして解錠します。</li>
+      <li>Email の箱は、砂場の Claude からは見えません。逆に、Email の中身を砂場に持ち出す指示も出さないようにしてください。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="root">9. ルートになるための手順</h2>
+
+<p>ルート(サーバーの管理者権限)は、<strong>管理者が許可した人だけ</strong>が使えます。経路は2つあり、どちらも本人の操作が要ります。</p>
+
+<h3>aigw の「Shell (root・sandbox外)」を使う</h3>
+<ol class="steps">
+  <li>管理者に頼みます。管理者がサーバーで次を実行し、表示された URL を渡してくれます。<pre><code>sudo aigw-passkey register <ユーザー名> --tier root</code></pre></li>
+  <li>受け取った URL を<strong>5分以内</strong>に、自分の端末のブラウザで開いて <strong>パスキーを登録する</strong> を押します。これがルート階層のパスキーです(ホストと Email の解錠にも使えます)。</li>
+  <li>aigw を再読み込みすると、作成欄に <strong>Shell (root・sandbox外)</strong> が出ます。選んで <strong>開始</strong> を押し、パスキーで確認すると右上が 🔓 になり、root のシェルが開きます。</li>
+  <li>root のシェルで Claude を使うには、設定画面の <strong>root</strong> の行で Claude にログインしておきます(<a href="#settings">7章</a>)。</li>
+</ol>
+<div class="warn"><strong>施錠しても、root のシェルの中の作業は止まりません。</strong> 窓が閉じると aigw から見えなくなるだけで、次に解錠すれば同じ画面に戻れます。</div>
+
+<h3>SSH で <code>sudo</code> を使う</h3>
+<p>サーバーで <code>sudo</code> を許可されている人は、SSH で入って <code>sudo</code> を使えます。誰に許可するかは管理者が決めます。</p>
+
+<!-- ===================================================================== -->
+<h2 id="faq">10. 困ったとき</h2>
+<div class="scroll"><table>
+  <tr><th>症状</th><th>対処</th></tr>
+  <tr><td>aigw にログインできない</td><td>許可されたドメインのアカウントを選んでいるか確認。管理者が作ったアカウントなら、SSH で <code>aigw-set-email</code> を実行(<a href="#account">1章</a>)</td></tr>
+  <tr><td>Claude が何も返さない・ログインを求められる</td><td>設定画面で、その場所の行が「Not logged in」になっていないか確認してログイン(<a href="#settings">7章</a>)</td></tr>
+  <tr><td>チャットが止まって見える</td><td>🖥️ で画面パネルを開く。メニューや確認の質問で止まっていることが多いので、キーの列で答える</td></tr>
+  <tr><td>キーを押しても反応が見えない</td><td>チャットにはその場の書き換えが出ないため。画面パネルで確認する(<a href="#screen-vs-chat">5章</a>)</td></tr>
+  <tr><td>Email やホストのシェルが「解錠」を求めて進まない</td><td>パスキーを登録したか、その端末で登録したかを確認(<a href="#passkey">9章</a>)。施錠中の帯が出ていればタップ</td></tr>
+  <tr><td>Claude の作業を止めたい</td><td><kbd>Esc</kbd>。それでも止まらなければ、名前の左の ● を長押しして強制終了</td></tr>
+  <tr><td>画面が古いまま</td><td>右上の ⟳ か、上のバーを下にスワイプ</td></tr>
+  <tr><td>それでも分からない</td><td>管理者に相談</td></tr>
+</table></div>
+
+<footer>aigw チュートリアル · 2026-10-09 · 画面写真はスマホ幅で撮影し、ユーザー名・メールアドレス・マシン名を置き換えたもの</footer>
+</div>
+</body>
+</html>

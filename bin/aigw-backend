@@ -52,6 +52,9 @@ outbox/ to have them shown as attachments, without this process ever needing
 to `docker exec` just to read them back out.
 """
 import base64
+import hashlib
+import hmac
+import secrets
 import datetime
 import difflib
 import getpass
@@ -208,6 +211,14 @@ SSH_CONFIG_PATH = "/opt/aigw-ssh/config"
 # each need to create their own socket here; namespaced by uid so one user's
 # ssh multiplexing can't be reused (and can't be broken) by another's.
 SSH_CONTROL_DIR = "/run/aigw-ssh-mux"
+# Environment for every ssh/scp this backend runs (2026-10-08). OpenSSH runs
+# ProxyJump's hop as `$SHELL -c 'exec ssh -W ...'`, and $SHELL here is the
+# account's login shell (systemd sets it from passwd). For a self-signup
+# account that has not set its password yet, that is adm-force-password-setup,
+# which refuses every command -- so every ssh machine looked unreachable and
+# the machine selector never appeared for that user. Only these ssh calls get
+# a plain /bin/sh; the user's own shells (tmux panes) keep their login shell.
+SSH_ENV = {**os.environ, "SHELL": "/bin/sh"}
 SSH_MACHINES_CONFIG_PATH = "/etc/aigw/ssh_machines.json"
 # Deployment-specific (which GPU/remote machines exist, at what paths), so
 # this lives in a config file rather than a code literal -- see
@@ -313,6 +324,17 @@ def _load_mailbox():
               file=sys.stderr, flush=True)
         return None
     path = Path(directory)
+    # "~/<name>" (2026-10-09): every user gets their own box under their own
+    # home, created 0700 on first start, instead of only the one user whose
+    # home an absolute `dir` happens to be in.
+    if directory.startswith("~/") and directory[2:].strip("/"):
+        path = HOME / directory[2:].strip("/")
+        try:
+            path.mkdir(mode=0o700, exist_ok=True)
+        except OSError as e:
+            print(f"[aigw-backend] {MAILBOX_CONFIG_PATH}: cannot create {path} ({e}) "
+                  "-- no Email preset configured", file=sys.stderr, flush=True)
+            return None
     # Must be under this user's own home: `sandbox new` enforces the same
     # rule itself and would reject anything else, so catching it here only
     # turns a confusing pane-death into a startup log line. Not a security
@@ -435,7 +457,7 @@ def _ssh_invoke(machine, remote_cmd, timeout=15, text=True, connect_timeout=10):
                 "-o", f"ControlPath={control_path}", "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
                 "-o", f"ConnectTimeout={connect_timeout}", _ssh_host(machine), remote_cmd]
     try:
-        return subprocess.run(ssh_argv, capture_output=True, text=text, timeout=timeout)
+        return subprocess.run(ssh_argv, capture_output=True, text=text, timeout=timeout, env=SSH_ENV)
     except subprocess.TimeoutExpired:
         msg = f"ssh to {machine} timed out after {timeout}s (it may still be starting up -- try again in a moment)"
         empty, msg = (b"", msg.encode()) if not text else ("", msg)
@@ -665,19 +687,21 @@ if MAILBOX:
         # wrapper's own usage comment both still spell it "new --claude";
         # those are documentation errors, not a code bug.)
         #
-        # KNOWN LIMITATION, measured the same day: AIGW_OUTBOX and
-        # AIGW_TALKTO do NOT reach Claude Code here. create_session sets
-        # them with `env VAR=... <command>`, which puts them in the HOST
-        # pane -- and this command crosses into a container, where neither
-        # sudo nor `docker run` carries them over (verified: both read back
-        # empty inside). So a session on this preset has no outbox (no
-        # images/attachments surfaced into the chat) and no talkto. The
-        # chat itself is unaffected, because that comes from capture-pane
-        # on the host pane, not from anything inside the container. Fixing
-        # it would mean teaching the sandbox CLI to forward env into the
-        # container, which is a change to the privilege-boundary script
-        # this preset was shaped specifically to avoid touching.
-        "command": ["sandbox", "--claude", "--fg", "new",
+        # AIGW_OUTBOX and AIGW_TALKTO: create_session sets them with
+        # `env VAR=... <command>`, which puts them in the HOST pane, and
+        # neither sudo nor `docker exec` carries them into the box (measured
+        # 2026-10-04). Since 2026-10-09 create_session also passes
+        # `--aigw-session <id>`, and the sandbox CLI sets exactly these
+        # two inside the box from paths it builds under DIR/.aigw/<id>/ --
+        # a narrow, validated option rather than forwarding env in general.
+        # `box`, not `new` (2026-10-07, at the user's request): one resident
+        # container box-<user>-<container_name> shared by every Email
+        # session, the way devbox-<user> is shared, instead of a disposable
+        # container per session under one fixed name -- which allowed only
+        # one Email session at a time (a second died on docker's name
+        # conflict). `box` also kills the session's own processes in the
+        # container when the pane goes away (see the sandbox CLI).
+        "command": ["sandbox", "--claude", "--fg", "box",
                     MAILBOX["container_name"], str(MAILBOX["dir"])],
         "location": "host",
         # Same 100 columns as claude-tui, same reason: the TUI lays itself
@@ -1162,6 +1186,76 @@ def sandbox_exec(args, timeout=15):
         ["sandbox", "exec", "--", *args],
         capture_output=True, text=True, timeout=timeout,
     )
+
+
+# ---- requester signature for /sandbox/... proxied apps (the deployment notes) ----
+#
+# 2026-10-07, user request ("他のユーザがそのブラウザを見たり、操作したり
+# できないように"): /sandbox/<owner>/port<N>/ deliberately lets ANY logged-in
+# aigw user reach another user's container ports, so an app in there cannot
+# tell its owner from anyone else -- chromedbg-viewer relied on a random URL
+# token alone, and that URL is printed into the (shareable) session chat.
+# Now every proxied request carries X-Aigw-User / X-Aigw-Exp / X-Aigw-Sig:
+# who aigw-gateway authenticated, signed by THIS user's backend with a key
+# only this user (and root) can read -- VIEWER_KEY_NAME under each tree a
+# container of theirs mounts as $HOME (~/sandhome, the Email MAILBOX dir), mode
+# 0600 in a 0700 home. An app checks HMAC-SHA256(key, "<user>\n<exp>") and
+# that <user> is its own account. Another host user who could reach the
+# container IP directly cannot forge it (cannot read the key); nginx
+# overwrites any client-sent copies of these headers.
+VIEWER_KEY_NAME = ".aigw/viewer.key"
+SANDBOX_SIG_TTL = 120
+
+
+def _viewer_key_paths():
+    paths = [SANDHOME / VIEWER_KEY_NAME]
+    if MAILBOX:
+        paths.append(MAILBOX["dir"] / VIEWER_KEY_NAME)
+    return paths
+
+
+def ensure_viewer_key():
+    """One random key, present (0600) in every tree that needs it; the first
+    one found is copied to the others. Returns the key bytes."""
+    key = None
+    for path in _viewer_key_paths():
+        try:
+            key = path.read_text().strip() or None
+        except OSError:
+            continue
+        if key:
+            break
+    key = key or secrets.token_hex(32)
+    for path in _viewer_key_paths():
+        try:
+            if path.read_text().strip() == key:
+                continue
+        except OSError:
+            pass
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key + "\n")
+        os.replace(tmp, path)
+    return key.encode()
+
+
+def sign_requester(requester):
+    exp = int(time.time()) + SANDBOX_SIG_TTL
+    sig = hmac.new(ensure_viewer_key(), f"{requester}\n{exp}".encode(), hashlib.sha256).hexdigest()
+    return {"user": requester, "exp": exp, "sig": sig}
+
+
+def box_ip(name):
+    """Bridge IP of this user's own running `box NAME` container (the Email
+    sandbox) -- only the configured MAILBOX name, never an arbitrary one."""
+    if not MAILBOX or name != MAILBOX["container_name"]:
+        raise RuntimeError("no such box")
+    r = subprocess.run(["sandbox", "ip", "--box", name], capture_output=True, text=True, timeout=15)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError(r.stderr.strip() or "sandbox ip --box failed")
+    return r.stdout.strip()
 
 
 def container_ip():
@@ -1831,7 +1925,7 @@ class SshAgent:
                 "-o", f"ControlPath={control_path}", "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
                 "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
                 _ssh_host(self.machine), self._remote_command()]
-        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.proc = subprocess.Popen(argv, env=SSH_ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.DEVNULL, bufsize=0)
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
 
@@ -2853,17 +2947,19 @@ def claude_auth_logout_scope(scope):
 SUBDIR_LIMIT = 500
 
 
-def list_subdirs(abs_cwd):
+def list_subdirs(abs_cwd, base=None):
     """Immediate subdirectories of one directory, by bare name, sorted.
     Dot-directories are left out: ~/sandhome's are tool state (`.claude`,
     `.aigw`, `.npm`, ...), never a project someone points an agent at.
     Symlinks are followed but, like every other path here, only kept if they
     stay inside ~/sandhome -- offering a choice resolve_workdir would then
-    refuse would be worse than not offering it."""
-    root = SANDHOME.resolve()
+    refuse would be worse than not offering it. `base` swaps ~/sandhome for
+    another tree (the Email preset's MAILBOX dir, the deployment notes)."""
+    base = base or SANDHOME
+    root = base.resolve()
     out = []
     try:
-        entries = sorted(os.scandir(abs_cwd or SANDHOME), key=lambda e: e.name)
+        entries = sorted(os.scandir(abs_cwd or base), key=lambda e: e.name)
     except OSError:
         return []
     for e in entries:
@@ -2884,18 +2980,23 @@ def list_subdirs(abs_cwd):
     return out
 
 
-def resolve_workdir(rel):
+def resolve_workdir(rel, base=None):
     """Validate a client-supplied working directory and return it as an
     absolute path, or None to mean "wherever the container puts us" (which is
     ~/sandhome). Anything resolving outside ~/sandhome is rejected -- `..`,
     an unrelated absolute path, a symlink pointing out of the tree -- so this
-    can never place an agent somewhere the sandbox itself doesn't reach."""
+    can never place an agent somewhere the sandbox itself doesn't reach.
+    `base` swaps ~/sandhome for another tree with the same rules (the Email
+    preset's MAILBOX dir, the deployment notes); None then means that tree's
+    own top."""
+    sandhome_tree = base is None
+    base = base or SANDHOME
     if not rel or not rel.strip():
         return None
     rel = rel.strip()
     if "\x00" in rel:
         raise ValueError("invalid working directory")
-    if rel.startswith("~/"):
+    if sandhome_tree and rel.startswith("~/"):
         rel = rel[2:]
     elif rel.startswith("/"):
         # An absolute path is only meaningful if it is already the one this
@@ -2903,20 +3004,22 @@ def resolve_workdir(rel):
         # as a relative path ("/etc" -> ~/sandhome/etc), which is a confusing
         # way to say "rejected".
         try:
-            rel = str(Path(rel).relative_to(SANDHOME))
+            rel = str(Path(rel).relative_to(base))
         except ValueError:
-            raise ValueError(f"working directory must be under {SANDHOME}")
+            raise ValueError(f"working directory must be under {base}")
     rel = rel.strip("/")
     # The UI labels these "sandhome/<x>"; accept that spelling back, but only
     # when it isn't the name of a real directory of its own.
-    if rel.startswith("sandhome/") and not (SANDHOME / rel).is_dir():
+    if sandhome_tree and rel.startswith("sandhome/") and not (SANDHOME / rel).is_dir():
         rel = rel[len("sandhome/"):]
-    if not rel or rel == "sandhome":
+    if not rel or rel == "." or (sandhome_tree and rel == "sandhome"):
         return None
-    root = SANDHOME.resolve()
-    target = (SANDHOME / rel).resolve()
-    if target != root and root not in target.parents:
-        raise ValueError(f"working directory must be under {SANDHOME}")
+    root = base.resolve()
+    target = (base / rel).resolve()
+    if target == root:
+        return None
+    if root not in target.parents:
+        raise ValueError(f"working directory must be under {base}")
     if not target.is_dir():
         raise ValueError(f"no such directory: {rel}")
     return str(target)
@@ -3218,6 +3321,38 @@ def _claude_home_for_location(location):
     if location == "host":
         return HOME
     return SANDHOME
+
+
+def mark_claude_onboarded(home):
+    """Sets hasCompletedOnboarding in <home>/.claude.json when this $HOME is
+    already logged in but the flag is missing (2026-10-08, user report:
+    "設定でログインしても再度ログインを求められました"). Logging in through the
+    settings page runs `claude auth login`, which writes the credentials but
+    not this flag -- and an interactive `claude` without it starts its
+    first-run setup again, whose first screen is "Select login method", so
+    every new session looked logged out. Only ever adds the one key, only
+    when credentials exist, and leaves a file it cannot parse alone."""
+    if not (home / ".claude" / ".credentials.json").exists():
+        return
+    cfg = home / ".claude.json"
+    try:
+        data = json.loads(cfg.read_text())
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or data.get("hasCompletedOnboarding"):
+        return
+    data["hasCompletedOnboarding"] = True
+    tmp = cfg.with_name(cfg.name + ".aigw-tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, cfg)
+        log(f"marked Claude Code onboarding complete in {cfg}")
+    except OSError as e:
+        log(f"could not update {cfg}: {e}")
 
 
 def _remote_claude_project_dir_key(machine, posix_cwd):
@@ -3537,11 +3672,12 @@ def _claude_session_last_locations():
     return {cid: loc for cid, (_, loc) in newest.items()}
 
 
-def list_claude_conversations(abs_cwd, limit=40):
+def list_claude_conversations(abs_cwd, limit=40, home=None):
     """Claude Code conversations already recorded for `abs_cwd`, newest
-    first -- the candidates for `--resume`."""
+    first -- the candidates for `--resume`. `home`: see claude_project_dir
+    (the Email preset's $HOME is its MAILBOX dir, the deployment notes)."""
     try:
-        files = [p for p in claude_project_dir(abs_cwd).iterdir() if p.suffix == ".jsonl"]
+        files = [p for p in claude_project_dir(abs_cwd, home=home).iterdir() if p.suffix == ".jsonl"]
     except OSError:
         return []
     out = []
@@ -3559,16 +3695,105 @@ def list_claude_conversations(abs_cwd, limit=40):
     return out
 
 
-def resolve_resume_id(abs_cwd, resume_id):
+def resolve_resume_id(abs_cwd, resume_id, home=None):
     """Check that a requested conversation id really is one of `abs_cwd`'s
     own logs before it is ever passed to `claude --resume`."""
     if not resume_id:
         return None
     if not CLAUDE_CONV_ID_RE.match(resume_id):
         raise ValueError("invalid conversation id")
-    if not (claude_project_dir(abs_cwd) / f"{resume_id}.jsonl").is_file():
+    if not (claude_project_dir(abs_cwd, home=home) / f"{resume_id}.jsonl").is_file():
         raise ValueError("no such conversation in that directory")
     return resume_id
+
+
+# ---- the Email preset's own folder picker / resume (the deployment notes) -----
+#
+# 2026-10-06, at the user's request ("他のサンドボックス内Claudeと同様に"):
+# the same one-level-at-a-time picker, "続きから" list and new-folder button
+# claude-tui has, just rooted at the MAILBOX dir instead of ~/sandhome.
+# Inside that sandbox the MAILBOX dir is both the only mount and $HOME, so
+# a chosen subfolder only moves Claude Code's cwd (`sandbox --workdir`,
+# checked again by the sandbox CLI itself) and its logs land under
+# <dir>/.claude/projects/<cwd key>/ -- claude_project_dir(..., home=dir).
+# Everything here reads mail-derived content (folder names, conversation
+# summaries), so each entry point takes the same host-tier unlock the
+# preset itself does (it runs at location "host", see TMUX_PRESETS).
+FOLDER_NAME_MAX = 100
+
+
+def mail_abs_cwd(abs_cwd):
+    """resolve_workdir(..., base=MAILBOX dir)'s None ("the top") as the real
+    path, for the two places that need an actual directory to key on."""
+    return abs_cwd or str(MAILBOX["dir"])
+
+
+def resolve_mail_workdir(rel):
+    if not MAILBOX:
+        raise ValueError("no Email sandbox is configured on this host")
+    return resolve_workdir(rel, base=MAILBOX["dir"])
+
+
+_WINDOWS_RESERVED_NAME_RE = re.compile(r"(?i)^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$")
+
+
+def make_ssh_workdir(machine, parent, name):
+    """make_workdir()'s ssh:<machine> counterpart, for a drives-capable
+    (Windows) machine's picker (2026-10-08, user request: "windows機でフォルダ
+    追加ボタンがないです"). `parent` is the picker's current MSYS2 path; a
+    drive must already be chosen. Same one-component name rules as
+    make_workdir, plus what Windows itself refuses in a file name. Created
+    with a plain `mkdir` over the usual ssh path (_ssh_run quotes it)."""
+    if not SSH_MACHINES.get(machine, {}).get("drives"):
+        raise ValueError("unknown or non-drives-capable ssh machine")
+    parent = resolve_ssh_workdir(machine, parent)
+    if parent is None:
+        raise ValueError("choose a drive first")
+    name = (name or "").strip()
+    if (not name or len(name) > FOLDER_NAME_MAX or name.startswith(".")
+            or any(c in name for c in '<>:"/\\|?*') or name.endswith((".", " "))
+            or _WINDOWS_RESERVED_NAME_RE.match(name)
+            or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+        raise ValueError("invalid folder name")
+    if not ssh_reachable(machine):
+        raise RuntimeError(f"{machine} is not reachable over SSH right now")
+    path = parent.rstrip("/") + "/" + name
+    r = _ssh_run(machine, ["mkdir", "--", path])
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        if "File exists" in err:
+            raise ValueError(f"already exists: {name}")
+        raise RuntimeError(err[:300] or "mkdir failed")
+    return path
+
+
+def make_workdir(scope, parent_rel, name):
+    """Create one new, empty folder directly under a picker directory and
+    return its picker-relative path. Same trees, same containment rules as
+    GET /workdirs' "sandhome" (default) and "mail" scopes -- never the
+    host/root/ssh ones, whose pickers browse a whole filesystem where a
+    phone tap creating directories has no business. The name is one plain
+    path component: no "/", no leading "." (the pickers hide those, so it
+    would vanish on creation), no control characters."""
+    if scope == "mail":
+        require_unlock_if_outside_sandbox("host")
+        base = MAILBOX["dir"] if MAILBOX else None
+        parent = resolve_mail_workdir(parent_rel)
+    elif scope == "sandhome":
+        base = SANDHOME
+        parent = resolve_workdir(parent_rel)
+    else:
+        raise ValueError(f"cannot create folders in scope {scope!r}")
+    name = (name or "").strip()
+    if (not name or len(name) > FOLDER_NAME_MAX or name.startswith(".")
+            or "/" in name or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+        raise ValueError("invalid folder name")
+    target = Path(parent or base) / name
+    try:
+        target.mkdir(mode=0o755 if scope == "sandhome" else 0o700)
+    except FileExistsError:
+        raise ValueError(f"already exists: {name}")
+    return os.path.relpath(target, base)
 
 
 def list_ssh_claude_conversations(machine, posix_cwd, limit=40):
@@ -3775,7 +4000,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         candidate = location.split(":", 1)[1]
         if SSH_MACHINES.get(candidate, {}).get("drives"):
             ssh_drive_machine = candidate
-    if resume and preset not in CWD_PRESETS and not ssh_drive_machine:
+    if resume and preset not in CWD_PRESETS and preset not in MAIL_PRESETS and not ssh_drive_machine:
         # No notion of a prior conversation outside the two local Claude
         # presets and a drives-capable ssh machine's own Claude preset --
         # the plain shells have none.
@@ -3783,7 +4008,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
             f"resume only applies to the {'/'.join(sorted(CWD_PRESETS))} presets, "
             "or a drives-capable ssh machine's Claude preset"
         )
-    if cwd and not (preset in CWD_PRESETS or preset in SHELL_CWD_PRESETS or ssh_drive_machine):
+    if cwd and not (preset in CWD_PRESETS or preset in SHELL_CWD_PRESETS or preset in MAIL_PRESETS or ssh_drive_machine):
         # ssh:<machine>'s own "shell-<machine>" (not a drives-capable
         # machine's Claude preset) still has no notion of a working
         # directory to pick -- MSYS2/linuxbox quoting over ssh is its own
@@ -3811,6 +4036,10 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     elif preset == "root-shell":
         abs_cwd = resolve_root_workdir(cwd)
         resume_id = None
+    elif preset in MAIL_PRESETS:
+        # the deployment notes: None = the MAILBOX dir itself, as before.
+        abs_cwd = resolve_mail_workdir(cwd)
+        resume_id = resolve_resume_id(mail_abs_cwd(abs_cwd), resume, home=MAILBOX["dir"])
     else:
         abs_cwd = resolve_workdir(cwd)
         resume_id = resolve_resume_id(abs_cwd, resume)
@@ -3844,7 +4073,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     # anything into).
     assigned_claude_session_id = None
     if resume_id is None and (
-            preset in CLAUDE_TUI_PRESETS or
+            preset in CLAUDE_TUI_PRESETS or preset in MAIL_PRESETS or
             preset in ("shell", "host-shell", "root-shell") or
             preset in SSH_SHELL_PRESETS):
         assigned_claude_session_id = str(uuid.uuid4())
@@ -3960,7 +4189,28 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         inner_command.append("--dangerously-bypass-approvals-and-sandbox")
     if spec.get("remote_control"):
         inner_command.append(f"--remote-control={remote_control_name(meta)}")
-    if resume_id:
+    if preset in MAIL_PRESETS:
+        # the deployment notes: `sandbox --claude --fg <these> box NAME DIR` --
+        # the sandbox CLI only takes flags before its subcommand, and builds
+        # the claude command line itself, so the cwd and the conversation id
+        # go to it rather than onto the end of inner_command. Same
+        # pre-assigned id as claude-tui (the tailer then knows its file up
+        # front instead of guessing which new .jsonl is this session's).
+        at = inner_command.index("box")
+        # --aigw-session (2026-10-09): the sandbox CLI then passes this
+        # session's AIGW_TALKTO/AIGW_OUTBOX (paths it builds itself under
+        # DIR/.aigw/<id>/, i.e. sdir) into the box, which `env` below cannot
+        # do -- they would stop at sudo/docker exec. Gives Email sessions
+        # talkto (the deployment notes) and the outbox.
+        flags = ["--aigw-session", session_id]
+        if abs_cwd:
+            flags += ["--workdir", abs_cwd]
+        if resume_id:
+            flags += ["--resume", resume_id]
+        elif assigned_claude_session_id:
+            flags += ["--session-id", assigned_claude_session_id]
+        inner_command[at:at] = flags
+    elif resume_id:
         # Interactive `--resume <id>` picks up that conversation directly
         # rather than opening the picker, same as the headless path.
         inner_command += ["--resume", resume_id]
@@ -4083,13 +4333,22 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     # talkto-remote) turns it into $HOME/.aigw-talkto/<id>.jsonl, which
     # _ssh_take_talkto reads back (the deployment notes).
     pane_env = ["-e", f"AIGW_TALKTO_ID={session_id}"] if location.startswith("ssh:") else []
+    # Logged in but never through first-run setup -> would ask to log in
+    # again (see mark_claude_onboarded). Local trees only: root's is not
+    # writable from here, ssh:<machine>'s is on another machine.
+    if preset in MAIL_PRESETS:
+        mark_claude_onboarded(MAILBOX["dir"])
+    elif preset in CLAUDE_TUI_PRESETS and location in ("container", "host"):
+        mark_claude_onboarded(_claude_home_for_location(location))
     r = tmux_exec(location, ["respawn-pane", "-k", "-t", session_id, *pane_env, *start_dir, "--", *command])
     if r.returncode != 0:
         tmux_exec(location, ["kill-session", "-t", session_id])
         shutil.rmtree(sdir, ignore_errors=True)
         raise RuntimeError(f"failed to start tmux session: {r.stderr.strip()}")
 
-    if preset in CLAUDE_TUI_PRESETS:
+    if preset in CLAUDE_TUI_PRESETS or preset in MAIL_PRESETS:
+        # MAIL_PRESETS too since a subfolder can be picked/created for it
+        # (the deployment notes): a fresh one gets Claude Code's trust prompt.
         _accept_workspace_trust_if_shown(location, session_id)
     elif assigned_claude_session_id and (
             preset in ("shell", "host-shell", "root-shell") or preset in SSH_SHELL_PRESETS):
@@ -4606,7 +4865,11 @@ def outbox_attachment_kind(filename):
 # or the headless turn's own prompt argument) does the rest unchanged -- no
 # new wire protocol into the pane itself.
 INBOX_DIR_NAME = "aigw-inbox"  # relative to $HOME on an ssh:<machine> box, mirroring ~/sandhome/.aigw/<id>/inbox locally
-MAX_INBOX_BYTES = 15 * 1024 * 1024  # decoded size -- comfortably above a phone photo, small enough a mis-picked video doesn't wedge a request/the ssh transfer
+# Decoded size. Any file type since 2026-10-07 (user request: "何でもアップロード
+# できるように"), so sized for documents/archives/short videos rather than
+# just phone photos. nginx's own cap for this one route is set to match
+# (the deployment notes); the request body is base64 JSON, ~4/3 of this.
+MAX_INBOX_BYTES = 100 * 1024 * 1024
 
 
 def session_inbox_dir(session_id):
@@ -4615,13 +4878,18 @@ def session_inbox_dir(session_id):
     return d
 
 
-def _sanitize_inbox_filename(name):
+def _sanitize_inbox_filename(name, ascii_only=True):
     """Basename only, and only the OUTBOX_NAME_RE charset -- the client-
     supplied filename must never be able to steer where this lands (path
     traversal) or collide with shell/path syntax on the ssh:<machine> leg
-    below, which shells the filename through a real remote bash."""
-    base = os.path.basename(name or "") or "upload"
-    base = re.sub(r"[^A-Za-z0-9._-]", "_", base)[:200]
+    below, which shells the filename through a real remote bash.
+    ascii_only=False (local sessions only, 2026-10-07) also keeps Unicode
+    letters and digits, so "請求書.pdf" stays readable instead of "___.pdf";
+    still no separators, spaces or shell punctuation, and never a leading
+    dot."""
+    base = os.path.basename((name or "").replace("\\", "/")) or "upload"
+    pattern = r"[^A-Za-z0-9._-]" if ascii_only else r"[^\w.-]"
+    base = re.sub(pattern, "_", base)[:200].lstrip(".")
     return base or "upload"
 
 
@@ -4640,9 +4908,9 @@ def save_inbox_attachment(session_id, meta, filename, data):
     reports back -- the remote Claude Code is a native Windows build
     (claude.exe under MSYS2 tmux, not WSL), so a POSIX-style /c/Users/...
     path in the prompt would not resolve for it."""
-    safe_name = _sanitize_inbox_filename(filename)
-    stamped_name = f"{int(time.time() * 1000)}_{safe_name}"
     location = meta.get("tmux_location", "container")
+    safe_name = _sanitize_inbox_filename(filename, ascii_only=location.startswith("ssh:"))
+    stamped_name = f"{int(time.time() * 1000)}_{safe_name}"
     if location.startswith("ssh:"):
         machine = location.split(":", 1)[1]
         tmp_path = None
@@ -4666,7 +4934,7 @@ def save_inbox_attachment(session_id, meta, filename, data):
                 ["scp", "-F", SSH_CONFIG_PATH,
                  "-o", f"ControlPath={control_path}", "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
                  "-o", "ConnectTimeout=10", tmp_path, f"{_ssh_host(machine)}:{remote_rel}"],
-                capture_output=True, timeout=60,
+                capture_output=True, timeout=600, env=SSH_ENV,  # up to MAX_INBOX_BYTES over the double hop
             )
             if scp.returncode != 0:
                 raise RuntimeError((scp.stderr or scp.stdout or b"scp failed").decode(errors="replace")[:500])
@@ -6317,12 +6585,14 @@ def _tail_claude_transcript(session_id):
         return
     if meta.get("preset") in MAIL_PRESETS:
         # Inside the second sandbox $HOME is the mailbox dir itself and
-        # Claude Code runs in it as its cwd (`sandbox new <name> <dir>`), so
-        # the log is <dir>/.claude/projects/<dir-key>/ on this side of the
-        # bind mount. No --session-id can be passed through `sandbox
-        # --claude`, so claude_session_id starts out None and the "newest
-        # fresh .jsonl" discovery below finds it.
-        proj_dir = claude_project_dir(str(MAILBOX["dir"]), home=MAILBOX["dir"])
+        # Claude Code runs in it, or in the subfolder picked for it
+        # (meta["cwd"], `sandbox --workdir`, the deployment notes), so the log
+        # is <dir>/.claude/projects/<cwd-key>/ on this side of the bind
+        # mount. Since 2026-10-06 the id is pre-assigned (`sandbox
+        # --session-id`) like claude-tui's; sessions from before that have
+        # claude_session_id None and fall to the "newest fresh .jsonl"
+        # discovery below.
+        proj_dir = claude_project_dir(mail_abs_cwd(meta.get("cwd")), home=MAILBOX["dir"])
     else:
         proj_dir = claude_project_dir(meta.get("cwd"))
     claude_session_id = meta.get("claude_session_id")
@@ -8004,6 +8274,21 @@ class Handler(BaseHTTPRequestHandler):
                     "dir": abs_cwd or "/",
                     "subdirs": subdirs,
                 })
+            if scope == "mail":
+                # the deployment notes: same shape as the default (sandhome)
+                # answer below, relative to the MAILBOX dir.
+                try:
+                    require_unlock_if_outside_sandbox("host")
+                    abs_cwd = resolve_mail_workdir(dir_param)
+                except UnlockRequired as e:
+                    return self._unlock_required(e)
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                rel = "" if abs_cwd is None else os.path.relpath(abs_cwd, MAILBOX["dir"])
+                return self._json(200, {
+                    "dir": rel,
+                    "subdirs": list_subdirs(abs_cwd, base=MAILBOX["dir"]),
+                })
             try:
                 abs_cwd = resolve_workdir(dir_param)
             except ValueError as e:
@@ -8060,6 +8345,16 @@ class Handler(BaseHTTPRequestHandler):
                 if dir_ is None:
                     return self._json(200, {"conversations": []})
                 return self._json(200, {"conversations": list_ssh_claude_conversations(machine, dir_)})
+            if qs.get("scope", [""])[0] == "mail":
+                try:
+                    require_unlock_if_outside_sandbox("host")
+                    abs_cwd = resolve_mail_workdir(qs.get("cwd", [""])[0])
+                except UnlockRequired as e:
+                    return self._unlock_required(e)
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(200, {"conversations": list_claude_conversations(
+                    mail_abs_cwd(abs_cwd), home=MAILBOX["dir"])})
             try:
                 abs_cwd = resolve_workdir(qs.get("cwd", [""])[0])
             except ValueError as e:
@@ -8067,9 +8362,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"conversations": list_claude_conversations(abs_cwd)})
 
         if parts == ["container-ip"]:
+            # aigw-gateway's /sandbox-auth only. `box` picks the Email box
+            # (owner's own requests only -- the gateway never asks this for
+            # someone else's box); X-Aigw-Requester is who the gateway
+            # authenticated, signed for the proxied app (the deployment notes).
+            box = qs.get("box", [""])[0]
+            requester = self.headers.get("X-Aigw-Requester", "")
             try:
-                return self._json(200, {"ip": container_ip()})
-            except (RuntimeError, subprocess.TimeoutExpired) as e:
+                ip = box_ip(box) if box else container_ip()
+                out = {"ip": ip}
+                if requester:
+                    out.update(sign_requester(requester))
+                return self._json(200, out)
+            except (RuntimeError, subprocess.TimeoutExpired, OSError) as e:
                 return self._json(502, {"error": str(e)})
 
         self._json(404, {"error": "not found"})
@@ -8107,6 +8412,27 @@ class Handler(BaseHTTPRequestHandler):
         # Both take {"scope": "container"|"host"|"root"}, defaulting to the
         # container -- which is what a client written before the host/root
         # rows existed sends, and still the one these presets mostly use.
+        # The folder pickers' "＋" (the deployment notes): {"scope": "sandhome"|
+        # "mail", "dir": <picker-relative parent>, "name": <new folder>}.
+        if parts == ["workdirs"]:
+            body = self._read_json_body() or {}
+            try:
+                if body.get("scope") == "ssh":
+                    rel = make_ssh_workdir(str(body.get("machine") or ""),
+                                           str(body.get("dir") or ""), str(body.get("name") or ""))
+                else:
+                    rel = make_workdir(str(body.get("scope") or "sandhome"),
+                                       str(body.get("dir") or ""), str(body.get("name") or ""))
+            except UnlockRequired as e:
+                return self._unlock_required(e)
+            except ValueError as e:
+                return self._json(400, {"error": str(e)})
+            except RuntimeError as e:
+                return self._json(502, {"error": str(e)})
+            except OSError as e:
+                return self._json(500, {"error": f"could not create the folder: {e.strerror or e}"})
+            return self._json(200, {"dir": rel})
+
         if parts == ["claude-auth", "logout"]:
             scope = (self._read_json_body() or {}).get("scope", "container")
             try:
@@ -8275,8 +8601,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(413, {"error": "attachment too large"})
             body = self._read_json_body()
             filename = body.get("filename", "")
-            if outbox_attachment_kind(filename) != "image":
-                return self._json(400, {"error": "only image attachments are supported right now"})
             try:
                 data = base64.b64decode(body.get("data_base64", ""), validate=True)
             except (ValueError, base64.binascii.Error):

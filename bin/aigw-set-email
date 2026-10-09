@@ -46,6 +46,23 @@ else
     fi
 fi
 
+# One email, one account. aigw-gateway's login maps a verified email to the
+# account whose "Other" field holds it, so registering an address someone
+# else already uses would otherwise race them for their own logins (and the
+# gateway now refuses an ambiguous match outright -- see its
+# find_usernames_for_email). Only the address itself is reported, never which
+# account holds it.
+if [ -n "$email" ]; then
+    while IFS=: read -r other_user _ _ _ other_gecos _; do
+        [ "$other_user" = "$username" ] && continue
+        other_email="$(cut -d, -f5 <<<"$other_gecos" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+        if [ "$other_email" = "$email" ]; then
+            echo "${email} is already registered for another account. Ask the administrator if it is yours." >&2
+            exit 1
+        fi
+    done < <(getent passwd)
+fi
+
 gecos="$(getent passwd "$username" | cut -d: -f5)"
 full="$(cut -d, -f1 <<<"$gecos")"
 room="$(cut -d, -f2 <<<"$gecos")"

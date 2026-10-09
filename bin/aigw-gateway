@@ -863,18 +863,26 @@ def _revoke_session_from_cookie(signed: str):
         _session_store_save(data, now)
 
 
-def find_username_for_email(email: str):
-    """Reverse-lookup: scan local Unix accounts for one whose GECOS 'Other'
-    field (5th comma-separated subfield, set via aigw-set-email) matches the
+def find_usernames_for_email(email: str):
+    """Reverse-lookup: every local Unix account whose GECOS 'Other' field
+    (5th comma-separated subfield, set via aigw-set-email) matches the
     verified email from Google. Google only proves identity -- this lookup is
-    what actually authorizes (self-service allowlist, no admin step)."""
+    what actually authorizes (self-service allowlist, no admin step).
+
+    Returns all matches, not the first: the field is self-service, so
+    anyone can write someone else's address into their own account, and
+    "first in /etc/passwd order wins" would then send the real owner's
+    logins into that account (2026-10-06 review). The caller refuses
+    anything but exactly one match; aigw-set-email also refuses a duplicate
+    at registration time."""
     email = email.strip().lower()
+    matches = []
     for entry in pwd.getpwall():
         fields = entry.pw_gecos.split(",")
         other = fields[4].strip().lower() if len(fields) > 4 else ""
         if other and other == email:
-            return entry.pw_name
-    return None
+            matches.append(entry.pw_name)
+    return matches
 
 
 BACKEND_SOCKET_DIR = "/run/aigw-backend"
@@ -1435,7 +1443,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(403, {"error": "email not verified by google"})
 
         email = claims["email"].strip().lower()
-        username = find_username_for_email(email)
+        usernames = find_usernames_for_email(email)
+        if len(usernames) > 1:
+            # Ambiguous: never pick one, and never fall through to the
+            # self-signup path below (the address is registered, just not
+            # uniquely). Only an administrator can tell which is genuine.
+            log(f"login refused: {email} is registered for {len(usernames)} accounts: {', '.join(usernames)}")
+            return self._send_json(403, {"error": "this email is registered for more than one account; ask the administrator"})
+        username = usernames[0] if usernames else None
         if username is None:
             # A deployment-supplied site route
             # (the deployment notes) can offer self-signup for its own fixed domain here --
@@ -1553,12 +1568,25 @@ class Handler(BaseHTTPRequestHandler):
         if username is None:
             return self._send_json(401, {"error": "not logged in"})
         owner = self.headers.get("X-Sandbox-Owner") or username
+        # /sandbox-box/<name>/port<N>/ (the Email box, 2026-10-07): the
+        # caller's OWN box only -- there is no owner variant of this route,
+        # and a box name never comes with someone else's owner.
+        box = self.headers.get("X-Sandbox-Box") or ""
+        if box:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,31}", box):
+                return self._send_json(403, {"error": "bad box name"})
+            owner = username
         try:
             sock_path = backend_socket_path_for(owner)
         except KeyError:
             return self._send_json(403, {"error": "no such user"})
+        path = "/container-ip" + (f"?box={box}" if box else "")
         try:
-            conn, resp = backend_request(sock_path, "GET", "/container-ip", timeout=15)
+            # X-Aigw-Requester: who is asking, for the owner's backend to
+            # sign (the deployment notes) -- forwarded to the app as
+            # X-Aigw-User/-Exp/-Sig, which nginx sets from these headers.
+            conn, resp = backend_request(sock_path, "GET", path, timeout=15,
+                                         headers={"X-Aigw-Requester": username})
             body = json.loads(resp.read())
             backend_conn_put(sock_path, conn)
         except (ConnectionRefusedError, OSError, socket.timeout,
@@ -1566,7 +1594,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(502, {"error": f"container lookup failed: {e}"})
         if resp.status != 200 or "ip" not in body:
             return self._send_json(502, {"error": body.get("error", "container lookup failed")})
-        self._send_json(200, {"ok": True}, extra_headers={"X-Container-IP": body["ip"]})
+        extra = {"X-Container-IP": body["ip"]}
+        if body.get("sig"):
+            extra.update({"X-Aigw-User": str(body.get("user", "")),
+                          "X-Aigw-Exp": str(body.get("exp", "")),
+                          "X-Aigw-Sig": str(body["sig"])})
+        self._send_json(200, {"ok": True}, extra_headers=extra)
 
     # ---- proxy to per-user backend --------------------------------------
 

@@ -132,11 +132,11 @@
     flex: 1; min-width: 0; font-size: 0.85rem; font-family: ui-monospace, monospace;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
   }
-  #cwd-up, #ssh-cwd-up, #shell-cwd-up {
+  #cwd-up, #cwd-new, #ssh-cwd-up, #ssh-cwd-new, #shell-cwd-up {
     flex-shrink: 0; padding: 0.35rem 0.7rem; border-radius: 8px; border: 1px solid #2a3542;
     background: #1c2531; color: #e6e6e6;
   }
-  #cwd-up:disabled, #ssh-cwd-up:disabled, #shell-cwd-up:disabled { opacity: 0.35; }
+  #cwd-up:disabled, #ssh-cwd-up:disabled, #ssh-cwd-new:disabled, #shell-cwd-up:disabled { opacity: 0.35; }
 
   #view-chat { display: none; flex-direction: column; flex: 1; min-height: 0; }
   #chat-header { display: flex; align-items: center; gap: 0.6rem; padding: 0.6rem 1rem; background: #131a22; }
@@ -505,6 +505,7 @@
           <span class="nsb-icon" title="作業ディレクトリ">📁</span>
           <span id="cwd-crumb" title="作業ディレクトリ">sandhome</span>
           <button id="cwd-up" title="上のフォルダへ">↑</button>
+          <button id="cwd-new" title="ここに新しいフォルダを作る">＋</button>
         </div>
         <div class="nsb-row">
           <select id="cwd-child"><option value="">サブフォルダを開く…</option></select>
@@ -540,6 +541,7 @@
           <span class="nsb-icon" title="作業ドライブ/フォルダ">📁</span>
           <span id="ssh-cwd-crumb" title="作業ドライブ/フォルダ">ドライブを選択…</span>
           <button id="ssh-cwd-up" title="上のフォルダへ">↑</button>
+          <button id="ssh-cwd-new" title="ここに新しいフォルダを作る">＋</button>
         </div>
         <div class="nsb-row">
           <select id="ssh-cwd-child"><option value="">ドライブを選ぶ…</option></select>
@@ -626,23 +628,16 @@
          /claude-auth/{login,logout}. Its own page (not part of view-list)
          since 2026-08-15 -- five rows made the session list too long. -->
     <div id="claude-auth-section">
-      <!-- Cleans up headful-Chrome debug instances (the deployment notes)
-           left running from CDP-driven browser testing/automation --
-           otherwise only reaped automatically after 30 minutes idle. Always
-           first row (2026-08-18, at the user's request). "全員" only ever
-           shown to users with root-shell access (applyCapabilities()), same
-           gate as #auth-row-root below -- see kill_all_chrome in
-           aigw-backend. -->
-      <div class="auth-row" id="chrome-kill-row">
-        <div class="auth-line">
-          <span class="auth-label">Chrome</span>
-          <span id="chrome-kill-status" class="auth-status-text"></span>
-        </div>
-        <div class="auth-actions">
-          <button id="chrome-kill-own-btn">Kill Chrome</button>
-          <button id="chrome-kill-all-btn">Kill Chrome(全員)</button>
-        </div>
-      </div>
+      <!-- Extension point (see site-extras.js at the bottom of this file):
+           a deployment can add its own extra auth-row(s) here without
+           touching this core file. First on the page (2026-10-06, at the
+           user's request: the deployment's rows on top, then Accounts, Chrome last). Left empty and untouched if no
+           site-extras.js is present. -->
+      <div id="site-extra-auth-rows"></div>
+      <!-- Everything below the deployment's own rows is about
+           signing a tool in somewhere -- one heading for it (2026-10-06,
+           at the user's request). -->
+      <h2 style="margin: 1rem 0 0.5rem; padding: 0; font-size: 0.85rem; color: #9aa5b1;">Accounts</h2>
       <div class="auth-row">
         <div class="auth-line">
           <span class="auth-label">sandbox内</span>
@@ -676,19 +671,15 @@
           <button class="auth-logout" data-scope="root">ログアウト</button>
         </div>
       </div>
-      <!-- Extension point (see site-extras.js at the bottom of this file):
-           a deployment can add its own extra auth-row(s) here without
-           touching this core file. Left empty and untouched if no
-           site-extras.js is present. -->
-      <div id="site-extra-auth-rows"></div>
-    </div>
-    <!-- Codex CLI's own auth rows, same shape as claude-auth-section above
-         (the deployment notes) -- no ssh:<machine> rows, codex isn't installed on
-         those machines. Kept as a visually separate section (its own h2)
-         rather than interleaved with Claude's rows, since "container/host/
-         root" repeats and a shared label per row would be ambiguous about
-         which tool it's for. -->
-    <h2 style="margin: 1rem 0 0.25rem; padding: 0 1rem; font-size: 0.85rem; color: #9aa5b1;">Codex</h2>
+    <!-- Codex CLI's own auth rows, same shape as Claude's above (see the
+         deployment notes on codex) -- no ssh:<machine> rows, codex isn't installed on those
+         machines. Kept as a visually separate group (its own h2) rather
+         than interleaved with Claude's rows, since "container/host/root"
+         repeats and a shared label per row would be ambiguous about which
+         tool it's for. Inside #claude-auth-section (2026-10-06, at the
+         user's request), so the whole page is one scrolling pane instead of
+         Codex staying pinned below it and eating the screen. -->
+    <h2 style="margin: 1rem 0 0.5rem; padding: 0; font-size: 0.85rem; color: #9aa5b1;">Codex</h2>
     <div id="codex-auth-section">
       <div class="auth-row">
         <div class="auth-line">
@@ -720,6 +711,30 @@
         <div class="auth-actions">
           <button class="codex-auth-login" data-scope="root">ログイン</button>
           <button class="codex-auth-logout" data-scope="root">ログアウト</button>
+        </div>
+      </div>
+    </div>
+    <!-- Claude Code on each ssh:<machine> (addSshAuthRow() in app.js fills
+         this in). Its own heading, after Codex, so those rows don't read as
+         more Codex rows. Hidden until at least one row exists. -->
+    <h2 id="ssh-auth-heading" hidden style="margin: 1rem 0 0.5rem; padding: 0; font-size: 0.85rem; color: #9aa5b1;">Other hosts</h2>
+    <div id="ssh-auth-rows"></div>
+    <div style="margin-top: 1rem;"></div>
+      <!-- Cleans up headful-Chrome debug instances (the deployment notes)
+           left running from CDP-driven browser testing/automation --
+           otherwise only reaped automatically after 30 minutes idle. First row
+           from 2026-08-18, last since 2026-10-06 (both at the user's request). "全員" only ever
+           shown to users with root-shell access (applyCapabilities()), same
+           gate as #auth-row-root below -- see kill_all_chrome in
+           aigw-backend. -->
+      <div class="auth-row" id="chrome-kill-row">
+        <div class="auth-line">
+          <span class="auth-label">Chrome</span>
+          <span id="chrome-kill-status" class="auth-status-text"></span>
+        </div>
+        <div class="auth-actions">
+          <button id="chrome-kill-own-btn">Kill Chrome</button>
+          <button id="chrome-kill-all-btn">Kill Chrome(全員)</button>
         </div>
       </div>
     </div>
@@ -816,7 +831,7 @@
     </div>
     <!-- Hidden, triggered by the 📎 button #key-toolbar builds (app.js) --
          not visible itself, only its native file picker is. -->
-    <input type="file" id="attach-file-input" accept="image/*" hidden>
+    <input type="file" id="attach-file-input" hidden>
   </div>
 
 <!-- Optional, deployment-supplied (see the two "Extension point" comments

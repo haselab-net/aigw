@@ -9,6 +9,8 @@
 開閉するデーモン」と「1ユーザー1プロセスのバックエンドへ、systemdの
 ソケットアクティベーションで振り分けるプロキシ」を備えている。
 
+**使い方のチュートリアル**(画面写真付き、利用者向け): [docs/tutorial/](docs/tutorial/index.html) — GitHub Pages では https://haselab-net.github.io/aigw/tutorial/
+
 **現状のスコープ**: このリポジトリには、上記2つの仕組み、PWAの
 コアフロントエンド(セッション一覧・チャットUI)、そしてセッション管理・
 tmux操作を行うバックエンド本体(`bin/aigw-backend`・`bin/aigw-gateway`)の
