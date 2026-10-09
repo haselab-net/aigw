@@ -2434,6 +2434,7 @@
         // updateUnlockNotice()'s own alive check.
         if (currentSessionMeta) currentSessionMeta.alive = false;
         updateUnlockNotice();
+        updateChatResumeBtn();
       }
       div.className = "bubble system";
       // exit_status is only present when the pane was kept around long
@@ -2659,6 +2660,22 @@
           renameSession(s);
         });
         row.appendChild(editBtn);
+
+        // ↻ on an ended Claude session (2026-10-09, user request:
+        // "終了セッションに再開ボタンをつけられますか"): a new session of the same
+        // preset/folder/name that continues this one's conversation -- exactly
+        // what picking it in ⏱ would do, without going through the picker.
+        if (!s.alive && canResumeEnded(s)) {
+          const resumeBtn = document.createElement("button");
+          resumeBtn.className = "resume-btn";
+          resumeBtn.textContent = "↻";
+          resumeBtn.title = "この会話の続きから新しいセッションを開く";
+          resumeBtn.addEventListener("click", (e) => {
+            e.stopPropagation(); // don't also open the (ended) session
+            resumeEndedSession(s, resumeBtn);
+          });
+          row.appendChild(resumeBtn);
+        }
 
         const linkBtn = document.createElement("button");
         linkBtn.className = "link-btn" + (linkArmedSessionId === s.id ? " armed" : "");
@@ -3174,6 +3191,7 @@
 
     if (currentEventSource) currentEventSource.close();
     currentEventSource = null;
+    updateChatResumeBtn();
     connectSessionEvents(meta);
   }
 
@@ -3450,6 +3468,71 @@
 
   document.getElementById("back-btn").addEventListener("click", closeSession);
 
+  // The chat header's ↻ 再開: only for one's own ended, resumable session.
+  // Also retitles the status dot, whose long-press force-stop does nothing
+  // once the session has ended.
+  const resumeChatBtn = document.getElementById("resume-chat-btn");
+  function updateChatResumeBtn() {
+    const m = currentSessionMeta;
+    const ended = !!m && m.alive === false;
+    resumeChatBtn.hidden = !(ended && !currentOwner && canResumeEnded(m));
+    chatDotEl.title = ended ? "終了しています" : "長押しで強制終了";
+  }
+  resumeChatBtn.addEventListener("click", () => {
+    if (currentSessionMeta) resumeEndedSession(currentSessionMeta, resumeChatBtn);
+  });
+
+  // Which ended sessions get ↻: the presets create_session accepts `resume`
+  // for (aigw-backend: CWD_PRESETS, the Email preset, and a drives-capable
+  // ssh machine's Claude once a folder was chosen), and only once the
+  // conversation id is known. The backend re-checks all of it (the log must
+  // still exist in that folder), so this only decides whether to offer it.
+  function canResumeEnded(s) {
+    if (!s.claude_session_id) return false;
+    if (CWD_PRESETS.includes(s.preset) || s.preset === "mail-tui") return true;
+    // A shell (incl. root) where `claude` was run by hand: the backend
+    // records the folder that conversation ran in as claude_cwd (null when
+    // it never ran), and on ↻ opens the same shell there and types
+    // `claude --resume <id>` (the deployment notes).
+    if (["shell", "host-shell", "root-shell"].includes(s.preset)) return !!s.claude_cwd;
+    return s.preset.startsWith("claude-tui-") && !!s.cwd;
+  }
+
+  async function resumeEndedSession(s, btn) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "…";
+    try {
+      const body = {
+        preset: s.preset,
+        label: s.label,
+        cwd: s.claude_cwd || s.cwd || "",
+        resume: s.claude_session_id,
+        cols: computeScreenCols(),
+        rows: computeScreenRows(),
+      };
+      if (s.preset === "claude-tui" || s.preset.startsWith("claude-tui-")) {
+        body.skip_permissions = s.skip_permissions !== false;
+      }
+      // Same passkey handling as 開始 (Email and host/root presets).
+      const meta = await withUnlockRetry(() => api("/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })).catch((e) => {
+        alert(`再開できませんでした: ${e.message}`);
+        return null;
+      });
+      if (!meta) return;
+      await refreshSessions();
+      openSession(meta);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+
   // Force-stopping a still-*running* session -- aborting a hung shell, or a
   // claude turn the user doesn't want to wait out -- is not something the
   // automatic dead-pane/remain-on-exit detection (aigw-backend) can ever
@@ -3464,6 +3547,9 @@
     let pressTimer = null;
     function arm() {
       if (!currentSessionId) return;
+      // Already ended: nothing to force-stop (the header's ↻ 再開 is what an
+      // ended session offers instead, 2026-10-09).
+      if (currentSessionMeta && currentSessionMeta.alive === false) return;
       pressTimer = setTimeout(async () => {
         pressTimer = null;
         if (!confirm("このセッションを強制終了しますか？(まだ動いている場合のみ意味があります)")) return;

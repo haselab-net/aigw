@@ -24,6 +24,7 @@
   h1 { font-size: 1.9rem; line-height: 1.3; margin: 8px 0 4px; }
   h2 { font-size: 1.4rem; margin: 56px 0 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   h3 { font-size: 1.1rem; margin: 28px 0 8px; }
+  h4 { font-size: 1rem; margin: 20px 0 6px; }
   p, li { max-width: 72ch; }
   a { color: var(--accent); }
   code, kbd, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .92em; }
@@ -102,14 +103,41 @@
 </ol>
 
 <h3>SSH でも入れるようにする(パスキー登録に必要)</h3>
-<p>aigw だけを使うなら SSH は不要です。ただし、<a href="#passkey">Email やホストのシェルに使うパスキーの登録</a>には SSH ログインが1回要るので、早めに済ませておくと楽です。</p>
+<p>aigw だけを使うなら SSH は不要です。ただし、<a href="#passkey">Email やホストのシェルに使うパスキーの登録</a>には SSH ログインが1回要るので、早めに済ませておくと楽です。使っている PC に合わせて、どちらかの手順で行います。</p>
+
+<h4>Mac・Linux、Windows の MSYS2(Git Bash も同じ)</h4>
 <pre><code># 自分の PC で: もらった鍵を保存して権限を絞る
+mkdir -p ~/.ssh
 mv ~/Downloads/id_ed25519_<ユーザー名> ~/.ssh/
 chmod 600 ~/.ssh/id_ed25519_<ユーザー名>
 
 # 初回ログイン。ログイン直後にパスワードの設定を求められる
-ssh -i ~/.ssh/id_ed25519_<ユーザー名> <ユーザー名>@<サーバー></code></pre>
+ssh -i ~/.ssh/id_ed25519_<ユーザー名> <ユーザー名>@&lt;サーバー&gt;</code></pre>
+<p>MSYS2 では <code>~</code> は MSYS2 のホーム(例: <code>C:\msys64\home\&lt;名前&gt;</code>)で、Windows のホーム(<code>C:\Users\&lt;名前&gt;</code>)とは別です。ダウンロードしたファイルは <code>/c/Users/&lt;Windowsの名前&gt;/Downloads/</code> にあります。MSYS2 の <code>~/.ssh</code> に置いた鍵は、PowerShell の <code>ssh</code> からは見えません。</p>
+
+<h4>Windows 標準の OpenSSH(PowerShell)</h4>
+<p>Windows 10/11 には <code>ssh</code> が入っています(無ければ「設定 → システム → オプション機能」で「OpenSSH クライアント」を追加)。PowerShell で次を実行します。<code>chmod</code> は使えないので、権限は <code>icacls</code> で絞ります。</p>
+<pre><code># 鍵を C:\Users\&lt;Windowsの名前&gt;\.ssh\ へ移す
+mkdir -Force $env:USERPROFILE\.ssh
+Move-Item $env:USERPROFILE\Downloads\id_ed25519_<ユーザー名> $env:USERPROFILE\.ssh\
+$key = "$env:USERPROFILE\.ssh\id_ed25519_<ユーザー名>"
+
+# 自分以外が読めないようにする(継承を切り、自分だけに読み取りを許す)
+icacls $key /inheritance:r
+icacls $key /grant:r "$($env:USERNAME):(R)"
+
+# 初回ログイン。ログイン直後にパスワードの設定を求められる
+ssh -i $key <ユーザー名>@&lt;サーバー&gt;</code></pre>
+<p>「UNPROTECTED PRIVATE KEY FILE」「bad permissions」と言われたら、<code>icacls</code> の2行を実行し直してください。PowerShell では <code>-i ~/.ssh/...</code> の <code>~</code> が展開されないことがあるので、<code>$env:USERPROFILE</code> で書いています。</p>
+
 <p>パスワードは、この初回ログインで決めるまで誰にも使えない状態になっています。2回目からは同じコマンドで入れます。</p>
+
+<h4>毎回 <code>-i</code> を書かないようにする</h4>
+<p>次の内容を設定ファイルに書くと、<code>ssh aigw</code> だけで入れます。設定ファイルは、Mac・Linux・MSYS2 では <code>~/.ssh/config</code>、Windows 標準では <code>C:\Users\&lt;Windowsの名前&gt;\.ssh\config</code>(拡張子なし)です。<code>IdentityFile</code> の <code>~</code> はどちらでも <code>ssh</code> が自分のホームに読み替えます。</p>
+<pre><code>Host aigw
+    HostName &lt;サーバー&gt;
+    User <ユーザー名>
+    IdentityFile ~/.ssh/id_ed25519_<ユーザー名></code></pre>
 
 <div class="note">管理者に作ってもらったアカウントで aigw にログインできないときは、SSH で入って <code>aigw-set-email you@example.com</code> を1回実行してください。そのメールアドレスの Google アカウントでログインできるようになります。</div>
 

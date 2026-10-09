@@ -2179,6 +2179,15 @@ def list_sessions(on_behalf_of=None):
             if live_container is None:
                 live_container = list_tmux_sessions()
             meta["alive"] = meta.get("tmux_name", d.name) in live_container
+        if (on_behalf_of is None and not meta["alive"] and "claude_cwd" not in meta
+                and meta.get("preset") in SHELL_RESUME_PRESETS and meta.get("claude_session_id")):
+            # Looked up once per ended shell session and kept in meta (None
+            # when `claude` never ran there): whether its ↻ is offered.
+            meta["claude_cwd"] = find_transcript_cwd(location, meta["claude_session_id"])
+            fresh = load_meta(d.name)
+            if fresh is not None:
+                fresh["claude_cwd"] = meta["claude_cwd"]
+                save_meta(d.name, fresh)
         link_id, rec = _link_for_session(links, d.name)
         if rec is not None:
             partner_id = _other_side(rec, d.name)
@@ -3302,6 +3311,43 @@ def claude_project_dir(abs_cwd, home=None):
     return (home or SANDHOME) / ".claude" / "projects" / key
 
 
+# The local shells a `claude` was run in by hand, whose ended sessions get ↻
+# (the deployment notes, 2026-10-09: "rootのコマンドラインでもclaude が動いていた
+# ものはclaude の再開につないでほしい").
+SHELL_RESUME_PRESETS = {"shell", "host-shell", "root-shell"}
+
+
+def find_transcript_cwd(location, conv_id):
+    """The working directory Claude Code recorded in conversation `conv_id`'s
+    own log (every record carries "cwd"), searched across all project
+    directories of the $HOME a `claude` in `location` sees -- or None when no
+    such log exists there. A shell's pane can move anywhere, so the project
+    directory is not known in advance the way claude-tui's is."""
+    if not conv_id or not CLAUDE_CONV_ID_RE.match(conv_id):
+        return None
+    base = _claude_home_for_location(location) / ".claude" / "projects"
+    try:
+        dirs = list(base.iterdir())
+    except OSError:
+        return None
+    for d in dirs:
+        try:
+            with open(d / f"{conv_id}.jsonl", "rb") as f:
+                for _ in range(200):
+                    line = f.readline()
+                    if not line:
+                        break
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and isinstance(rec.get("cwd"), str) and rec["cwd"]:
+                        return rec["cwd"]
+        except OSError:
+            continue
+    return None
+
+
 def _claude_home_for_location(location):
     """The real $HOME a `claude` process sees for a given tmux_location --
     claude_project_dir()'s own SANDHOME default is correct only for
@@ -4000,7 +4046,8 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         candidate = location.split(":", 1)[1]
         if SSH_MACHINES.get(candidate, {}).get("drives"):
             ssh_drive_machine = candidate
-    if resume and preset not in CWD_PRESETS and preset not in MAIL_PRESETS and not ssh_drive_machine:
+    if (resume and preset not in CWD_PRESETS and preset not in MAIL_PRESETS
+            and preset not in SHELL_RESUME_PRESETS and not ssh_drive_machine):
         # No notion of a prior conversation outside the two local Claude
         # presets and a drives-capable ssh machine's own Claude preset --
         # the plain shells have none.
@@ -4030,9 +4077,22 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
             # only fires for a hand-crafted request.
             raise ValueError("resume requires an explicit working directory on this machine")
         resume_id = resolve_ssh_resume_id(ssh_drive_machine, abs_cwd, resume) if abs_cwd else None
+    elif preset in SHELL_RESUME_PRESETS and resume:
+        # ↻ on an ended shell session that ran `claude` (the deployment notes):
+        # the folder is the one that conversation's own log names, not
+        # whatever the client sent; checked by the same rules as a picked one.
+        if not CLAUDE_CONV_ID_RE.match(resume):
+            raise ValueError("invalid conversation id")
+        conv_cwd = find_transcript_cwd(location, resume)
+        if conv_cwd is None:
+            raise ValueError("no such conversation")
+        resolve = {"shell": resolve_workdir, "host-shell": resolve_host_workdir,
+                   "root-shell": resolve_root_workdir}[preset]
+        abs_cwd = resolve(conv_cwd)
+        resume_id = resume
     elif preset == "host-shell":
         abs_cwd = resolve_host_workdir(cwd)
-        resume_id = None  # SHELL_CWD_PRESETS: already validated above, never reached with resume set
+        resume_id = None
     elif preset == "root-shell":
         abs_cwd = resolve_root_workdir(cwd)
         resume_id = None
@@ -4355,6 +4415,11 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         _inject_claude_session_id_wrapper(
             location, session_id,
             session_id_value=assigned_claude_session_id if preset in SSH_SHELL_PRESETS else None)
+    if resume_id and preset in SHELL_RESUME_PRESETS:
+        # The shell itself is the pane's program here, so the resumed `claude`
+        # is typed into it (type-ahead, see _inject_claude_session_id_wrapper)
+        # -- exiting it leaves the user at that same shell, as before.
+        tmux_exec(location, ["send-keys", "-t", session_id, f"claude --resume {shquote(resume_id)}", "Enter"])
 
     # No pipe-pane here: output is read via _watch_tmux_session's
     # capture-pane polling (see its docstring), same as an adopted session.

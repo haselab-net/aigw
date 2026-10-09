@@ -71,7 +71,7 @@
   }
   #link-armed-banner.visible { display: flex; }
   #link-armed-banner button { background: none; border: none; color: #9aa5b1; }
-  .session-row .delete-btn, .session-row .edit-btn, .session-row .archive-btn, .session-row .link-btn {
+  .session-row .delete-btn, .session-row .edit-btn, .session-row .archive-btn, .session-row .link-btn, .session-row .resume-btn {
     background: none; border: none; color: #9aa5b1; font-size: 1.1rem;
     padding: 0.4rem 0.6rem; flex-shrink: 0;
   }
@@ -164,6 +164,7 @@
      background is currently showing. */
   #chat-header button.screen-btn { margin-left: auto; background: none; border: none; color: #9aa5b1; font-size: 1.1rem; padding: 0.2rem 0.4rem; border-radius: 6px; }
   #chat-header button.screen-btn.active { background: rgba(66,133,244,0.28); }
+  #chat-header button.resume-chat-btn { background: rgba(66,133,244,0.18); border: 1px solid #4285F4; color: #cfe0fc; font-size: 0.85rem; padding: 0.15rem 0.5rem; border-radius: 6px; margin-left: 0.4rem; }
   #chat-header button.share-btn { background: none; border: none; color: #9aa5b1; font-size: 1.1rem; padding: 0.2rem 0.4rem; border-radius: 6px; }
   /* .shared = "this session is currently shared with someone", independent
      of whether the panel is open right now (2026-08-28, at the user's
@@ -760,6 +761,10 @@
       <span id="chat-label"></span>
       <!-- Someone else's session shared with me. -->
       <span id="chat-owner-badge" class="owner-badge"></span>
+      <!-- ↻ for an ended session (2026-10-09): same as the list row's ↻ --
+           continues this conversation in a new session. Shown by app.js only
+           while the session is ended and resumable. -->
+      <button class="resume-chat-btn" id="resume-chat-btn" hidden>↻ 再開</button>
       <!-- Shows the pane exactly as tmux renders it right now. The chat log
            is append-only and cannot represent an in-place redraw, which is
            what Claude Code's selection menus are — see _latest_screen in
