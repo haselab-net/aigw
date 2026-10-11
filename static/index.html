@@ -71,7 +71,7 @@
   }
   #link-armed-banner.visible { display: flex; }
   #link-armed-banner button { background: none; border: none; color: #9aa5b1; }
-  .session-row .delete-btn, .session-row .edit-btn, .session-row .archive-btn, .session-row .link-btn, .session-row .resume-btn {
+  .session-row .delete-btn, .session-row .edit-btn, .session-row .archive-btn, .session-row .link-btn {
     background: none; border: none; color: #9aa5b1; font-size: 1.1rem;
     padding: 0.4rem 0.6rem; flex-shrink: 0;
   }
@@ -164,7 +164,9 @@
      background is currently showing. */
   #chat-header button.screen-btn { margin-left: auto; background: none; border: none; color: #9aa5b1; font-size: 1.1rem; padding: 0.2rem 0.4rem; border-radius: 6px; }
   #chat-header button.screen-btn.active { background: rgba(66,133,244,0.28); }
-  #chat-header button.resume-chat-btn { background: rgba(66,133,244,0.18); border: 1px solid #4285F4; color: #cfe0fc; font-size: 0.85rem; padding: 0.15rem 0.5rem; border-radius: 6px; margin-left: 0.4rem; }
+  /* An ended session's grey dot that a tap resumes (list row and chat header). */
+  .dot.resumable { cursor: pointer; box-shadow: 0 0 0 3px rgba(66,133,244,0.45); }
+  .dot.stoppable, #chat-dot { cursor: pointer; }
   #chat-header button.share-btn { background: none; border: none; color: #9aa5b1; font-size: 1.1rem; padding: 0.2rem 0.4rem; border-radius: 6px; }
   /* .shared = "this session is currently shared with someone", independent
      of whether the panel is open right now (2026-08-28, at the user's
@@ -750,21 +752,15 @@
            停止 button used to occupy; swipe-right still also works
            see the swipe-back handler in app.js. -->
       <button class="back" id="back-btn">←</button>
-      <!-- Force-stopping a still-*running* session (not something auto-
-           detection can ever replace -- there is nothing to detect until
-           it actually stops) is now a long-press on this dot rather than
-           its own always-visible button, specifically so it takes a
-           deliberate, confirmed gesture instead of an ordinary tap
-           (2026-08-16, at the user's request). See the long-press handler
-           in app.js. -->
-      <span class="dot" id="chat-dot" title="長押しで強制終了"></span>
+      <!-- Status dot: a tap on a running session's (green) dot offers to stop
+           it -- Claude Code gets Ctrl+C twice first so its conversation is
+           saved for resume; a tap on an ended, resumable session's (grey)
+           dot offers to resume it (2026-10-09; before that, stopping was a
+           long-press). See app.js. -->
+      <span class="dot" id="chat-dot" title="タップで停止"></span>
       <span id="chat-label"></span>
       <!-- Someone else's session shared with me. -->
       <span id="chat-owner-badge" class="owner-badge"></span>
-      <!-- ↻ for an ended session (2026-10-09): same as the list row's ↻ --
-           continues this conversation in a new session. Shown by app.js only
-           while the session is ended and resumable. -->
-      <button class="resume-chat-btn" id="resume-chat-btn" hidden>↻ 再開</button>
       <!-- Shows the pane exactly as tmux renders it right now. The chat log
            is append-only and cannot represent an in-place redraw, which is
            what Claude Code's selection menus are — see _latest_screen in

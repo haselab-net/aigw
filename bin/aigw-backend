@@ -817,6 +817,16 @@ UNLOCKD_SOCK_PATH = "/run/aigw-unlockd.sock"
 # timeout is, expiring it must mean "treat as locked", never "wait forever".
 UNLOCKD_TIMEOUT = 5
 
+# Per-browser unlock windows (2026-10-09, the deployment notes: ユーザー依頼
+# 「鍵をあけたブラウザ経由でしかアクセスできないように」). aigw-gateway sends
+# X-Aigw-Unlock-Key -- derived from the caller's login, never from the
+# client -- on every request; Handler stores it here for the request's
+# thread, and _unlockd_call hands it to aigw-unlockd for the verbs that open
+# or check a window. A thread that is not serving a request (watchers,
+# schedulers) has no key and asks about the user's window as before.
+_REQ = threading.local()
+_UNLOCK_KEY_VERBS = ("touch", "status", "finish-assertion")
+
 
 def _unlockd_call(verb, **fields):
     """Sends one request to aigw-unlockd's newline-delimited-JSON socket
@@ -850,6 +860,8 @@ def _unlockd_call(verb, **fields):
     through (design notes "Fail closed everywhere" -- an unreachable
     unlockd must never be mistaken for an open window)."""
     req = {"verb": verb, "user": getpass.getuser(), **fields}
+    if verb in _UNLOCK_KEY_VERBS and hasattr(_REQ, "unlock_key"):
+        req["unlock_key"] = _REQ.unlock_key
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -1354,7 +1366,50 @@ def resolve_session_access(session_id, on_behalf_of):
         return None, (404, {"error": "no such session"})
     if on_behalf_of is not None and on_behalf_of not in meta.get("shared_with", []):
         return None, (404, {"error": "no such session"})
+    # Reading a host/root/Email session (its chat, screen, files) needs this
+    # browser's passkey window too, not only sending into it (2026-10-09,
+    # the deployment notes: a Google login alone must not show what such a
+    # session read, e.g. mail). Every sessions/<id>/* route comes through
+    # here, so this one check covers them all, including the SSE stream's
+    # start (_sse re-checks while it stays open).
+    gate = session_unlock_location(meta)
+    if gate is not None:
+        try:
+            require_unlock_if_outside_sandbox(gate)
+        except UnlockRequired as e:
+            return None, (403, {"error": str(e), "unlock_required": True, "tier": e.tier})
     return meta, None
+
+
+def session_unlock_location(meta):
+    """The location whose passkey window guards reading this session, or
+    None when it needs none (a container or recognized ssh: session, or a
+    headless preset, which always runs in the container -- same exemption
+    as send_message)."""
+    if meta.get("preset") in HEADLESS_PRESETS:
+        return None
+    location = meta.get("tmux_location", "container")
+    return location if _location_requires_unlock(location) else None
+
+
+def redact_locked_sessions(sessions):
+    """GET /sessions for a browser without the needed window: keeps the
+    rows (so the list still shows there is something to unlock) but blanks
+    the label and folder, which for an Email session come from the mail.
+    Display only -- every read of the session itself is gated by
+    resolve_session_access. One `status` call (no extension) per listing."""
+    needs = [m for m in sessions if session_unlock_location(m) is not None]
+    if not needs:
+        return sessions
+    st = _unlockd_call("status")
+    open_tier = st.get("tier") if st.get("unlocked") else None
+    for m in needs:
+        tier = _tier_for_location(session_unlock_location(m))
+        if not (open_tier == "root" or (open_tier == "host" and tier == "host")):
+            m["label"] = "🔒"
+            m["cwd"] = ""
+            m["locked"] = True
+    return sessions
 
 
 def share_session(session_id, username):
@@ -4023,7 +4078,8 @@ def _trust_dialog_cursor_move(screen):
     return "Down" if yes_idx > cursor_idx else "Up"
 
 
-def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, cols=None, rows=None):
+def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, cols=None, rows=None,
+                   replace_session=None):
     if preset not in PRESETS:
         raise ValueError(f"unknown preset: {preset}")
     # the design notes: gate as early as this function can possibly know
@@ -4036,6 +4092,19 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     # same "belt and suspenders" spirit as the root_shell_allowed() check
     # a few lines below.
     location = TMUX_PRESETS[preset]["location"] if preset in TMUX_PRESETS else "container"
+    # replace_session (the deployment notes, 2026-10-09, user request:
+    # "再開したものに過去の履歴も残し、停止したものは削除"): the ended session
+    # this one resumes. Its chat history is carried over below and the
+    # caller deletes it once this one exists. Only an ended session of this
+    # same user, and only for the conversation it actually held.
+    replaced_meta = None
+    if replace_session:
+        if not SESSION_ID_RE.match(replace_session):
+            raise ValueError("invalid replace_session")
+        replaced_meta = load_meta(replace_session)
+        if (replaced_meta is None or not replaced_meta.get("stopped") or not resume
+                or replaced_meta.get("claude_session_id") != resume):
+            raise ValueError("replace_session must be an ended session holding that conversation")
     require_unlock_if_outside_sandbox(location)
     # A drives-capable ssh machine's Claude preset (winbox-a/winbox-b, never
     # linuxbox -- see SSH_MACHINES' own "drives" field) also takes a cwd, from
@@ -4159,6 +4228,10 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     (sdir / "outbox").mkdir(parents=True)
     (sdir / "output.log").touch()
     (sdir / "events.jsonl").touch()
+    if replaced_meta is not None:
+        _carry_over_history(replace_session, sdir)
+        append_event(session_id, {"type": "system",
+                                  "text": f"「{replaced_meta.get('label', '')}」の続きから再開しました"})
     # A resume with no explicit label carries over the name a past aigw
     # session already gave this same conversation (the deployment notes,
     # 2026-09-24, at the user's request: "セッション名なども引き継ぐように")
@@ -4270,7 +4343,10 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         elif assigned_claude_session_id:
             flags += ["--session-id", assigned_claude_session_id]
         inner_command[at:at] = flags
-    elif resume_id:
+    elif resume_id and preset not in SHELL_RESUME_PRESETS:
+        # (Not the shells: their pane runs `bash -l`, which would choke on
+        # --resume; for them `claude --resume` is typed in after start-up,
+        # further down -- the deployment notes.)
         # Interactive `--resume <id>` picks up that conversation directly
         # rather than opening the picker, same as the headless path.
         inner_command += ["--resume", resume_id]
@@ -4426,6 +4502,41 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     ensure_watcher(session_id)
     meta["alive"] = True
     return meta
+
+
+def _carry_over_history(old_session_id, sdir):
+    """Copy an ended session's chat history (events.jsonl) and the attachments
+    it refers to (outbox/) into a new session's directory, before anything is
+    written there -- so the resumed session shows the whole conversation and
+    its own events simply continue the numbering (append_event starts from
+    the file's last seq)."""
+    old_dir = session_dir(old_session_id)
+    try:
+        lines = (old_dir / "events.jsonl").read_text().splitlines()
+    except OSError:
+        lines = []
+    out = []
+    for raw in lines:
+        try:
+            ev = json.loads(raw)
+        except ValueError:
+            continue
+        if ev.get("type") == "session_ended":
+            # Replayed as-is it would mark the *new*, running session as
+            # ended in the chat view; keep the moment as a plain note.
+            ev = {"seq": ev.get("seq"), "ts": ev.get("ts"), "type": "system",
+                  "text": "(ここで一度停止しました)"}
+        out.append(json.dumps(ev))
+    if out:
+        (sdir / "events.jsonl").write_text("\n".join(out) + "\n")
+    old_outbox = old_dir / "outbox"
+    if old_outbox.is_dir():
+        for f in old_outbox.iterdir():
+            if f.is_file():
+                try:
+                    shutil.copy2(f, sdir / "outbox" / f.name)
+                except OSError:
+                    pass
 
 
 def _inject_claude_session_id_wrapper(location, tmux_name, session_id_value=None):
@@ -4809,8 +4920,15 @@ def stop_session(session_id):
         # container), so this is the only place in this function that ever
         # touches a location other than "container".
         require_unlock_if_outside_sandbox(location)
+        if meta and not meta.get("stopped"):
+            _graceful_claude_exit(location, tmux_name, meta.get("preset"))
         tmux_exec(location, ["kill-session", "-t", tmux_name])
     meta = load_meta(session_id)
+    if meta and meta.get("stopped"):
+        # The watcher already saw the pane end (Claude exited on the Ctrl+C
+        # above) and recorded it -- don't announce the end twice.
+        break_link(session_id, reason="セッションが終了しました")
+        return
     if meta:
         meta["stopped"] = True
         meta["alive"] = False
@@ -4818,6 +4936,58 @@ def stop_session(session_id):
         save_meta(session_id, meta)
     append_event(session_id, {"type": "session_ended"})
     break_link(session_id, reason="セッションが終了しました")
+
+
+def _graceful_claude_exit(location, tmux_name, preset, timeout=10):
+    """Before a session is stopped, end a Claude Code running in its pane the
+    way a person would -- Ctrl+C twice -- so it exits by itself with its
+    conversation log complete for a later --resume (2026-10-09, user request:
+    "再開のためのコンテキストの書き出しはするようにしてください。Ctrl+c2回と同じ
+    挙動を期待してます"). The pane is Claude itself for the Claude/Email
+    presets; in a shell only when `claude` is its foreground program (a plain
+    shell gets no keys at all). A busy Claude takes the first Ctrl+C to
+    interrupt its turn, so the pair is repeated once if it is still there.
+    If Claude asks what to do with background work still running ("Background
+    work is running" / "1. Exit and stop tasks"), that first option is chosen
+    (user: "その時は止めるで良いです"; checked 2026-10-09 with a backgrounded
+    `sleep`: Enter on it exits 0 and stops the task).
+    Waits at most `timeout` seconds; the caller kills the session either way."""
+    def state():
+        try:
+            r = tmux_query(location, ["display-message", "-p", "-t", tmux_name,
+                                      "#{pane_dead}|#{pane_current_command}"])
+        except subprocess.TimeoutExpired:
+            return None
+        if r.returncode != 0:
+            return None
+        dead, _, command = r.stdout.strip().partition("|")
+        return dead == "1", command
+    pane_is_claude = preset in CLAUDE_TUI_PRESETS or preset in MAIL_PRESETS
+    def claude_gone(st):
+        return st is None or st[0] or (not pane_is_claude and not _is_claude_foreground(st[1]))
+    if claude_gone(state()):
+        return
+    deadline = time.time() + timeout
+    for _ in range(2):
+        tmux_exec(location, ["send-keys", "-t", tmux_name, "C-c"])
+        time.sleep(0.4)
+        tmux_exec(location, ["send-keys", "-t", tmux_name, "C-c"])
+        pair_deadline = min(deadline, time.time() + timeout / 2)
+        answered = False
+        while time.time() < pair_deadline:
+            time.sleep(0.5)
+            if claude_gone(state()):
+                return
+            if not answered:
+                try:
+                    cap = tmux_query(location, ["capture-pane", "-p", "-t", tmux_name])
+                except subprocess.TimeoutExpired:
+                    continue
+                screen = cap.stdout if cap.returncode == 0 else ""
+                if "Exit and stop tasks" in screen:
+                    on_first = any("❯" in l and "1. Exit and stop tasks" in l for l in screen.splitlines())
+                    tmux_exec(location, ["send-keys", "-t", tmux_name, "Enter" if on_first else "1"])
+                    answered = True
 
 
 def delete_session(session_id):
@@ -8027,6 +8197,7 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length) or b"{}")
 
     def do_GET(self):
+        _REQ.unlock_key = self.headers.get("X-Aigw-Unlock-Key", "")
         parsed = urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
         qs = parse_qs(parsed.query)
@@ -8040,7 +8211,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"error": "sharing does not include this"})
 
         if parts == ["sessions"]:
-            return self._json(200, {"sessions": list_sessions(on_behalf_of)})
+            return self._json(200, {"sessions": redact_locked_sessions(list_sessions(on_behalf_of))})
 
         # Never reached with on_behalf_of set, same reasoning as
         # /session-order just below (this user's own links only).
@@ -8433,6 +8604,18 @@ class Handler(BaseHTTPRequestHandler):
             # authenticated, signed for the proxied app (the deployment notes).
             box = qs.get("box", [""])[0]
             requester = self.headers.get("X-Aigw-Requester", "")
+            # `unlock=host` (the deployment notes, 2026-10-09): the route also
+            # needs this user's host-tier passkey window, like the Email
+            # preset itself. Only "host" is accepted; anything else is 400,
+            # never silently "no gate".
+            unlock = qs.get("unlock", [""])[0]
+            if unlock:
+                if unlock != "host":
+                    return self._json(400, {"error": "bad unlock tier"})
+                try:
+                    require_unlock_if_outside_sandbox("host")
+                except UnlockRequired as e:
+                    return self._unlock_required(e)
             try:
                 ip = box_ip(box) if box else container_ip()
                 out = {"ip": ip}
@@ -8445,6 +8628,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        _REQ.unlock_key = self.headers.get("X-Aigw-Unlock-Key", "")
         parsed = urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
         on_behalf_of = self._on_behalf_of()
@@ -8467,11 +8651,17 @@ class Handler(BaseHTTPRequestHandler):
                     cwd=body.get("cwd"), resume=body.get("resume"),
                     skip_permissions=body.get("skip_permissions", True),
                     cols=body.get("cols"), rows=body.get("rows"),
+                    replace_session=body.get("replace_session"),
                 )
             except UnlockRequired as e:
                 return self._unlock_required(e)
             except (ValueError, RuntimeError) as e:
                 return self._json(400, {"error": str(e)})
+            replaced = body.get("replace_session")
+            if replaced:
+                # Its history now lives on in `meta` (create_session copied it),
+                # so the ended original goes (the deployment notes).
+                delete_session(replaced)
             return self._json(201, meta)
 
         # Both take {"scope": "container"|"host"|"root"}, defaulting to the
@@ -8986,7 +9176,19 @@ class Handler(BaseHTTPRequestHandler):
                             self._write_sse(ev)
                             max_replayed = max(max_replayed, ev["seq"])
 
+            gate = session_unlock_location(load_meta(session_id) or {})
+            last_gate_check = time.monotonic()
             while True:
+                # A stream opened inside the window must not outlive it
+                # (resolve_session_access checked only its start): re-check
+                # once a minute and end it when the window has closed --
+                # app.js then asks for the passkey before reopening.
+                if gate is not None and time.monotonic() - last_gate_check >= 60:
+                    last_gate_check = time.monotonic()
+                    try:
+                        require_unlock_if_outside_sandbox(gate)
+                    except UnlockRequired:
+                        break
                 try:
                     ev = q.get(timeout=20)
                 except queue.Empty:

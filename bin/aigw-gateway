@@ -516,6 +516,8 @@ def _session_store_save(data, now: int):
     tmp_path = SESSION_STORE_PATH.with_name(
         f"{SESSION_STORE_PATH.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     tmp_path.write_text(json.dumps(data))
+    # Same mode aigw-mint-session-cookie gives it: only aigw reads the store.
+    os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, SESSION_STORE_PATH)
 
 
@@ -632,7 +634,9 @@ def _session_revoke_chain(data, chain: str, now: int):
 def check_and_rotate_session(signed: str):
     """Verifies a session cookie against the server-side store and rotates
     it if due (the deployment notes, the design notes). Returns
-    (username_or_None, new_cookie_header_or_None, current_jti_or_None) --
+    (username_or_None, new_cookie_header_or_None, current_jti_or_None,
+    chain_or_None) -- the chain is the login's stable id across rotations,
+    which unlock_key_for() turns into the per-browser passkey key --
     the second element is a ready-to-send Set-Cookie header string exactly
     when the caller should re-issue the cookie (rotation, or nudging a
     stale-but-in-grace tab back onto the chain's current tip), and is None
@@ -646,11 +650,11 @@ def check_and_rotate_session(signed: str):
     simply "not logged in"."""
     value = unsign(signed)
     if value is None:
-        return None, None, None
+        return None, None, None, None
     try:
         payload = json.loads(value)
     except ValueError:
-        return None, None, None
+        return None, None, None, None
     username = payload.get("u")
     jti = payload.get("jti")
     exp = payload.get("exp", 0)
@@ -661,17 +665,17 @@ def check_and_rotate_session(signed: str):
     # the store below is what adds rotation/idle/reuse on top of it, not
     # what this check depends on.
     if not username or not jti or not isinstance(exp, int) or exp < time.time():
-        return None, None, None
+        return None, None, None, None
     try:
         pwd.getpwnam(username)
     except KeyError:
-        return None, None, None
+        return None, None, None, None
 
     now = int(time.time())
     with _session_store_locked():
         data = _session_store_read()
         if data is None:
-            return None, None, None  # fail closed -- see _session_store_read's own comment
+            return None, None, None, None  # fail closed -- see _session_store_read's own comment
 
         record = data["sessions"].get(jti)
         if record is None or record["u"] != username:
@@ -681,18 +685,18 @@ def check_and_rotate_session(signed: str):
             # reuse-detection case: a real reuse replay requires the record
             # to still exist and be marked superseded (below), which a
             # pruned-away record by definition no longer is.
-            return None, None, None
+            return None, None, None, None
 
         chain = record["chain"]
         if chain in data["revoked_chains"]:
-            return None, None, None
+            return None, None, None, None
 
         # Idle timeout removed 2026-08-31 (see SESSION_ABSOLUTE_TTL's own
         # comment above) -- absolute_exp is the only expiry check left.
         if now > record["absolute_exp"]:
             _session_revoke_chain(data, chain, now)
             _session_store_save(data, now)
-            return None, None, None
+            return None, None, None, None
 
         if record["superseded_at"] is not None:
             if now - record["superseded_at"] <= SESSION_REUSE_GRACE:
@@ -715,7 +719,7 @@ def check_and_rotate_session(signed: str):
                         })),
                         tip_record["absolute_exp"],
                     )
-                return username, new_header, (tip or jti)
+                return username, new_header, (tip or jti), chain
             # Outside the grace window: an already-invalidated jti coming
             # back is exactly the "someone is using a copy" signal
             # refresh-token reuse detection exists to catch. Kill the
@@ -724,7 +728,7 @@ def check_and_rotate_session(signed: str):
             # design notes explicit instruction.
             _session_revoke_chain(data, chain, now)
             _session_store_save(data, now)
-            return None, None, None
+            return None, None, None, None
 
         # Ordinary case: this jti is the chain's current, non-superseded tip.
         if now - record["issued"] >= SESSION_ROTATE_INTERVAL:
@@ -739,17 +743,29 @@ def check_and_rotate_session(signed: str):
                 sign(json.dumps({"u": username, "jti": new_jti, "exp": record["absolute_exp"]})),
                 record["absolute_exp"],
             )
-            return username, new_header, new_jti
+            return username, new_header, new_jti, chain
 
         if now - record["last_seen"] < SESSION_LAST_SEEN_WRITE_THROTTLE:
             # Not due for rotation, and last_seen was persisted too
             # recently to be worth a rewrite -- see
             # SESSION_LAST_SEEN_WRITE_THROTTLE's own comment.
-            return username, None, jti
+            return username, None, jti, chain
 
         record["last_seen"] = now
         _session_store_save(data, now)
-        return username, None, jti
+        return username, None, jti, chain
+
+
+def unlock_key_for(chain: str) -> str:
+    """The per-browser key of a passkey unlock window (the deployment notes,
+    2026-10-09: ユーザー依頼「鍵をあけたブラウザ経由でしかアクセスできないように」).
+    A login's chain survives the 5-minute cookie rotation but is new for
+    every Google login, so a window opened in one browser is never usable
+    from another login of the same user -- e.g. someone who took over the
+    Google account. Hashed so the store key itself never leaves this
+    process. Sent to the backend as X-Aigw-Unlock-Key on every request,
+    always set (or emptied) here, never copied from the client."""
+    return hashlib.sha256(b"aigw-unlock-key\0" + chain.encode()).hexdigest()[:32]
 
 
 def _session_touch(jti: str, username: str) -> bool:
@@ -1159,7 +1175,9 @@ class Handler(BaseHTTPRequestHandler):
         cookies = self._cookies()
         if SESSION_COOKIE not in cookies:
             return None
-        username, new_cookie_header, current_jti = check_and_rotate_session(cookies[SESSION_COOKIE].value)
+        username, new_cookie_header, current_jti, chain = check_and_rotate_session(cookies[SESSION_COOKIE].value)
+        if chain is not None:
+            self._pending_unlock_key = unlock_key_for(chain)
         if new_cookie_header is not None:
             self._pending_session_cookie_header = new_cookie_header
         if current_jti is not None:
@@ -1236,6 +1254,7 @@ class Handler(BaseHTTPRequestHandler):
         # this connection in turn.
         self._pending_session_cookie_header = None
         self._pending_session_jti = None
+        self._pending_unlock_key = None
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -1357,6 +1376,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._pending_session_cookie_header = None  # see do_GET's own comment
         self._pending_session_jti = None
+        self._pending_unlock_key = None
         parsed = urlparse(self.path)
         path = parsed.path
         if path == f"{BASE_PATH}/logout":
@@ -1580,18 +1600,31 @@ class Handler(BaseHTTPRequestHandler):
             sock_path = backend_socket_path_for(owner)
         except KeyError:
             return self._send_json(403, {"error": "no such user"})
-        path = "/container-ip" + (f"?box={box}" if box else "")
+        # X-Sandbox-Unlock (the deployment notes): nginx asks for the caller's
+        # host-tier passkey window on top of the login. Only "host" exists.
+        unlock = self.headers.get("X-Sandbox-Unlock") or ""
+        if unlock and unlock != "host":
+            return self._send_json(403, {"error": "bad unlock tier"})
+        query = "&".join(q for q in (f"box={box}" if box else "",
+                                     f"unlock={unlock}" if unlock else "") if q)
+        path = "/container-ip" + (f"?{query}" if query else "")
         try:
             # X-Aigw-Requester: who is asking, for the owner's backend to
             # sign (the deployment notes) -- forwarded to the app as
             # X-Aigw-User/-Exp/-Sig, which nginx sets from these headers.
             conn, resp = backend_request(sock_path, "GET", path, timeout=15,
-                                         headers={"X-Aigw-Requester": username})
+                                         headers={"X-Aigw-Requester": username,
+                                                  "X-Aigw-Unlock-Key": getattr(self, "_pending_unlock_key", None) or ""})
             body = json.loads(resp.read())
             backend_conn_put(sock_path, conn)
         except (ConnectionRefusedError, OSError, socket.timeout,
                 http.client.HTTPException, ValueError) as e:
             return self._send_json(502, {"error": f"container lookup failed: {e}"})
+        # No open window: 403 is the only non-401 status nginx's
+        # auth_request passes through, and the /email/ location turns it
+        # into the passkey page.
+        if resp.status == 403 and body.get("unlock_required"):
+            return self._send_json(403, {"error": "unlock required", "unlock_required": True})
         if resp.status != 200 or "ip" not in body:
             return self._send_json(502, {"error": body.get("error", "container lookup failed")})
         extra = {"X-Container-IP": body["ip"]}
@@ -1662,6 +1695,7 @@ class Handler(BaseHTTPRequestHandler):
             headers["Last-Event-ID"] = self.headers["Last-Event-ID"]
         if target != username:
             headers["X-Aigw-On-Behalf-Of"] = username
+        headers["X-Aigw-Unlock-Key"] = getattr(self, "_pending_unlock_key", None) or ""
 
         try:
             conn, resp = backend_request(sock_path, method, backend_path,

@@ -396,6 +396,18 @@ _reg_tokens = {}  # token -> {"user": str, "expires_at": float, "used": bool}
 _reg_states = {}  # token -> fido2 internal state dict, from register_begin()
 _assert_states = {}  # user -> (fido2 internal state dict, expires_at float)
 _unlocks = {}  # user -> (unlocked_at, expires_at, tier) tuple; presence = unlocked.
+# Per-browser windows (2026-10-09, the deployment notes: ユーザー依頼「鍵をあけた
+# ブラウザ経由でしかアクセスできないように」): user -> {unlock_key: unlocked_at}.
+# aigw-backend passes the `unlock_key` aigw-gateway derived from the caller's
+# login. A request that carries one is unlocked only if that key itself did
+# the passkey ceremony within the user's current window (and within
+# UNLOCK_ABSOLUTE_MAX of doing so) -- another login of the same user, e.g.
+# someone holding the Google account, gets "not unlocked" even while the
+# owner's window is open. A request without the field (the CLI, the
+# backend's own background threads) sees the user's window as before.
+# Reset whenever a ceremony finds no open window, so keys never outlive the
+# window they joined.
+_unlock_keys = {}
 # `tier` ("host" or "root") is fixed at verb_finish_assertion time to the
 # tier of the credential that opened the window and `touch` never changes
 # it -- see the module docstring's "TWO-TIER CREDENTIALS AND WINDOWS"
@@ -1275,7 +1287,13 @@ def verb_finish_assertion(uid, pid, req):
 
     window_start = time.time()
     window_expires_at = window_start + UNLOCK_TTL
+    unlock_key = req.get("unlock_key")
     with _lock:
+        prev = _unlocks.get(user)
+        if prev is None or prev[1] <= window_start:
+            _unlock_keys[user] = {}
+        if isinstance(unlock_key, str) and unlock_key:
+            _unlock_keys.setdefault(user, {})[unlock_key] = window_start
         _unlocks[user] = (window_start, window_expires_at, credential_tier)
     # THE single most important line in this whole daemon: a
     # root shell is granted -- systemctl start aigw-root-tmux@<user> -- if
@@ -1303,7 +1321,8 @@ def verb_status(uid, pid, req):
     now = time.time()
     with _lock:
         entry = _unlocks.get(user)
-    unlocked = entry is not None and entry[1] > now
+        key_ok = _key_allowed(user, req, now)
+    unlocked = entry is not None and entry[1] > now and key_ok
     # `enrolled` (any tier) is what lets a UI offer a sandbox-outside action
     # while the window is *closed*. Without it the frontend has only
     # root_shell_allowed() -- "does the root tmux socket exist right now" --
@@ -1341,6 +1360,17 @@ def verb_status(uid, pid, req):
         "enrolled": enrolled,
         "enrolled_root": enrolled_root,
     }
+
+
+def _key_allowed(user, req, now):
+    """False when the request carries an `unlock_key` that did not unlock
+    the user's current window itself (see _unlock_keys). Call with _lock
+    held. True for a request without the field (the per-user check alone)."""
+    if "unlock_key" not in req:
+        return True
+    key = req.get("unlock_key")
+    at = _unlock_keys.get(user, {}).get(key) if isinstance(key, str) and key else None
+    return at is not None and at + UNLOCK_ABSOLUTE_MAX > now
 
 
 def verb_touch(uid, pid, req):
@@ -1389,7 +1419,7 @@ def verb_touch(uid, pid, req):
     deny_reason = None
     with _lock:
         entry = _unlocks.get(user)
-        if entry is None or entry[1] <= now:
+        if entry is None or entry[1] <= now or not _key_allowed(user, req, now):
             deny_reason = "not-unlocked"
         elif not _tier_satisfies(entry[2], tier):
             deny_reason = "insufficient-tier"

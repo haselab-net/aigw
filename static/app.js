@@ -2591,6 +2591,58 @@
     return [...rest, ...orderedIds.map((id) => byId.get(id))];
   }
 
+  // Rows a browser without the needed passkey window gets back from
+  // GET /sessions with label "🔒" and locked: true (aigw-backend's
+  // redact_locked_sessions). WebAuthn can only start from a tap, so the list
+  // cannot ask for the passkey by itself on load: this bar above it (not
+  // inside #sessions, whose children the drag-reorder code counts) offers
+  // the tap, and a tap on a locked row asks first and then opens the row
+  // with its real name (2026-10-09, at the user's request).
+  const lockedListBarEl = document.createElement("div");
+  lockedListBarEl.hidden = true;
+  lockedListBarEl.style.cssText =
+    "display: flex; align-items: center; gap: 0.6rem; margin: 0 0 0.6rem; padding: 0.6rem 0.8rem; " +
+    "border-radius: 10px; border: 1px solid #b45309; background: rgba(180,83,9,0.15); color: #fcd34d; font-size: 0.9rem;";
+  const lockedListTextEl = document.createElement("span");
+  lockedListTextEl.style.flex = "1";
+  const lockedListBtnEl = document.createElement("button");
+  lockedListBtnEl.type = "button";
+  lockedListBtnEl.textContent = "🔓 解錠して表示";
+  lockedListBtnEl.style.cssText =
+    "flex-shrink: 0; padding: 0.4rem 0.8rem; border-radius: 8px; border: none; background: #4285F4; color: white; font-weight: 600;";
+  lockedListBarEl.append(lockedListTextEl, lockedListBtnEl);
+  sessionsEl.parentNode.insertBefore(lockedListBarEl, sessionsEl);
+  let lockedListTier = "host";
+
+  function lockedTierFor(list) {
+    return list.some((s) => s.tmux_location === "root") ? "root" : "host";
+  }
+
+  async function unlockAndRefresh(tier) {
+    await ensureUnlocked(tier);
+    return refreshSessions();
+  }
+
+  lockedListBtnEl.addEventListener("click", async () => {
+    lockedListBtnEl.disabled = true;
+    try {
+      await unlockAndRefresh(lockedListTier);
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      lockedListBtnEl.disabled = false;
+    }
+  });
+
+  async function openLockedSession(s) {
+    try {
+      const all = await unlockAndRefresh(s.tmux_location === "root" ? "root" : "host");
+      openSession((all || []).find((x) => x.id === s.id && x.owner === s.owner) || s);
+    } catch (e) {
+      alert(e.message);
+    }
+  }
+
   async function refreshSessions() {
     const [{ sessions: ownSessions }, sharedSessions, order] = await Promise.all([
       api("/sessions"),
@@ -2631,6 +2683,12 @@
     // bookkeeping via `sessions`/`lastSessions` above, only the rendering
     // splits them out into #archived-list below.
     const visible = sessions.filter((s) => sessionMachine(s) === currentMachine);
+    const lockedRows = visible.filter((s) => s.locked && !s.archived);
+    lockedListTier = lockedTierFor(lockedRows);
+    lockedListTextEl.textContent =
+      `🔒 ${lockedRows.length} 件のセッションは、パスキーで解錠するまで名前を隠しています`;
+    lockedListBarEl.hidden = lockedRows.length === 0;
+    lockedListBarEl.style.display = lockedRows.length === 0 ? "none" : "flex";
     for (const s of visible.filter((s) => !s.archived)) {
       const row = document.createElement("div");
       row.className = "session-row";
@@ -2647,8 +2705,31 @@
           <span class="label">${screenBadge(s)}${escapeHtml(s.label)}</span>
           <div class="meta">${s.preset}${cwdSuffix(s)} &middot; ${fmtTime(s.created_ts)}${ownerBadge}${linkSuffix(s)}</div>
         </div>`;
-      row.addEventListener("click", () => openSession(s));
+      row.addEventListener("click", () => (s.locked ? openLockedSession(s) : openSession(s)));
       wireSessionDrag(row.querySelector(".drag-handle"), row);
+      // Tapping an ended session's grey dot offers to resume it (2026-10-09,
+      // user request: "灰色のスイッチを押したら、再開するか確認して、OKなら再開") --
+      // instead of a separate ↻ button. Only one's own, resumable sessions
+      // (a locked row carries no conversation id, so never qualifies).
+      if (!s.alive && !s.owner && canResumeEnded(s)) {
+        const dot = row.querySelector(".dot");
+        dot.classList.add("resumable");
+        dot.title = "タップで再開";
+        dot.addEventListener("click", (e) => {
+          e.stopPropagation(); // don't also open the ended session
+          resumeEndedSession(s);
+        });
+      } else if (s.alive && !s.owner && !s.locked) {
+        // ...and a running one's green dot offers to stop it, the same as
+        // the chat header's dot.
+        const dot = row.querySelector(".dot");
+        dot.classList.add("stoppable");
+        dot.title = "タップで停止";
+        dot.addEventListener("click", (e) => {
+          e.stopPropagation();
+          stopSessionConfirmed(s.id, null, false);
+        });
+      }
 
       if (!s.owner) {
         const editBtn = document.createElement("button");
@@ -2660,22 +2741,6 @@
           renameSession(s);
         });
         row.appendChild(editBtn);
-
-        // ↻ on an ended Claude session (2026-10-09, user request:
-        // "終了セッションに再開ボタンをつけられますか"): a new session of the same
-        // preset/folder/name that continues this one's conversation -- exactly
-        // what picking it in ⏱ would do, without going through the picker.
-        if (!s.alive && canResumeEnded(s)) {
-          const resumeBtn = document.createElement("button");
-          resumeBtn.className = "resume-btn";
-          resumeBtn.textContent = "↻";
-          resumeBtn.title = "この会話の続きから新しいセッションを開く";
-          resumeBtn.addEventListener("click", (e) => {
-            e.stopPropagation(); // don't also open the (ended) session
-            resumeEndedSession(s, resumeBtn);
-          });
-          row.appendChild(resumeBtn);
-        }
 
         const linkBtn = document.createElement("button");
         linkBtn.className = "link-btn" + (linkArmedSessionId === s.id ? " armed" : "");
@@ -2737,7 +2802,7 @@
           <span class="label">${screenBadge(s)}${escapeHtml(s.label)}</span>
           <div class="meta">${s.preset}${cwdSuffix(s)} &middot; ${fmtTime(s.created_ts)}${ownerBadge}</div>
         </div>`;
-      row.addEventListener("click", () => openSession(s));
+      row.addEventListener("click", () => (s.locked ? openLockedSession(s) : openSession(s)));
 
       if (!s.owner) {
         const restoreBtn = document.createElement("button");
@@ -3078,7 +3143,10 @@
     setHistoryTopText("");
     let since = 0;
     try {
-      const page = await api(sessionPath(meta.id, `/events/page?limit=${HISTORY_PAGE_LIMIT}`, currentOwner));
+      // host/root/Email sessions need this browser's passkey window just to
+      // be read (the deployment notes, 2026-10-09): ask for it here, where
+      // the tap that opened the session still counts as a user gesture.
+      const page = await withUnlockRetry(() => api(sessionPath(meta.id, `/events/page?limit=${HISTORY_PAGE_LIMIT}`, currentOwner)));
       if (meta.id !== currentSessionId) return; // switched sessions while this was in flight
       for (const ev of page.events) renderEvent(meta.id, ev);
       hasMoreHistory = page.has_more;
@@ -3090,6 +3158,10 @@
       // new, still-empty session has nothing to mark the "start" of yet.
       setHistoryTopText(!hasMoreHistory && page.events.length ? "ここが会話の最初です" : "");
     } catch (e) {
+      if (e.unlockRequired) {
+        setHistoryTopText("🔒 このセッションを読むにはパスキーでの解錠が要ります。開き直してください");
+        return;
+      }
       // Falls through to a from-scratch SSE replay (since=0) below -- worse
       // than the fast path, but still correct, and the initial history
       // fetch failing at all should be rare.
@@ -3130,7 +3202,18 @@
       };
       es.onerror = () => {
         if (es.readyState !== EventSource.CLOSED) return; // the browser is retrying by itself
-        setTimeout(() => {
+        setTimeout(async () => {
+          if (currentEventSource !== es || meta.id !== currentSessionId) return;
+          // The backend also ends the stream when the passkey window closes;
+          // reopening would only be refused again every 3 seconds.
+          try {
+            await api(sessionPath(meta.id, `/events/page?limit=1`, currentOwner));
+          } catch (err) {
+            if (err.unlockRequired) {
+              setHistoryTopText("🔒 パスキーの解錠が切れました。開き直してください");
+              return;
+            }
+          }
           if (currentEventSource === es && meta.id === currentSessionId) open();
         }, 3000);
       };
@@ -3468,19 +3551,44 @@
 
   document.getElementById("back-btn").addEventListener("click", closeSession);
 
-  // The chat header's ↻ 再開: only for one's own ended, resumable session.
-  // Also retitles the status dot, whose long-press force-stop does nothing
-  // once the session has ended.
-  const resumeChatBtn = document.getElementById("resume-chat-btn");
+  // The chat header's status dot: on one's own ended, resumable session a
+  // tap offers to resume it (same as the list row's grey dot); its
+  // long-press force-stop does nothing once the session has ended.
+  function chatDotResumable() {
+    const m = currentSessionMeta;
+    return !!m && m.alive === false && !currentOwner && canResumeEnded(m);
+  }
   function updateChatResumeBtn() {
     const m = currentSessionMeta;
     const ended = !!m && m.alive === false;
-    resumeChatBtn.hidden = !(ended && !currentOwner && canResumeEnded(m));
-    chatDotEl.title = ended ? "終了しています" : "長押しで強制終了";
+    const resumable = chatDotResumable();
+    chatDotEl.classList.toggle("resumable", resumable);
+    chatDotEl.title = resumable ? "タップで再開" : ended ? "終了しています" : "タップで停止";
   }
-  resumeChatBtn.addEventListener("click", () => {
-    if (currentSessionMeta) resumeEndedSession(currentSessionMeta, resumeChatBtn);
+  chatDotEl.addEventListener("click", () => {
+    if (chatDotResumable()) { resumeEndedSession(currentSessionMeta); return; }
+    if (currentSessionMeta && currentSessionMeta.alive !== false) {
+      stopSessionConfirmed(currentSessionId, currentOwner, true);
+    }
   });
+
+  // Stopping a running session: an ordinary tap on its green status dot and
+  // a confirm (2026-10-09, user request -- it used to be a long-press, now
+  // that the grey dot's tap resumes, a tap is consistent). The backend first
+  // sends Claude Code Ctrl+C twice so it exits with its conversation saved
+  // for a later resume, then ends the session (aigw-backend's
+  // _graceful_claude_exit).
+  async function stopSessionConfirmed(sessionId, owner, fromChat) {
+    if (!confirm("このセッションを停止しますか？(Claude が動いていれば Ctrl+C を2回送り、会話を残してから終わらせます)")) return;
+    try {
+      await withUnlockRetry(() => api(sessionPath(sessionId, "/stop", owner), { method: "POST" }));
+    } catch (e) {
+      alert(`停止できませんでした: ${e.message}`);
+      return;
+    }
+    if (fromChat) closeSession();
+    else await refreshSessions();
+  }
 
   // Which ended sessions get ↻: the presets create_session accepts `resume`
   // for (aigw-backend: CWD_PRESETS, the Email preset, and a drives-capable
@@ -3498,17 +3606,20 @@
     return s.preset.startsWith("claude-tui-") && !!s.cwd;
   }
 
-  async function resumeEndedSession(s, btn) {
-    if (btn.disabled) return;
-    btn.disabled = true;
-    const original = btn.textContent;
-    btn.textContent = "…";
+  let resumingSession = false;
+  async function resumeEndedSession(s) {
+    if (resumingSession) return;
+    if (!confirm(`「${s.label}」を続きから再開しますか？(履歴は新しいセッションに引き継ぎ、このセッションは消えます)`)) return;
+    resumingSession = true;
     try {
       const body = {
         preset: s.preset,
         label: s.label,
         cwd: s.claude_cwd || s.cwd || "",
         resume: s.claude_session_id,
+        // The backend copies this ended session's chat history into the new
+        // one and then deletes it (the deployment notes).
+        replace_session: s.id,
         cols: computeScreenCols(),
         rows: computeScreenRows(),
       };
@@ -3528,8 +3639,7 @@
       await refreshSessions();
       openSession(meta);
     } finally {
-      btn.disabled = false;
-      btn.textContent = original;
+      resumingSession = false;
     }
   }
 
@@ -3542,39 +3652,6 @@
   // caught automatically) with a long-press on the status dot + a
   // confirm() dialog, so ending a still-running session takes a deliberate
   // gesture rather than an ordinary tap that sits among harmless buttons.
-  (function () {
-    const LONG_PRESS_MS = 600;
-    let pressTimer = null;
-    function arm() {
-      if (!currentSessionId) return;
-      // Already ended: nothing to force-stop (the header's ↻ 再開 is what an
-      // ended session offers instead, 2026-10-09).
-      if (currentSessionMeta && currentSessionMeta.alive === false) return;
-      pressTimer = setTimeout(async () => {
-        pressTimer = null;
-        if (!confirm("このセッションを強制終了しますか？(まだ動いている場合のみ意味があります)")) return;
-        try {
-          await withUnlockRetry(() => api(sessionPath(currentSessionId, "/stop", currentOwner), { method: "POST" }));
-        } catch (e) {
-          alert(`停止できませんでした: ${e.message}`);
-          return;
-        }
-        closeSession();
-      }, LONG_PRESS_MS);
-    }
-    function disarm() {
-      if (pressTimer) {
-        clearTimeout(pressTimer);
-        pressTimer = null;
-      }
-    }
-    chatDotEl.addEventListener("touchstart", arm, { passive: true });
-    chatDotEl.addEventListener("touchend", disarm);
-    chatDotEl.addEventListener("touchmove", disarm);
-    chatDotEl.addEventListener("mousedown", arm);
-    chatDotEl.addEventListener("mouseup", disarm);
-    chatDotEl.addEventListener("mouseleave", disarm);
-  })();
 
   // submit=false is the 送信 button: the characters, no Enter. The box is
   // still cleared -- the text has left for the pane either way, and what it
