@@ -34,6 +34,11 @@
   const sessionsEl = document.getElementById("sessions");
   const archiveToggleBtn = document.getElementById("archive-toggle-btn");
   const archivedListEl = document.getElementById("archived-list");
+  // Sessions others shared with me, folded like the archive and grouped by
+  // owner (the deployment notes).
+  const sharedToggleBtn = document.getElementById("shared-toggle-btn");
+  const sharedListEl = document.getElementById("shared-list");
+  const composerEl = document.getElementById("composer");
   const linkArmedBannerEl = document.getElementById("link-armed-banner");
   const linkArmedTextEl = document.getElementById("link-armed-text");
   const linkArmedCancelBtn = document.getElementById("link-armed-cancel");
@@ -86,6 +91,7 @@
   const shellCwdCrumbEl = document.getElementById("shell-cwd-crumb");
   const shellCwdUpBtn = document.getElementById("shell-cwd-up");
   const shellCwdChildEl = document.getElementById("shell-cwd-child");
+  const shellCwdNewBtn = document.getElementById("shell-cwd-new");
 
   // Working directory for a new claude session, relative to ~/sandhome
   // ("" = ~/sandhome itself). Walked one level at a time, so it can go as
@@ -207,6 +213,9 @@
   // reload, same as sessionMachine/currentMachine above.
   let archivedVisible = false;
   let lastArchivedSessions = [];
+  let sharedVisible = false;
+  let lastSharedSessions = [];
+  const openSharedOwners = new Set();
   // A fixed "このホスト" label was ambiguous whenever more than one host
   // shares this same static file -- the actual hostname (2026-08-17, at
   // the user's request) says which one without guessing.
@@ -354,7 +363,7 @@
     if (canRoot) {
       const opt = document.createElement("option");
       opt.value = "root-shell";
-      opt.textContent = "Shell (root・sandbox外)";
+      opt.textContent = t("Shell (root・sandbox外)");
       presetEl.appendChild(opt);
       // Same gate as the preset option above: the root Claude-auth row is
       // only ever useful to a user who can reach the root tmux server at all.
@@ -403,7 +412,7 @@
     // (Kill Chrome) -- see index.html's comment on #auth-header.
     const authOpt = document.createElement("option");
     authOpt.value = "auth";
-    authOpt.textContent = "設定";
+    authOpt.textContent = t("設定");
     machineSelectEl.appendChild(authOpt);
     machineSelectEl.addEventListener("change", applyMachineFilter);
     // Same gate as the "root-shell" preset option above.
@@ -457,8 +466,8 @@
       el.style.display = available ? "" : "none";
       el.textContent = desktopMode ? "🪟" : "🐚";
       el.title = desktopMode
-        ? "画面あり(デスクトップのセッション1で動く)。タップで画面なしに"
-        : "画面なし(セッション0で動く)。タップで画面ありに";
+        ? t("画面あり(デスクトップのセッション1で動く)。タップで画面なしに")
+        : t("画面なし(セッション0で動く)。タップで画面ありに");
     }
   }
   for (const el of desktopToggleEls) {
@@ -491,7 +500,7 @@
         if (scope === "mail") {
           cwdCrumbEl.textContent = top;
           cwdUpBtn.disabled = true;
-          cwdChildEl.innerHTML = '<option value="">(一覧を取得できません)</option>';
+          cwdChildEl.innerHTML = `<option value="">${t("(一覧を取得できません)")}</option>`;
           cwdChildEl.disabled = true;
           populateConversationSelect(resumeEl, []);
         }
@@ -507,7 +516,7 @@
     cwdChildEl.innerHTML = "";
     const head = document.createElement("option");
     head.value = "";
-    head.textContent = r.subdirs.length ? "サブフォルダを開く…" : "(サブフォルダなし)";
+    head.textContent = r.subdirs.length ? t("サブフォルダを開く…") : t("(サブフォルダなし)");
     cwdChildEl.appendChild(head);
     cwdChildEl.disabled = !r.subdirs.length;
     for (const name of r.subdirs) {
@@ -550,7 +559,7 @@
       body: JSON.stringify({ scope, dir: parent, name }),
     });
     const r = await (scope === "mail" ? withUnlockRetry(post) : post()).catch((e) => ({ error: e.message }));
-    if (r.error) return alert(`フォルダを作れませんでした: ${r.error}`);
+    if (r.error) return alert(t("フォルダを作れませんでした: {err}", { err: r.error }));
     if (scope === cwdScope) navigateTo(r.dir);
   });
 
@@ -585,7 +594,7 @@
     }
     currentSshCwd = r.dir;
     const atRoot = currentSshCwd === "";
-    sshCwdCrumbEl.textContent = atRoot ? "ドライブを選択…" : mountPathLabel(currentSshCwd);
+    sshCwdCrumbEl.textContent = atRoot ? t("ドライブを選択…") : mountPathLabel(currentSshCwd);
     sshCwdUpBtn.disabled = atRoot;
     sshCwdNewBtn.disabled = atRoot; // a folder needs a drive to go in
 
@@ -594,8 +603,8 @@
     const head = document.createElement("option");
     head.value = "";
     head.textContent = items.length
-      ? (atRoot ? "ドライブを選ぶ…" : "サブフォルダを開く…")
-      : (atRoot ? "(ドライブが見つかりません)" : "(サブフォルダなし)");
+      ? (atRoot ? t("ドライブを選ぶ…") : t("サブフォルダを開く…"))
+      : (atRoot ? t("(ドライブが見つかりません)") : t("(サブフォルダなし)"));
     sshCwdChildEl.appendChild(head);
     sshCwdChildEl.disabled = !items.length;
     for (const name of items) {
@@ -640,7 +649,7 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ scope: "ssh", machine, dir: parent, name }),
     }).catch((e) => ({ error: e.message }));
-    if (r.error) return alert(`フォルダを作れませんでした: ${r.error}`);
+    if (r.error) return alert(t("フォルダを作れませんでした: {err}", { err: r.error }));
     if (machine === currentMachine && parent === currentSshCwd) navigateSshTo(r.dir);
   });
 
@@ -679,7 +688,7 @@
         shellCwdChildEl.innerHTML = "";
         const fail = document.createElement("option");
         fail.value = "";
-        fail.textContent = "(一覧を取得できません)";
+        fail.textContent = t("(一覧を取得できません)");
         shellCwdChildEl.appendChild(fail);
         shellCwdChildEl.disabled = true;
         return;
@@ -694,7 +703,7 @@
     shellCwdChildEl.innerHTML = "";
     const head = document.createElement("option");
     head.value = "";
-    head.textContent = r.subdirs.length ? "サブフォルダを開く…" : "(サブフォルダなし)";
+    head.textContent = r.subdirs.length ? t("サブフォルダを開く…") : t("(サブフォルダなし)");
     shellCwdChildEl.appendChild(head);
     shellCwdChildEl.disabled = !r.subdirs.length;
     for (const name of r.subdirs) {
@@ -736,6 +745,26 @@
     }
   });
 
+  // ＋ on the shell pickers too (2026-10-13, user request): the same
+  // new-folder move as #claude-opts' own. "host"/"root" create on the real
+  // filesystem, behind the same unlock window the pane itself needs.
+  shellCwdNewBtn.addEventListener("click", async () => {
+    const preset = presetEl.value;
+    const scope = SHELL_CWD_SCOPE[preset];
+    if (!scope) return;
+    const name = (prompt("新しいフォルダの名前") || "").trim();
+    if (!name) return;
+    const parent = shellCwdByPreset[preset];
+    const post = () => api("/workdirs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope, dir: parent, name }),
+    });
+    const r = await (scope === "sandhome" ? post() : withUnlockRetry(post)).catch((e) => ({ error: e.message }));
+    if (r.error) return alert(t("フォルダを作れませんでした: {err}", { err: r.error }));
+    if (presetEl.value === preset && shellCwdByPreset[preset] === parent) navigateShellCwdTo(r.dir);
+  });
+
   // Shared option-building behind refreshConversations (local) and
   // refreshSshConversations (a drives-capable ssh machine,
   // the deployment notes) -- both fetch the same {id, mtime, aigw_label, summary} shape
@@ -744,7 +773,7 @@
     selectEl.innerHTML = "";
     const fresh = document.createElement("option");
     fresh.value = "";
-    fresh.textContent = "新規";
+    fresh.textContent = t("新規");
     selectEl.appendChild(fresh);
     for (const c of conversations) {
       const opt = document.createElement("option");
@@ -869,13 +898,13 @@
   // without saying whose session is about to end. ssh:<machine> entries are
   // added by addSshAuthRow().
   const AUTH_SCOPE_LABELS = {
-    container: "sandboxコンテナ内",
-    host: "このホスト(sandbox外・あなた自身)",
-    root: "このホストの root",
+    container: t("sandboxコンテナ内"),
+    host: t("このホスト(sandbox外・あなた自身)"),
+    root: t("このホストの root"),
   };
 
   function setChecking(el) {
-    el.textContent = "確認中…";
+    el.textContent = t("確認中…");
     el.className = "auth-status-text";
   }
 
@@ -886,17 +915,17 @@
   // shape `claude auth status --json` returns.
   function renderAuthStatus(el, st) {
     if (st == null) {
-      el.textContent = "権限なし";
+      el.textContent = t("権限なし");
       el.className = "auth-status-text";
     } else if (st.error) {
       el.textContent = st.error;
       el.className = "auth-status-text err";
     } else if (st.loggedIn) {
       const detail = [st.authMethod, st.orgName, st.subscriptionType].filter(Boolean).join(" / ");
-      el.textContent = `${st.email || "ログイン済み"}${detail ? ` (${detail})` : ""}`;
+      el.textContent = `${st.email || t("ログイン済み")}${detail ? ` (${detail})` : ""}`;
       el.className = "auth-status-text in";
     } else {
-      el.textContent = "未ログイン";
+      el.textContent = t("未ログイン");
       el.className = "auth-status-text out";
     }
   }
@@ -945,13 +974,13 @@
   function wireAuthLogoutButton(btn) {
     const scope = btn.dataset.scope;
     btn.addEventListener("click", () => withAuthButtonsDisabled(async () => {
-      if (!confirm(`${AUTH_SCOPE_LABELS[scope]}のClaude Codeをログアウトします。よろしいですか?`)) return;
+      if (!confirm(t("{where}のClaude Codeをログアウトします。よろしいですか?", { where: AUTH_SCOPE_LABELS[scope] }))) return;
       const r = await withUnlockRetry(() => api("/claude-auth/logout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scope }),
       })).catch((e) => ({ error: e.message }));
-      if (r.error) alert(`ログアウトに失敗しました: ${r.error}`);
+      if (r.error) alert(t("ログアウトに失敗しました: {err}", { err: r.error }));
       await refreshAuthStatus();
     }));
   }
@@ -964,7 +993,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scope }),
       })).catch((e) => {
-        alert(`ログインを開始できませんでした: ${e.message}`);
+        alert(t("ログインを開始できませんでした: {err}", { err: e.message }));
         return null;
       });
       if (!meta) return;
@@ -990,11 +1019,11 @@
     row.innerHTML = `
       <div class="auth-line">
         <span class="auth-label">${escapeHtml(machine)}</span>
-        <span class="auth-status-text">確認中…</span>
+        <span class="auth-status-text">${t("確認中…")}</span>
       </div>
       <div class="auth-actions">
-        <button class="auth-login" data-scope="${scope}">ログイン</button>
-        <button class="auth-logout" data-scope="${scope}">ログアウト</button>
+        <button class="auth-login" data-scope="${scope}">${t("ログイン")}</button>
+        <button class="auth-logout" data-scope="${scope}">${t("ログアウト")}</button>
       </div>`;
     // Under their own "Other hosts" heading, after the Codex group
     // (2026-10-06, at the user's request) -- the heading stays hidden on a
@@ -1029,23 +1058,23 @@
   let codexAuthLoginBtns = [...document.querySelectorAll("button.codex-auth-login")];
   let codexAuthLogoutBtns = [...document.querySelectorAll("button.codex-auth-logout")];
   const CODEX_AUTH_SCOPE_LABELS = {
-    container: "sandboxコンテナ内",
-    host: "このホスト(sandbox外・あなた自身)",
-    root: "このホストの root",
+    container: t("sandboxコンテナ内"),
+    host: t("このホスト(sandbox外・あなた自身)"),
+    root: t("このホストの root"),
   };
 
   function renderCodexAuthStatus(el, st) {
     if (st == null) {
-      el.textContent = "権限なし";
+      el.textContent = t("権限なし");
       el.className = "auth-status-text";
     } else if (st.error) {
       el.textContent = st.error;
       el.className = "auth-status-text err";
     } else if (st.loggedIn) {
-      el.textContent = st.text || "ログイン済み";
+      el.textContent = st.text || t("ログイン済み");
       el.className = "auth-status-text in";
     } else {
-      el.textContent = st.text || "未ログイン";
+      el.textContent = st.text || t("未ログイン");
       el.className = "auth-status-text out";
     }
   }
@@ -1075,13 +1104,13 @@
   function wireCodexAuthLogoutButton(btn) {
     const scope = btn.dataset.scope;
     btn.addEventListener("click", () => withCodexAuthButtonsDisabled(async () => {
-      if (!confirm(`${CODEX_AUTH_SCOPE_LABELS[scope]}のCodexをログアウトします。よろしいですか?`)) return;
+      if (!confirm(t("{where}のCodexをログアウトします。よろしいですか?", { where: CODEX_AUTH_SCOPE_LABELS[scope] }))) return;
       const r = await withUnlockRetry(() => api("/codex-auth/logout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scope }),
       })).catch((e) => ({ error: e.message }));
-      if (r.error) alert(`ログアウトに失敗しました: ${r.error}`);
+      if (r.error) alert(t("ログアウトに失敗しました: {err}", { err: r.error }));
       await refreshCodexAuthStatus();
     }));
   }
@@ -1094,7 +1123,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scope }),
       })).catch((e) => {
-        alert(`ログインを開始できませんでした: ${e.message}`);
+        alert(t("ログインを開始できませんでした: {err}", { err: e.message }));
         return null;
       });
       if (!meta) return;
@@ -1124,7 +1153,7 @@
     if (confirmMsg && !confirm(confirmMsg)) return;
     const btns = [chromeKillOwnBtn, chromeKillAllBtn];
     btns.forEach((b) => (b.disabled = true));
-    chromeKillStatusEl.textContent = "実行中…";
+    chromeKillStatusEl.textContent = t("実行中…");
     chromeKillStatusEl.className = "auth-status-text";
     try {
       // Only ever relevant for scope "all" (root pane) -- "self" never hits
@@ -1135,7 +1164,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scope }),
       }));
-      chromeKillStatusEl.textContent = "停止しました";
+      chromeKillStatusEl.textContent = t("停止しました");
       chromeKillStatusEl.className = "auth-status-text in";
     } catch (e) {
       chromeKillStatusEl.textContent = e.message;
@@ -1147,7 +1176,7 @@
 
   chromeKillOwnBtn.addEventListener("click", () => killChrome("self"));
   chromeKillAllBtn.addEventListener("click", () =>
-    killChrome("all", "全ユーザーのheadful ChromeをKillします。よろしいですか?"));
+    killChrome("all", t("全ユーザーのheadful ChromeをKillします。よろしいですか?")));
 
   // The phone's own keyboard already sends any literal character via the
   // text box -- what it can't produce at all is terminal control input:
@@ -1210,7 +1239,7 @@
     // on textEl further down).
     const attachBtn = document.createElement("button");
     attachBtn.textContent = "📎";
-    attachBtn.title = "ファイルを添付";
+    attachBtn.title = t("ファイルを添付");
     attachBtn.addEventListener("click", () => attachFileInputEl.click());
     modRowEl.appendChild(attachBtn);
 
@@ -1415,26 +1444,26 @@
     }
     const promise = (async () => {
       if (!window.PublicKeyCredential) {
-        throw new Error("このブラウザはパスキー(WebAuthn)に対応していません");
+        throw new Error(t("このブラウザはパスキー(WebAuthn)に対応していません"));
       }
       const begin = await api("/unlock/begin-assertion", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ tier }),
       });
-      if (!begin.ok) throw new Error(begin.error || "認証を開始できませんでした");
+      if (!begin.ok) throw new Error(begin.error || t("認証を開始できませんでした"));
       let cred;
       try {
         cred = await navigator.credentials.get({ publicKey: requestOptionsFromWire(begin.options) });
       } catch (e) {
-        throw new Error(`生体認証がキャンセルまたは失敗しました: ${e.message}`);
+        throw new Error(t("生体認証がキャンセルまたは失敗しました: {err}", { err: e.message }));
       }
       const finish = await api("/unlock/finish-assertion", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ credential: credentialToJSON(cred) }),
       });
-      if (!finish.ok) throw new Error(finish.error || "認証に失敗しました");
+      if (!finish.ok) throw new Error(finish.error || t("認証に失敗しました"));
       updateUnlockBadge({ unlocked: true, expires_at: finish.expires_at, tier: finish.tier });
       return finish.expires_at;
     })();
@@ -1508,7 +1537,8 @@
     // No tier needed (container/ssh:/no session open), or the session has
     // already ended -- nothing further can arrive for it either way, so a
     // closed window has nothing to catch up on.
-    if (!tier || !currentSessionMeta.alive) {
+    // A read-only share needs no window (the deployment notes).
+    if (!tier || !currentSessionMeta.alive || currentShareMode === "read") {
       unlockNoticeEl.hidden = true;
       return;
     }
@@ -1553,7 +1583,7 @@
     // 🔓 (open padlock) for root -- the strongest tier, authorises host
     // too. 🔑 (key) for host-only -- open, but not the same as 🔓.
     const label = unlockTier === "root" ? "root/host" : "host";
-    unlockBadgeEl.title = `${label} がアンロック中。タップでロック(今すぐ解除)`;
+    unlockBadgeEl.title = t("{label} がアンロック中。タップでロック(今すぐ解除)", { label });
     unlockBadgeEl.textContent = unlockTier === "root" ? "🔓" : "🔑";
   }
 
@@ -1580,7 +1610,7 @@
   }
 
   unlockBadgeEl.addEventListener("click", async () => {
-    if (!confirm("root/hostのアンロックを今すぐ解除しますか?")) return;
+    if (!confirm(t("root/hostのアンロックを今すぐ解除しますか?"))) return;
     await api("/unlock/lock", { method: "POST" }).catch(() => {});
     await pollUnlockStatus();
   });
@@ -1655,7 +1685,7 @@
     const div = document.createElement("div");
     div.className = "bubble agent thinking";
     div.id = "thinking-indicator";
-    div.textContent = "考え中…";
+    div.textContent = t("考え中…");
     const follow = chatNearBottom();
     messagesEl.appendChild(div);
     if (follow) scrollChatToBottom();
@@ -2035,7 +2065,7 @@
 
   function renderAgentsList(subagents) {
     if (!subagents.length) {
-      agentsPaneEl.innerHTML = '<div class="agents-empty">サブエージェントはまだありません</div>';
+      agentsPaneEl.innerHTML = `<div class="agents-empty">${t("サブエージェントはまだありません")}</div>`;
       return;
     }
     agentsPaneEl.innerHTML = "";
@@ -2057,10 +2087,10 @@
     const header = document.createElement("div");
     header.className = "agent-detail-header";
     const back = document.createElement("button");
-    back.textContent = "← 一覧";
+    back.textContent = t("← 一覧");
     back.addEventListener("click", () => {
       currentAgentId = null;
-      agentsPaneEl.innerHTML = '<div class="agents-empty">読み込み中…</div>';
+      agentsPaneEl.innerHTML = `<div class="agents-empty">${t("読み込み中…")}</div>`;
       refreshAgentsList();
     });
     header.appendChild(back);
@@ -2068,7 +2098,7 @@
     agentsPaneEl.appendChild(header);
     const body = document.createElement("div");
     body.className = "agent-detail-body";
-    setTextWithLinks(body, text || "(まだ内容がありません)");
+    setTextWithLinks(body, text || t("(まだ内容がありません)"));
     agentsPaneEl.appendChild(body);
   }
 
@@ -2092,7 +2122,7 @@
   function showAgentDetail(agentId, description) {
     currentAgentId = agentId;
     currentAgentDescription = description;
-    agentsPaneEl.innerHTML = '<div class="agents-empty">読み込み中…</div>';
+    agentsPaneEl.innerHTML = `<div class="agents-empty">${t("読み込み中…")}</div>`;
     refreshAgentDetail();
   }
 
@@ -2103,7 +2133,7 @@
     stopAgentsPoll();
     if (!on) return;
     currentAgentId = null;
-    agentsPaneEl.innerHTML = '<div class="agents-empty">読み込み中…</div>';
+    agentsPaneEl.innerHTML = `<div class="agents-empty">${t("読み込み中…")}</div>`;
     refreshAgentsList();
     agentsPollTimer = setInterval(() => {
       if (currentAgentId === null) refreshAgentsList();
@@ -2123,6 +2153,10 @@
 
   let shareVisible = false;
   let currentSharedWith = [];
+  let currentSharedRead = [];
+  // "read" when the open session is someone else's shared with me read-only
+  // (the deployment notes): the log only -- no composer, keys, screen or stop.
+  let currentShareMode = null;
 
   // aigw-backend sends Content-Disposition: attachment, but a same-tab
   // navigation to it is not reliable in a standalone PWA on every mobile
@@ -2135,7 +2169,7 @@
     // throw on this endpoint's plain-text body.
     const res = await fetch(sessionApiUrl(currentSessionId, "/download", currentOwner)).catch(() => null);
     if (!res || !res.ok) {
-      alert(`ダウンロードに失敗しました${res ? `: ${res.status}` : ""}`);
+      alert(t("ダウンロードに失敗しました") + (res ? `: ${res.status}` : ""));
       return;
     }
     const disposition = res.headers.get("Content-Disposition") || "";
@@ -2158,73 +2192,101 @@
   // Meaningless for a shared viewer's own copy of this button (they don't
   // control shared_with), so only ever set for one's own session.
   function updateShareBtnColor() {
-    shareBtn.classList.toggle("shared", !currentOwner && currentSharedWith.length > 0);
+    shareBtn.classList.toggle("shared", !currentOwner && currentSharedWith.length + currentSharedRead.length > 0);
   }
 
   function renderSharePane() {
     updateShareBtnColor();
     const save = `
       <div class="share-save">
-        <button id="share-download-btn">💾 会話ログを保存</button>
+        <button id="share-download-btn">${t("💾 会話ログを保存")}</button>
       </div>`;
     // Sharing *management* stays owner-only -- currentOwner set means this
-    // session was shared to me, not mine to re-share.
-    if (currentOwner) {
+    // session was shared to me, not mine to re-share. Email is never shared
+    // (the deployment notes).
+    if (currentOwner || currentPreset === "mail-tui") {
       sharePaneEl.innerHTML = save;
       sharePaneEl.querySelector("#share-download-btn").addEventListener("click", downloadTranscript);
       return;
     }
-    const risky = currentPreset === "host-shell" || currentPreset === "root-shell";
-    const warn = risky
-      ? `<div class="share-warn">⚠️ 共有すると、相手はあなた${currentPreset === "root-shell" ? "(root)" : ""}と同じ権限でコマンドを実行できます。</div>`
-      : "";
-    const rows = currentSharedWith.length
-      ? currentSharedWith.map((u) => `
+    // the deployment notes: everyone, read-only is the default. A root shell is
+    // only ever shared read-only.
+    const isRoot = currentPreset === "root-shell";
+    const modeLabel = (m) => (m === "read" ? t("閲覧のみ") : t("共同作業"));
+    const entries = [
+      ...currentSharedRead.map((u) => ({ u, m: "read" })),
+      ...currentSharedWith.map((u) => ({ u, m: isRoot ? "read" : "write" })),
+    ];
+    const rows = entries.length
+      ? entries.map(({ u, m }) => `
           <div class="share-row" data-user="${escapeHtml(u)}">
-            <span>${escapeHtml(u)}</span>
-            <button class="unshare-btn">解除</button>
+            <span>${u === "*" ? t("全員") : escapeHtml(u)} &middot; ${modeLabel(m)}</span>
+            <button class="unshare-btn">${t("解除")}</button>
           </div>`).join("")
-      : `<div class="share-empty">まだ誰とも共有していません</div>`;
+      : `<div class="share-empty">${t("まだ誰とも共有していません")}</div>`;
+    const note = `<div class="share-note">${t("閲覧のみ: チャットのログだけが見えます(画面・送信・停止はできません)。全員 = このサーバーの aigw の全ユーザー。")}</div>`;
+    const warn = currentPreset === "host-shell"
+      ? `<div class="share-warn">${t("⚠️ 共同作業で共有すると、相手はあなたと同じ権限でコマンドを実行できます。")}</div>`
+      : "";
     sharePaneEl.innerHTML = `
       ${save}
+      ${note}
       ${warn}
       ${rows}
       <div class="share-add">
-        <input type="text" id="share-username" placeholder="ユーザー名" autocapitalize="off" autocorrect="off">
-        <button id="share-add-btn">共有する</button>
+        <select id="share-target">
+          <option value="*">${t("全員")}</option>
+          <option value="user">${t("ユーザーを指定")}</option>
+        </select>
+        <input type="text" id="share-username" placeholder="${t("ユーザー名")}" autocapitalize="off" autocorrect="off" hidden>
+        <select id="share-mode" ${isRoot ? "hidden" : ""}>
+          <option value="read">${t("閲覧のみ")}</option>
+          <option value="write" disabled>${t("共同作業")}</option>
+        </select>
+        <button id="share-add-btn">${t("共有する")}</button>
       </div>`;
     sharePaneEl.querySelector("#share-download-btn").addEventListener("click", downloadTranscript);
+    const targetEl = sharePaneEl.querySelector("#share-target");
+    const userEl = sharePaneEl.querySelector("#share-username");
+    const modeEl = sharePaneEl.querySelector("#share-mode");
+    targetEl.addEventListener("change", () => {
+      const everyone = targetEl.value === "*";
+      userEl.hidden = everyone;
+      // Co-working is with a named person only.
+      modeEl.querySelector('option[value="write"]').disabled = everyone;
+      if (everyone) modeEl.value = "read";
+    });
+    const applyShareMeta = (meta) => {
+      currentSharedWith = meta.shared_with || [];
+      currentSharedRead = meta.shared_read || [];
+      renderSharePane();
+    };
     sharePaneEl.querySelectorAll(".unshare-btn").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const username = btn.closest(".share-row").dataset.user;
         try {
-          const meta = await api(`/sessions/${currentSessionId}/unshare`, {
+          applyShareMeta(await api(`/sessions/${currentSessionId}/unshare`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ username }),
-          });
-          currentSharedWith = meta.shared_with || [];
-          renderSharePane();
+          }));
         } catch (e) {
-          alert(`共有解除に失敗しました: ${e.message}`);
+          alert(t("共有解除に失敗しました: {err}", { err: e.message }));
         }
       });
     });
     sharePaneEl.querySelector("#share-add-btn").addEventListener("click", async () => {
-      const input = sharePaneEl.querySelector("#share-username");
-      const username = input.value.trim();
+      const username = targetEl.value === "user" ? userEl.value.trim() : "*";
       if (!username) return;
+      const mode = isRoot ? "read" : modeEl.value;
       try {
-        const meta = await api(`/sessions/${currentSessionId}/share`, {
+        applyShareMeta(await api(`/sessions/${currentSessionId}/share`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username }),
-        });
-        currentSharedWith = meta.shared_with || [];
-        input.value = "";
-        renderSharePane();
+          body: JSON.stringify({ username, mode }),
+        }));
       } catch (e) {
-        alert(`共有に失敗しました: ${e.message}`);
+        alert(t("共有に失敗しました: {err}", { err: e.message }));
       }
     });
   }
@@ -2339,6 +2401,18 @@
     div.appendChild(a);
   }
 
+  // Claude's thinking (agent_thinking, 2026-10-13): dimmed and folded to a
+  // few lines so it doesn't crowd out the replies; a tap unfolds it.
+  function renderThought(div, text) {
+    div.className = "bubble agent thought";
+    div.title = t("思考(タップで全文)");
+    setTextWithLinks(div, text);
+    div.addEventListener("click", (e) => {
+      if (e.target.closest("a")) return;
+      div.classList.toggle("open");
+    });
+  }
+
   function renderEvent(sessionId, ev) {
     // Ephemeral, and not a conversation event: it carries no seq, is never
     // written to events.jsonl, and must not disturb the chat log — including
@@ -2383,6 +2457,7 @@
     }
 
     const div = document.createElement("div");
+    if (typeof ev.seq === "number") div.dataset.seq = ev.seq; // jump target for search (jumpToSeq)
     if (ev.type === "user_message") {
       div.className = "bubble user";
       // ev.from is set only when a shared collaborator, not
@@ -2401,12 +2476,14 @@
       if (ev.submit === false) {
         const tag = document.createElement("span");
         tag.className = "nosubmit";
-        tag.textContent = "⏎なし";
+        tag.textContent = t("⏎なし");
         div.appendChild(tag);
       }
     } else if (ev.type === "agent_output") {
       div.className = "bubble agent";
       setTextWithLinks(div, ev.text);
+    } else if (ev.type === "agent_thinking") {
+      renderThought(div, ev.text);
     } else if (ev.type === "image") {
       // Legacy event type: every outbox file was called "image" before
       // "attachment"+"kind" existed (2026-08-15) -- old sessions'
@@ -2442,8 +2519,8 @@
       // one is worth showing, since the message that explains it is the
       // bubble immediately above this one.
       div.textContent = ev.exit_status
-        ? `セッションは終了しました (終了コード ${ev.exit_status})`
-        : "セッションは終了しました";
+        ? t("セッションは終了しました (終了コード {code})", { code: ev.exit_status })
+        : t("セッションは終了しました");
       // A claude-login pane ends exactly when `claude auth login` is done,
       // success or failure -- i.e. this is the moment the auth panel's
       // answer changed, and the user should not have to press ⟳ to find out.
@@ -2494,7 +2571,7 @@
   function linkRemaining(expiresTs) {
     const min = Math.max(0, Math.ceil((expiresTs - Date.now() / 1000) / 60));
     const h = Math.floor(min / 60), m = min % 60;
-    return h ? `残り${h}時間${m ? m + "分" : ""}` : `残り${m}分`;
+    return h ? (m ? t("残り{h}時間{m}分", { h, m }) : t("残り{h}時間", { h })) : t("残り{m}分", { m });
   }
 
   function linkSuffix(s) {
@@ -2505,7 +2582,7 @@
   function renderLinkArmedBanner() {
     const armed = lastSessions.find((s) => s.id === linkArmedSessionId);
     linkArmedBannerEl.classList.toggle("visible", !!armed);
-    if (armed) linkArmedTextEl.textContent = `🔗「${armed.label}」とつなぐ相手をタップしてください`;
+    if (armed) linkArmedTextEl.textContent = t("🔗「{label}」とつなぐ相手をタップしてください", { label: armed.label });
   }
 
   linkArmedCancelBtn.addEventListener("click", () => {
@@ -2524,12 +2601,12 @@
 
   async function onLinkButtonTapped(s) {
     if (s.link) {
-      if (!confirm(`「${s.label}」と「${s.link.partner_label}」の連携を切断します。よろしいですか?`)) return;
+      if (!confirm(t("「{a}」と「{b}」の連携を切断します。よろしいですか?", { a: s.label, b: s.link.partner_label }))) return;
       await api("/sessions/unlink", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: s.id }),
-      }).catch((e) => alert(`切断できませんでした: ${e.message}`));
+      }).catch((e) => alert(t("切断できませんでした: {err}", { err: e.message })));
       await refreshSessions();
       return;
     }
@@ -2553,8 +2630,8 @@
     // when root is involved, 4 hours otherwise. Blank also means "default".
     const suggested = (isRootSession(s) || isRootSession(other)) ? 30 : 240;
     const raw = prompt(
-      `「${other.label}」と「${s.label}」をつなぎます。\n` +
-      "何分で自動的に切断するかを入力してください(最大1440分=24時間)。",
+      t("「{a}」と「{b}」をつなぎます。", { a: other.label, b: s.label }) + "\n" +
+      t("何分で自動的に切断するかを入力してください(最大1440分=24時間)。"),
       String(suggested),
     );
     if (raw === null) { await refreshSessions(); return; } // cancelled
@@ -2570,7 +2647,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    }).catch((e) => alert(`連携できませんでした: ${e.message}`));
+    }).catch((e) => alert(t("連携できませんでした: {err}", { err: e.message })));
     await refreshSessions();
   }
 
@@ -2607,7 +2684,7 @@
   lockedListTextEl.style.flex = "1";
   const lockedListBtnEl = document.createElement("button");
   lockedListBtnEl.type = "button";
-  lockedListBtnEl.textContent = "🔓 解錠して表示";
+  lockedListBtnEl.textContent = t("🔓 解錠して表示");
   lockedListBtnEl.style.cssText =
     "flex-shrink: 0; padding: 0.4rem 0.8rem; border-radius: 8px; border: none; background: #4285F4; color: white; font-weight: 600;";
   lockedListBarEl.append(lockedListTextEl, lockedListBtnEl);
@@ -2686,10 +2763,10 @@
     const lockedRows = visible.filter((s) => s.locked && !s.archived);
     lockedListTier = lockedTierFor(lockedRows);
     lockedListTextEl.textContent =
-      `🔒 ${lockedRows.length} 件のセッションは、パスキーで解錠するまで名前を隠しています`;
+      t("🔒 {n} 件のセッションは、パスキーで解錠するまで名前を隠しています", { n: lockedRows.length });
     lockedListBarEl.hidden = lockedRows.length === 0;
     lockedListBarEl.style.display = lockedRows.length === 0 ? "none" : "flex";
-    for (const s of visible.filter((s) => !s.archived)) {
+    for (const s of visible.filter((s) => !s.archived && !s.owner)) {
       const row = document.createElement("div");
       row.className = "session-row";
       row.dataset.sessionId = s.id;
@@ -2697,10 +2774,10 @@
       // entry -- shown as a badge so a shared session is never mistaken for
       // one's own, since it can be co-worked (messages/keys/stop) but not
       // renamed/deleted/archived from here (owner-only, see aigw-backend).
-      const ownerBadge = s.owner ? ` &middot; ${escapeHtml(s.owner)}さんと共有` : "";
+      const ownerBadge = s.owner ? ` &middot; ${t("{owner}さんと共有", { owner: escapeHtml(s.owner) })}` : "";
       row.innerHTML = `
         <div>
-          <span class="drag-handle" title="ドラッグで並べ替え">⠿</span>
+          <span class="drag-handle" title="${t("ドラッグで並べ替え")}">⠿</span>
           <span class="dot ${s.alive ? "alive" : "stopped"}"></span>
           <span class="label">${screenBadge(s)}${escapeHtml(s.label)}</span>
           <div class="meta">${s.preset}${cwdSuffix(s)} &middot; ${fmtTime(s.created_ts)}${ownerBadge}${linkSuffix(s)}</div>
@@ -2714,7 +2791,7 @@
       if (!s.alive && !s.owner && canResumeEnded(s)) {
         const dot = row.querySelector(".dot");
         dot.classList.add("resumable");
-        dot.title = "タップで再開";
+        dot.title = t("タップで再開");
         dot.addEventListener("click", (e) => {
           e.stopPropagation(); // don't also open the ended session
           resumeEndedSession(s);
@@ -2724,7 +2801,7 @@
         // the chat header's dot.
         const dot = row.querySelector(".dot");
         dot.classList.add("stoppable");
-        dot.title = "タップで停止";
+        dot.title = t("タップで停止");
         dot.addEventListener("click", (e) => {
           e.stopPropagation();
           stopSessionConfirmed(s.id, null, false);
@@ -2735,7 +2812,7 @@
         const editBtn = document.createElement("button");
         editBtn.className = "edit-btn";
         editBtn.textContent = "✏️";
-        editBtn.title = "名前を変更";
+        editBtn.title = t("名前を変更");
         editBtn.addEventListener("click", (e) => {
           e.stopPropagation(); // don't also open the session
           renameSession(s);
@@ -2745,7 +2822,7 @@
         const linkBtn = document.createElement("button");
         linkBtn.className = "link-btn" + (linkArmedSessionId === s.id ? " armed" : "");
         linkBtn.textContent = "🔗";
-        linkBtn.title = s.link ? `連携中(「${s.link.partner_label}」)-- タップで切断` : "他のセッションとつなぐ";
+        linkBtn.title = s.link ? t("連携中(「{label}」)-- タップで切断", { label: s.link.partner_label }) : t("他のセッションとつなぐ");
         linkBtn.addEventListener("click", (e) => {
           e.stopPropagation(); // don't also open the session
           onLinkButtonTapped(s);
@@ -2755,7 +2832,7 @@
         const archiveBtn = document.createElement("button");
         archiveBtn.className = "archive-btn";
         archiveBtn.textContent = "🗄";
-        archiveBtn.title = "アーカイブへ移動";
+        archiveBtn.title = t("アーカイブへ移動");
         archiveBtn.addEventListener("click", (e) => {
           e.stopPropagation(); // don't also open the session
           archiveSession(s);
@@ -2774,8 +2851,12 @@
 
       sessionsEl.appendChild(row);
     }
-    lastArchivedSessions = visible.filter((s) => s.archived);
+    lastArchivedSessions = visible.filter((s) => s.archived && !s.owner);
     renderArchivedSection();
+    // Not filtered by the machine selector: a shared log is found by its
+    // owner, not by where it ran.
+    lastSharedSessions = sessions.filter((s) => s.owner);
+    renderSharedSection();
     return sessions;
   }
 
@@ -2786,8 +2867,8 @@
   // below.
   function renderArchivedSection() {
     archiveToggleBtn.textContent = archivedVisible
-      ? "🗄 アーカイブを閉じる"
-      : `🗄 アーカイブを開く (${lastArchivedSessions.length})`;
+      ? t("🗄 アーカイブを閉じる")
+      : t("🗄 アーカイブを開く ({n})", { n: lastArchivedSessions.length });
     archivedListEl.hidden = !archivedVisible;
     archivedListEl.innerHTML = "";
     if (!archivedVisible) return;
@@ -2795,7 +2876,7 @@
       const row = document.createElement("div");
       row.className = "session-row";
       row.dataset.sessionId = s.id;
-      const ownerBadge = s.owner ? ` &middot; ${escapeHtml(s.owner)}さんと共有` : "";
+      const ownerBadge = s.owner ? ` &middot; ${t("{owner}さんと共有", { owner: escapeHtml(s.owner) })}` : "";
       row.innerHTML = `
         <div>
           <span class="dot ${s.alive ? "alive" : "stopped"}"></span>
@@ -2808,7 +2889,7 @@
         const restoreBtn = document.createElement("button");
         restoreBtn.className = "archive-btn";
         restoreBtn.textContent = "📤";
-        restoreBtn.title = "アーカイブから戻す";
+        restoreBtn.title = t("アーカイブから戻す");
         restoreBtn.addEventListener("click", (e) => {
           e.stopPropagation();
           unarchiveSession(s);
@@ -2829,6 +2910,56 @@
     }
   }
 
+  // "👥 共有ログ" (the deployment notes): folded like the archive; open, one
+  // folder per owner, each opened on its own.
+  function renderSharedSection() {
+    sharedToggleBtn.hidden = lastSharedSessions.length === 0 && !sharedVisible;
+    sharedToggleBtn.textContent = sharedVisible
+      ? t("👥 共有ログを閉じる")
+      : t("👥 共有ログを開く ({n})", { n: lastSharedSessions.length });
+    sharedListEl.hidden = !sharedVisible;
+    sharedListEl.innerHTML = "";
+    if (!sharedVisible) return;
+    const byOwner = new Map();
+    for (const s of lastSharedSessions) {
+      if (!byOwner.has(s.owner)) byOwner.set(s.owner, []);
+      byOwner.get(s.owner).push(s);
+    }
+    for (const owner of [...byOwner.keys()].sort()) {
+      const list = byOwner.get(owner);
+      const open = openSharedOwners.has(owner);
+      const folder = document.createElement("button");
+      folder.type = "button";
+      folder.className = "shared-folder";
+      folder.textContent = `${open ? "📂" : "📁"} ${owner} (${list.length})`;
+      folder.addEventListener("click", () => {
+        if (open) openSharedOwners.delete(owner); else openSharedOwners.add(owner);
+        renderSharedSection();
+      });
+      sharedListEl.appendChild(folder);
+      if (!open) continue;
+      for (const s of list) {
+        const row = document.createElement("div");
+        row.className = "session-row shared-row";
+        row.dataset.sessionId = s.id;
+        const mode = s.share_mode === "read" ? t("閲覧のみ") : t("共同作業");
+        row.innerHTML = `
+          <div>
+            <span class="dot ${s.alive ? "alive" : "stopped"}"></span>
+            <span class="label">${screenBadge(s)}${escapeHtml(s.label)}</span>
+            <div class="meta">${s.preset} &middot; ${fmtTime(s.created_ts)} &middot; ${mode}</div>
+          </div>`;
+        row.addEventListener("click", () => (s.locked ? openLockedSession(s) : openSession(s)));
+        sharedListEl.appendChild(row);
+      }
+    }
+  }
+
+  sharedToggleBtn.addEventListener("click", () => {
+    sharedVisible = !sharedVisible;
+    renderSharedSection();
+  });
+
   archiveToggleBtn.addEventListener("click", () => {
     archivedVisible = !archivedVisible;
     renderArchivedSection();
@@ -2836,13 +2967,13 @@
 
   async function archiveSession(meta) {
     await api(`/sessions/${meta.id}/archive`, { method: "POST" }).catch((e) =>
-      alert(`アーカイブできませんでした: ${e.message}`));
+      alert(t("アーカイブできませんでした: {err}", { err: e.message })));
     await refreshSessions();
   }
 
   async function unarchiveSession(meta) {
     await api(`/sessions/${meta.id}/unarchive`, { method: "POST" }).catch((e) =>
-      alert(`元に戻せませんでした: ${e.message}`));
+      alert(t("元に戻せませんでした: {err}", { err: e.message })));
     await refreshSessions();
   }
 
@@ -2937,7 +3068,7 @@
   }
 
   async function deleteSession(meta) {
-    if (!confirm(`「${meta.label}」の会話ログを削除します。元に戻せません。よろしいですか?`)) return;
+    if (!confirm(t("「{label}」の会話ログを削除します。元に戻せません。よろしいですか?", { label: meta.label }))) return;
     await api(`/sessions/${meta.id}/delete`, { method: "POST" });
     await refreshSessions();
   }
@@ -2951,7 +3082,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ label: trimmed }),
-    }).catch((e) => alert(`名前を変更できませんでした: ${e.message}`));
+    }).catch((e) => alert(t("名前を変更できませんでした: {err}", { err: e.message })));
     await refreshSessions();
     // The chat header's own label is a separate DOM element (set once in
     // openSession(), not re-read from the session list) -- keep it in sync
@@ -2991,7 +3122,7 @@
       row.appendChild(nameEl);
 
       const btn = document.createElement("button");
-      btn.textContent = "接続";
+      btn.textContent = t("接続");
       btn.addEventListener("click", () => adoptSession(name, location));
       row.appendChild(btn);
 
@@ -3012,7 +3143,7 @@
         cols: computeScreenCols(), rows: computeScreenRows(),
       }),
     })).catch((e) => {
-      alert(`接続に失敗しました: ${e.message}`);
+      alert(t("接続に失敗しました: {err}", { err: e.message }));
       return null;
     });
     if (!meta) return;
@@ -3058,6 +3189,7 @@
   // the live tail, never for a page of already-settled older history.
   function buildHistoryBubble(sessionId, ev) {
     const div = document.createElement("div");
+    if (typeof ev.seq === "number") div.dataset.seq = ev.seq;
     if (ev.type === "user_message") {
       div.className = "bubble user";
       if (ev.from) {
@@ -3070,12 +3202,14 @@
       if (ev.submit === false) {
         const tag = document.createElement("span");
         tag.className = "nosubmit";
-        tag.textContent = "⏎なし";
+        tag.textContent = t("⏎なし");
         div.appendChild(tag);
       }
     } else if (ev.type === "agent_output") {
       div.className = "bubble agent";
       setTextWithLinks(div, ev.text);
+    } else if (ev.type === "agent_thinking") {
+      renderThought(div, ev.text);
     } else if (ev.type === "image") {
       div.className = "bubble agent";
       const img = document.createElement("img");
@@ -3091,8 +3225,8 @@
     } else if (ev.type === "session_ended") {
       div.className = "bubble system";
       div.textContent = ev.exit_status
-        ? `セッションは終了しました (終了コード ${ev.exit_status})`
-        : "セッションは終了しました";
+        ? t("セッションは終了しました (終了コード {code})", { code: ev.exit_status })
+        : t("セッションは終了しました");
     } else if (ev.type === "system") {
       div.className = "bubble system";
       div.textContent = ev.text;
@@ -3102,15 +3236,15 @@
     return div;
   }
 
-  async function loadOlderHistory() {
-    if (loadingHistory || !hasMoreHistory || oldestLoadedSeq === null || !currentSessionId) return;
+  async function loadOlderHistory(limit = HISTORY_PAGE_LIMIT) {
+    if (loadingHistory || !hasMoreHistory || oldestLoadedSeq === null || !currentSessionId) return false;
     loadingHistory = true;
     setHistoryTopText("読み込み中…");
     const sessionId = currentSessionId;
     const owner = currentOwner;
     try {
-      const page = await api(sessionPath(sessionId, `/events/page?before=${oldestLoadedSeq}&limit=${HISTORY_PAGE_LIMIT}`, owner));
-      if (sessionId !== currentSessionId) return; // switched sessions while this was in flight
+      const page = await api(sessionPath(sessionId, `/events/page?before=${oldestLoadedSeq}&limit=${limit}`, owner));
+      if (sessionId !== currentSessionId) return false; // switched sessions while this was in flight
       const prevScrollHeight = messagesEl.scrollHeight;
       const prevScrollTop = messagesEl.scrollTop;
       const frag = document.createDocumentFragment();
@@ -3124,9 +3258,11 @@
       messagesEl.scrollTop = prevScrollTop + (messagesEl.scrollHeight - prevScrollHeight);
       hasMoreHistory = page.has_more;
       if (page.events.length) oldestLoadedSeq = Math.min(...page.events.map((e) => e.seq));
-      setHistoryTopText(hasMoreHistory ? "" : "ここが会話の最初です");
+      setHistoryTopText(hasMoreHistory ? "" : t("ここが会話の最初です"));
+      return true;
     } catch (e) {
       setHistoryTopText("読み込みに失敗しました(スクロールでやり直せます)");
+      return false;
     } finally {
       loadingHistory = false;
     }
@@ -3135,6 +3271,81 @@
   messagesEl.addEventListener("scroll", () => {
     if (messagesEl.scrollTop < 80) loadOlderHistory();
   });
+
+  // ---- jump to one event (chat search, 2026-10-11) -------------------------
+  //
+  // Loads older pages until the event with this seq is rendered, then
+  // scrolls it to the middle of #messages and flashes it. Pages are sized to
+  // reach the target in as few requests as possible (the backend caps a
+  // page at 500).
+  let pendingJumpSeq = null;
+  let pendingJumpTerms = [];
+
+  // The first occurrence of any of `terms` inside `el`, as a Range, plus
+  // every occurrence for highlighting -- a bubble can be far taller than
+  // the screen (a pasted log), where centering the bubble itself would
+  // leave the match off-screen.
+  function findTermRanges(el, terms) {
+    const ranges = [];
+    if (!terms.length) return ranges;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const lower = node.data.toLowerCase();
+      for (const t of terms) {
+        for (let j = lower.indexOf(t); j !== -1; j = lower.indexOf(t, j + t.length)) {
+          const r = document.createRange();
+          r.setStart(node, j);
+          r.setEnd(node, j + t.length);
+          ranges.push(r);
+        }
+      }
+    }
+    return ranges;
+  }
+
+  async function jumpToSeq(sessionId, seq, terms = []) {
+    const find = () => messagesEl.querySelector(`[data-seq="${seq}"]`);
+    let el = find();
+    while (!el && sessionId === currentSessionId && hasMoreHistory
+           && oldestLoadedSeq !== null && oldestLoadedSeq > seq) {
+      const need = Math.min(500, oldestLoadedSeq - seq + 10);
+      if (!(await loadOlderHistory(need))) break;
+      el = find();
+    }
+    if (!el || sessionId !== currentSessionId) return;
+    const ranges = findTermRanges(el, terms);
+    if (ranges.length && window.CSS && CSS.highlights && typeof Highlight === "function") {
+      CSS.highlights.set("search-term", new Highlight(...ranges));
+    }
+    const position = () => {
+      const first = ranges.length ? ranges[0].getBoundingClientRect() : null;
+      if (first && first.height && el.getBoundingClientRect().height > messagesEl.clientHeight) {
+        const box = messagesEl.getBoundingClientRect();
+        messagesEl.scrollTop += first.top - box.top - messagesEl.clientHeight / 2;
+      } else {
+        el.scrollIntoView({ block: "center" });
+      }
+    };
+    position();
+    // Images and 3D models above the target finish loading after this and
+    // push it down; keep it in place for a few seconds, until the user
+    // scrolls by hand or leaves the session.
+    const stopEvents = ["wheel", "touchstart", "pointerdown", "keydown"];
+    let timer = null;
+    const stop = () => {
+      clearInterval(timer);
+      for (const t of stopEvents) messagesEl.removeEventListener(t, stop);
+    };
+    for (const t of stopEvents) messagesEl.addEventListener(t, stop, { passive: true });
+    const until = Date.now() + 5000;
+    timer = setInterval(() => {
+      if (Date.now() > until || sessionId !== currentSessionId || !el.isConnected) stop();
+      else position();
+    }, 250);
+    el.classList.remove("search-hit");
+    void el.offsetWidth; // restart the animation if the same bubble is hit twice
+    el.classList.add("search-hit");
+  }
 
   async function connectSessionEvents(meta) {
     oldestLoadedSeq = null;
@@ -3156,7 +3367,12 @@
       }
       // Only worth saying for an actual (if short) conversation -- a brand
       // new, still-empty session has nothing to mark the "start" of yet.
-      setHistoryTopText(!hasMoreHistory && page.events.length ? "ここが会話の最初です" : "");
+      setHistoryTopText(!hasMoreHistory && page.events.length ? t("ここが会話の最初です") : "");
+      if (pendingJumpSeq !== null) {
+        const seq = pendingJumpSeq;
+        pendingJumpSeq = null;
+        await jumpToSeq(meta.id, seq, pendingJumpTerms);
+      }
     } catch (e) {
       if (e.unlockRequired) {
         setHistoryTopText("🔒 このセッションを読むにはパスキーでの解錠が要ります。開き直してください");
@@ -3221,7 +3437,10 @@
     open();
   }
 
-  function openSession(meta) {
+  function openSession(meta, jumpSeq = null, jumpTerms = []) {
+    pendingJumpSeq = jumpSeq;
+    pendingJumpTerms = jumpTerms;
+    if (window.CSS && CSS.highlights) CSS.highlights.delete("search-term");
     // Going back from here should land on this session's own machine's
     // list -- matters when it was opened by a notification or a reload's
     // hash rather than by tapping it in that list.
@@ -3235,14 +3454,18 @@
     // sessionApiUrl() need to tell apart.
     currentOwner = meta.owner || null;
     chatLabelEl.textContent = screenBadge(meta) + meta.label;
-    chatOwnerBadgeEl.textContent = currentOwner ? `${currentOwner}さんと共有中` : "";
+    currentShareMode = currentOwner ? (meta.share_mode || "write") : null;
+    const readOnly = currentShareMode === "read";
+    chatOwnerBadgeEl.textContent = currentOwner
+      ? (readOnly ? t("{owner}さんの共有ログ(閲覧のみ)", { owner: currentOwner }) : t("{owner}さんと共有中", { owner: currentOwner })) : "";
     // The panel itself is now always reachable (2026-08-28): it also holds
     // 💾 save, which a shared viewer needs too. The sharing *management*
     // controls rendered inside stay owner-only (renderSharePane checks
     // currentOwner) -- managing sharing on a session shared *to* me is not
     // something sharing is meant to also grant.
-    shareBtn.title = currentOwner ? "保存" : "共有";
+    shareBtn.title = currentOwner ? t("保存") : t("共有");
     currentSharedWith = currentOwner ? [] : (meta.shared_with || []);
+    currentSharedRead = currentOwner ? [] : (meta.shared_read || []);
     updateShareBtnColor();
     setShareVisible(false);
     chatDotEl.className = `dot ${meta.alive ? "alive" : "stopped"}`;
@@ -3260,9 +3483,10 @@
     topHeaderEl.style.display = "none";
     // Both the soft keyboard and the screen panel are about a real pane, so
     // neither applies to the headless preset.
-    const hasPane = !HEADLESS_PRESETS.includes(meta.preset);
+    const hasPane = !HEADLESS_PRESETS.includes(meta.preset) && !readOnly;
     keyToolbarEl.classList.toggle("visible", hasPane);
     screenBtn.style.display = hasPane ? "" : "none";
+    composerEl.style.display = readOnly ? "none" : "";
     // "Type without submitting" needs somewhere for the characters to sit
     // between calls, which only a real pane has -- a headless turn is a whole
     // message or nothing, so 実行 is the only button there.
@@ -3283,6 +3507,7 @@
     currentEventSource = null;
     currentSessionId = null;
     currentOwner = null;
+    currentShareMode = null;
     currentSessionMeta = null;
     updateUnlockNotice();
     viewChat.style.display = "none";
@@ -3352,6 +3577,113 @@
   document.getElementById("reload-btn").addEventListener("click", () => location.reload());
   document.getElementById("top-reload-btn").addEventListener("click", () => location.reload());
 
+  // ---- chat search (2026-10-11, at the user's request) ----------------------
+  //
+  // GET /search scans this user's own sessions' chat logs (aigw-backend's
+  // search_events), and GET /shared/<owner>/search, once per owner who
+  // shares something with this user, the sessions shared with them -- the
+  // owner's backend applies the same shared_with check as opening one.
+  // host/root/Email sessions only while this browser has their passkey
+  // window (the reply counts the skipped ones). Tapping a hit opens that
+  // session and jumps to the message (openSession's jumpSeq).
+  const searchPanelEl = document.getElementById("search-panel");
+  const searchInputEl = document.getElementById("search-input");
+  const searchStatusEl = document.getElementById("search-status");
+  const searchResultsEl = document.getElementById("search-results");
+  const SEARCH_TYPE_LABEL = { user_message: t("自分"), agent_output: "AI", agent_thinking: t("AI(思考)"), system: t("システム") };
+
+  document.getElementById("search-toggle-btn").addEventListener("click", () => {
+    searchPanelEl.hidden = !searchPanelEl.hidden;
+    if (!searchPanelEl.hidden) searchInputEl.focus();
+  });
+
+  function appendHighlighted(el, text, terms) {
+    const lower = text.toLowerCase();
+    let i = 0;
+    while (i < text.length) {
+      let best = -1, bestLen = 0;
+      for (const t of terms) {
+        const j = lower.indexOf(t, i);
+        if (j !== -1 && (best === -1 || j < best)) { best = j; bestLen = t.length; }
+      }
+      if (best === -1) break;
+      if (best > i) el.appendChild(document.createTextNode(text.slice(i, best)));
+      const m = document.createElement("mark");
+      m.textContent = text.slice(best, best + bestLen);
+      el.appendChild(m);
+      i = best + bestLen;
+    }
+    if (i < text.length) el.appendChild(document.createTextNode(text.slice(i)));
+  }
+
+  async function openSearchHit(hit, terms) {
+    const match = (s) => s.id === hit.session_id && (s.owner || null) === (hit.owner || null);
+    let meta = lastSessions.find(match);
+    if (!meta) {
+      const sessions = await refreshSessions();
+      meta = sessions.find(match);
+    }
+    if (!meta) {
+      searchStatusEl.textContent = t("このセッションはもうありません");
+      return;
+    }
+    openSession(meta, hit.seq, terms);
+  }
+
+  async function runSearch(q) {
+    const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+    searchResultsEl.innerHTML = "";
+    if (!terms.length) { searchStatusEl.textContent = ""; return; }
+    searchStatusEl.textContent = t("検索中…");
+    const qp = `/search?q=${encodeURIComponent(q)}`;
+    const owners = [...new Set(lastSessions.filter((s) => s.owner).map((s) => s.owner))];
+    let r;
+    try {
+      const [own, ...shared] = await Promise.all([
+        api(qp),
+        ...owners.map((o) => api(`/shared/${encodeURIComponent(o)}${qp}`)
+          .then((x) => ({ ...x, hits: x.hits.map((h) => ({ ...h, owner: o })) }))
+          .catch(() => ({ hits: [], locked: 0, truncated: false }))),
+      ]);
+      const all = [own, ...shared];
+      const hits = all.flatMap((x) => x.hits).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      r = {
+        hits: hits.slice(0, 200),
+        locked: all.reduce((n, x) => n + (x.locked || 0), 0),
+        truncated: hits.length > 200 || all.some((x) => x.truncated),
+      };
+    } catch (e) {
+      searchStatusEl.textContent = t("検索できませんでした: {err}", { err: e.message });
+      return;
+    }
+    const notes = [r.hits.length ? t("{n}件", { n: r.hits.length }) + (r.truncated ? t("(新しい順に表示、これより古いものは省略)") : "") : t("見つかりませんでした")];
+    if (r.locked) notes.push(t("🔒 {n}個のセッション(ホスト・ルート・Email)は解錠すると検索できます", { n: r.locked }));
+    searchStatusEl.textContent = notes.join(t("。"));
+    for (const hit of r.hits) {
+      const row = document.createElement("div");
+      row.className = "search-hit-row";
+      row.dataset.sessionId = hit.session_id;
+      if (hit.owner) row.dataset.owner = hit.owner;
+      row.dataset.seq = hit.seq;
+      const metaEl = document.createElement("div");
+      metaEl.className = "meta";
+      metaEl.textContent = `${hit.archived ? "🗄 " : ""}${hit.owner ? t("[{owner}さん] ", { owner: hit.owner }) : ""}${hit.label} · ${hit.ts ? fmtDateTime(hit.ts) : ""} · ${SEARCH_TYPE_LABEL[hit.type] || hit.type}`;
+      const snip = document.createElement("div");
+      snip.className = "snippet";
+      appendHighlighted(snip, hit.snippet, terms);
+      row.appendChild(metaEl);
+      row.appendChild(snip);
+      row.addEventListener("click", () => openSearchHit(hit, terms));
+      searchResultsEl.appendChild(row);
+    }
+  }
+
+  document.getElementById("search-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    searchInputEl.blur(); // closes the phone keyboard so the results are visible
+    runSearch(searchInputEl.value.trim());
+  });
+
   // Logging out moved from its own always-visible header link to a
   // tap-to-confirm on the username itself (2026-08-28, at the user's
   // request, to free up header space) -- whoEl.textContent is read at click
@@ -3367,7 +3699,7 @@
   // revoke either happened or the session was already invalid, and either way
   // sending the user back to /agents/ is the right next step.
   whoEl.addEventListener("click", async () => {
-    if (confirm(`${whoEl.textContent} からログアウトしますか？`)) {
+    if (confirm(t("{who} からログアウトしますか？", { who: whoEl.textContent }))) {
       try {
         await fetch("/agents/logout", { method: "POST", credentials: "same-origin" });
       } catch (e) { /* fall through to the redirect regardless */ }
@@ -3483,7 +3815,7 @@
     if (createBtn.disabled) return;
     createBtn.disabled = true;
     const originalLabel = createBtn.textContent;
-    createBtn.textContent = "起動中…";
+    createBtn.textContent = t("起動中…");
     try {
       let preset = presetEl.value;
       const label = document.getElementById("label").value;
@@ -3534,7 +3866,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       })).catch((e) => {
-        alert(`セッションを作成できませんでした: ${e.message}`);
+        alert(t("セッションを作成できませんでした: {err}", { err: e.message }));
         return null;
       });
       if (!meta) return;
@@ -3563,11 +3895,11 @@
     const ended = !!m && m.alive === false;
     const resumable = chatDotResumable();
     chatDotEl.classList.toggle("resumable", resumable);
-    chatDotEl.title = resumable ? "タップで再開" : ended ? "終了しています" : "タップで停止";
+    chatDotEl.title = resumable ? t("タップで再開") : ended ? t("終了しています") : t("タップで停止");
   }
   chatDotEl.addEventListener("click", () => {
     if (chatDotResumable()) { resumeEndedSession(currentSessionMeta); return; }
-    if (currentSessionMeta && currentSessionMeta.alive !== false) {
+    if (currentSessionMeta && currentSessionMeta.alive !== false && currentShareMode !== "read") {
       stopSessionConfirmed(currentSessionId, currentOwner, true);
     }
   });
@@ -3579,11 +3911,11 @@
   // for a later resume, then ends the session (aigw-backend's
   // _graceful_claude_exit).
   async function stopSessionConfirmed(sessionId, owner, fromChat) {
-    if (!confirm("このセッションを停止しますか？(Claude が動いていれば Ctrl+C を2回送り、会話を残してから終わらせます)")) return;
+    if (!confirm(t("このセッションを停止しますか？(Claude が動いていれば Ctrl+C を2回送り、会話を残してから終わらせます)"))) return;
     try {
       await withUnlockRetry(() => api(sessionPath(sessionId, "/stop", owner), { method: "POST" }));
     } catch (e) {
-      alert(`停止できませんでした: ${e.message}`);
+      alert(t("停止できませんでした: {err}", { err: e.message }));
       return;
     }
     if (fromChat) closeSession();
@@ -3609,7 +3941,7 @@
   let resumingSession = false;
   async function resumeEndedSession(s) {
     if (resumingSession) return;
-    if (!confirm(`「${s.label}」を続きから再開しますか？(履歴は新しいセッションに引き継ぎ、このセッションは消えます)`)) return;
+    if (!confirm(t("「{label}」を続きから再開しますか？(履歴は新しいセッションに引き継ぎ、このセッションは消えます)", { label: s.label }))) return;
     resumingSession = true;
     try {
       const body = {
@@ -3632,7 +3964,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       })).catch((e) => {
-        alert(`再開できませんでした: ${e.message}`);
+        alert(t("再開できませんでした: {err}", { err: e.message }));
         return null;
       });
       if (!meta) return;
@@ -3701,7 +4033,7 @@
       // discard *that* instead.
       textEl.value = textEl.value ? `${text}\n${textEl.value}` : text;
       autoResizeTextarea();
-      alert(`送信に失敗しました: ${e.message}\nもう一度お試しください。`);
+      alert(t("送信に失敗しました: {err}", { err: e.message }) + "\n" + t("もう一度お試しください。"));
     }
   }
 
@@ -3746,7 +4078,7 @@
   async function attachFile(file) {
     if (!currentSessionId) return;
     if (file.size > MAX_ATTACH_BYTES) {
-      alert(`ファイルが大きすぎます(上限${Math.floor(MAX_ATTACH_BYTES / (1024 * 1024))}MB)。`);
+      alert(t("ファイルが大きすぎます(上限{mb}MB)。", { mb: Math.floor(MAX_ATTACH_BYTES / (1024 * 1024)) }));
       return;
     }
     let path;
@@ -3761,7 +4093,7 @@
         body: JSON.stringify({ filename: file.name || (file.type.startsWith("image/") ? "image.png" : "upload"), data_base64 }),
       })));
     } catch (e) {
-      alert(`ファイルの添付に失敗しました: ${e.message}`);
+      alert(t("ファイルの添付に失敗しました: {err}", { err: e.message }));
       return;
     }
     const sep = textEl.value && !/[\s]$/.test(textEl.value) ? " " : "";
@@ -3880,6 +4212,18 @@
     }
     whoEl.textContent = me.username;
     buildKeyToolbar();
+    // Display language (the deployment notes): the picker on the settings page, and the
+    // choice saved on the server (another device may have changed it).
+    const langSelectEl = document.getElementById("lang-select");
+    for (const [code, name] of Object.entries(window.aigwI18n.LANGS)) {
+      const opt = document.createElement("option");
+      opt.value = code;
+      opt.textContent = name;
+      langSelectEl.appendChild(opt);
+    }
+    langSelectEl.value = window.aigwI18n.lang();
+    langSelectEl.addEventListener("change", () => window.aigwI18n.setLang(langSelectEl.value));
+    window.aigwI18n.syncFromServer();
 
     // A session (or auth) deep link -- typically a push notification's
     // click, see sw.js -- gets in as fast as possible: applyHash()'s own
@@ -3908,6 +4252,9 @@
     syncMachineSelect();
     if (currentMachine !== "local") rebuildPresetOptions();
     if (wanted !== currentMachine && !currentSessionId) setHash(listHash());
+    // Same for the settings page opened by its hash (a reload there):
+    // openAuthView() ran before the "auth" option existed.
+    if (viewAuth.style.display === "flex") machineSelectEl.value = "auth";
     initUnlockUI();
     initSiteExtras();
     applyPresetOptions();

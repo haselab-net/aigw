@@ -65,7 +65,7 @@
 <div class="wrap">
 
 <h1>aigw チュートリアル</h1>
-<p class="lead">スマホや PC のブラウザから、サーバー上の AI エージェント(Claude Code など)を使うための手引きです。2026-10-09 時点の画面で説明します。サーバーごとに入っている機能が少し違うので、分からないところは管理者に確認してください。</p>
+<p class="lead">スマホや PC のブラウザから、サーバー上の AI エージェント(Claude Code など)を使うための手引きです。2026-10-17 時点の画面で説明します。サーバーごとに入っている機能が少し違うので、分からないところは管理者に確認してください。</p>
 
 <p>aigw は <code>https://&lt;サーバー&gt;/agents/</code> で開くチャット風の画面です。チャットに書いた指示は、サーバー上の自分専用のコンテナで動く Claude Code に届き、返事がチャットに戻ってきます。</p>
 
@@ -160,6 +160,7 @@ ssh -i $key <ユーザー名>@&lt;サーバー&gt;</code></pre>
       <tr><td>作成欄</td><td>種類・フォルダ・名前を選んで <strong>開始</strong></td></tr>
       <tr><td>各行の ● </td><td>緑は動いている、灰色は止まったセッション。<strong>緑をタップすると停止、青い輪の付いた灰色をタップすると続きから再開</strong>(どちらも確認が出ます)</td></tr>
       <tr><td>⠿ ✏️ 🔗 🗄 🗑</td><td>並べ替え・名前の変更・他のセッションとつなぐ・アーカイブ(一覧から隠すだけ)・削除</td></tr>
+      <tr><td>👥 共有ログ</td><td>人から共有されたセッション。持ち主ごとのフォルダに入っています(<a href="#share">3章</a>)</td></tr>
     </table>
   </div>
 </div>
@@ -173,7 +174,7 @@ ssh -i $key <ユーザー名>@&lt;サーバー&gt;</code></pre>
       <tr><td><code>←</code></td><td>一覧へ戻る(画面を右へスワイプしても戻れます)</td></tr>
       <tr><td>● (名前の左)</td><td>動いているか。<strong>緑ならタップで停止、灰色ならタップで続きから再開</strong>(確認が出ます)</td></tr>
       <tr><td>🖥️</td><td>ターミナル画面(画面パネル)を開く・閉じる。<a href="#screen-vs-chat">5章</a></td></tr>
-      <tr><td>🧑‍🤝‍🧑</td><td>このセッションを他の人と共有する。会話の保存(💾)もこの中</td></tr>
+      <tr><td>🧑‍🤝‍🧑</td><td>このセッションを他の人と共有する(<a href="#share">3章</a>)。会話の保存(💾)もこの中</td></tr>
       <tr><td>キーの列</td><td><kbd>Ctrl</kbd> <kbd>⇧</kbd> <kbd>Alt</kbd> <kbd>↑</kbd> <kbd>↓</kbd> … 横にスクロールでき、右端に 📎(ファイル添付)。<a href="#keys">4章</a></td></tr>
       <tr><td><strong>送信</strong> / <strong>実行</strong></td><td>実行は Enter 付き、送信は Enter なし。<a href="#keys">4章</a></td></tr>
     </table>
@@ -216,6 +217,26 @@ ssh -i $key <ユーザー名>@&lt;サーバー&gt;</code></pre>
   <li>セッションを削除しても、会話は残っています。新しく作るときに同じフォルダを選び、⏱ の欄で日時と内容の要約から選ぶと続きから再開できます。</li>
   <li>Claude のセッションは claude.ai/code や Claude の公式アプリからも同じものを操作できます(画面パネルに出る <code>/remote-control</code> の案内)。</li>
 </ul>
+
+<h3 id="share">他の人と共有する</h3>
+<div class="shot">
+  <figure><img src="img/09-share.png" alt="共有パネル。会話ログの保存ボタン、閲覧のみの説明、相手(全員)と種類(閲覧のみ)の選択欄と「共有する」ボタン"><figcaption>🧑‍🤝‍🧑 で開く共有パネル。初めは「全員・閲覧のみ」</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li>チャット画面の 🧑‍🤝‍🧑 を押し、相手と種類を選んで <strong>共有する</strong>。初めは <strong>全員・閲覧のみ</strong> になっています。</li>
+      <li><strong>閲覧のみ</strong>: 相手にはチャットのログだけが見えます。画面パネル・送信・停止はできません。<strong>全員</strong> はこのサーバーの aigw の全ユーザーです。</li>
+      <li><strong>共同作業</strong>: 「ユーザーを指定」で名前を入れたときだけ選べます。相手もメッセージの送信・キー入力・停止ができます。ホストのシェルを共同作業で共有すると、相手はあなたの権限でコマンドを実行できます。</li>
+      <li>ルートのシェルは閲覧のみでしか共有できません。Email のセッションは共有できません。</li>
+      <li>やめるときは、パネルに並んだ相手の <strong>解除</strong> を押します。</li>
+    </ul>
+  </div>
+</div>
+<div class="shot">
+  <figure><img src="img/10-shared.png" alt="セッション一覧の下の「共有ログ」を開いたところ。持ち主ごとのフォルダ(alice・bob)があり、alice のフォルダの中に閲覧のみのセッション"><figcaption>人から共有されたセッションは「👥 共有ログ」に入る</figcaption></figure>
+  <div class="side">
+    <p>人から共有されたセッションは、一覧の下の <strong>👥 共有ログを開く</strong> に入ります(アーカイブと同じく、初めは閉じています)。開くと持ち主ごとのフォルダ(📁)が並び、フォルダを開くとその人のセッションが出ます。閲覧のみのセッションを開くと入力欄は出ず、上に「〇〇さんの共有ログ(閲覧のみ)」と出ます。</p>
+  </div>
+</div>
 
 <!-- ===================================================================== -->
 <h2 id="keys">4. キー入力</h2>
@@ -340,7 +361,7 @@ ssh -i $key <ユーザー名>@&lt;サーバー&gt;</code></pre>
 <p>Claude を初めて使う前に、<strong>使う場所ごとに1回ずつ</strong> Claude にログインします。砂場・ホスト・ルート・他のマシンでログイン情報は別々です。Email の箱だけは設定画面に行が無く、<a href="#passkey">箱の中で</a>ログインします。</p>
 
 <div class="shot">
-  <figure><img src="img/07-settings.png" alt="設定画面。Accounts の見出しの下に sandbox内・sandbox外(host)・root の行があり、それぞれにログインとログアウトのボタン"><figcaption>設定画面。各行にログイン中のアカウントが出る</figcaption></figure>
+  <figure><img src="img/07-settings.png" alt="設定画面。Accounts の見出しの下に sandbox内・sandbox外(host)・root の行があり、それぞれにログインとログアウトのボタン"><figcaption>設定画面。各行にログイン中のアカウントが出る。見出しの横は表示言語の選択欄</figcaption></figure>
   <div class="side">
     <h3>開き方</h3>
     <p>トップ画面のマシン選択(<code>server</code> の欄)で<strong>設定</strong>を選びます。戻るときは、同じ欄で <code>server</code>(このサーバー)を選び直します。</p>
@@ -355,6 +376,7 @@ ssh -i $key <ユーザー名>@&lt;サーバー&gt;</code></pre>
       <li>行の文字が「Not logged in」(黄色)のところでは、その場所の Claude は動きません。</li>
       <li><strong>Codex</strong> の欄も同じ手順です(ChatGPT のアカウント)。</li>
       <li>見出しの横の ⟳ で状態を取り直せます。</li>
+      <li>見出しの横の選択欄で <strong>表示言語</strong>(日本語・English・简体中文)を変えられます。選んだ言語は保存され、ほかの端末でもログインすれば同じになります。ログイン画面の下でも選べます。</li>
       <li>いちばん下の <strong>Kill Chrome</strong> は、自分用のテスト用ブラウザ(ヘッドフル Chrome)を止めるボタンです。重くなったときに押してかまいません。次に使えば自動でまた起動します。</li>
     </ul>
   </div>
@@ -417,6 +439,8 @@ aigw-passkey register</code></pre></li>
   <tr><td>aigw にログインできない</td><td>許可されたドメインのアカウントを選んでいるか確認。管理者が作ったアカウントなら、SSH で <code>aigw-set-email</code> を実行(<a href="#account">1章</a>)</td></tr>
   <tr><td>Claude が何も返さない・ログインを求められる</td><td>設定画面で、その場所の行が「Not logged in」になっていないか確認してログイン(<a href="#settings">7章</a>)</td></tr>
   <tr><td>チャットが止まって見える</td><td>🖥️ で画面パネルを開く。メニューや確認の質問で止まっていることが多いので、キーの列で答える</td></tr>
+  <tr><td>実行したのに Claude が動かない(入力欄に文が残っている)</td><td>aigw が数秒で気づいてチャットに ⚠ を出し、30秒ごとに Enter を送り直します。受け付けられると「受け付けました」と出ます。急ぐときは、文字を入れずに <strong>実行</strong> を押しても同じです</td></tr>
+  <tr><td>画面を英語や中国語にしたい</td><td>設定画面の見出しの横の選択欄で選ぶ(<a href="#settings">7章</a>)</td></tr>
   <tr><td>キーを押しても反応が見えない</td><td>チャットにはその場の書き換えが出ないため。画面パネルで確認する(<a href="#screen-vs-chat">5章</a>)</td></tr>
   <tr><td>Email やホストのシェルが「解錠」を求めて進まない</td><td>パスキーを登録したか、その端末で登録したかを確認(<a href="#passkey">9章</a>)。施錠中の帯が出ていればタップ</td></tr>
   <tr><td>Claude の作業を止めたい</td><td><kbd>Esc</kbd>。セッションごと止めるなら、名前の左の緑の ● をタップして停止(会話は保存され、灰色の ● のタップで続きから再開できます)</td></tr>
@@ -424,7 +448,7 @@ aigw-passkey register</code></pre></li>
   <tr><td>それでも分からない</td><td>管理者に相談</td></tr>
 </table></div>
 
-<footer>aigw チュートリアル · 2026-10-09 · 画面写真はスマホ幅で撮影し、ユーザー名・メールアドレス・マシン名を置き換えたもの</footer>
+<footer>aigw チュートリアル · 2026-10-17 · 画面写真はスマホ幅で撮影し、ユーザー名・メールアドレス・マシン名を置き換えたもの(設定画面と共有の画面写真は、模擬のデータを載せた同じ画面で撮ったもの)</footer>
 </div>
 </body>
 </html>

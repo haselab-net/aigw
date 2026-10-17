@@ -105,6 +105,7 @@ if [ "$revoke" = 1 ]; then
     setfacl -R -x "u:$user" /root/.claude/projects 2>/dev/null || true
     setfacl -R -d -x "u:$user" /root/.claude/projects 2>/dev/null || true
   fi
+  [ -d /root/.claude/sessions ] && setfacl -x "u:$user" /root/.claude/sessions 2>/dev/null || true
   exit 0
 fi
 
@@ -137,3 +138,11 @@ setfacl -m "u:$user:--x" /root/.claude
 # this script having to run again.
 setfacl -R -m "u:$user:rX" /root/.claude/projects
 setfacl -R -d -m "u:$user:rX" /root/.claude/projects
+# Claude Code's per-process records (<pid>.json, 0644: which conversation a
+# running `claude` is writing and in which tmux pane), listed so
+# aigw-backend's _live_claude_conversation can follow a root-shell's
+# `claude` across /clear (the deployment notes). The
+# directory only, no default ACL: the records are already world-readable,
+# and the 0600 *.key files beside them stay root's.
+install -d -m 0700 -o root -g root /root/.claude/sessions
+setfacl -m "u:$user:r-x" /root/.claude/sessions

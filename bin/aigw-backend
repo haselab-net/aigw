@@ -1153,6 +1153,13 @@ _shell_claude_watchers_lock = threading.Lock()
 _claude_foreground = {}
 _claude_foreground_lock = threading.Lock()
 
+# "codex-tui" counterparts (_tail_codex_rollout): session_id -> True once that
+# thread has found the pane's rollout file, which turns _watch_tmux_session's
+# row-count bubbling off for it like _claude_foreground does.
+_codex_tailers_started = set()
+_codex_tailers_lock = threading.Lock()
+_codex_rollout_active = {}
+
 # (proj_dir_str, claude_session_id) -> the aigw session_id that has claimed
 # it as "my own Claude Code conversation" -- shared by _tail_claude_transcript
 # and _watch_shell_claude, the two places that guess which on-disk .jsonl a
@@ -1350,6 +1357,36 @@ def save_meta(session_id, meta):
     p.write_text(json.dumps(meta))
 
 
+# Read-only sharing (the deployment notes, 2026-10-15): meta["shared_read"]
+# holds user names, or SHARE_EVERYONE for every aigw user, who may read the
+# session's chat log but not act on it. meta["shared_with"] stays the
+# collaborators (共同作業). A root-shell is never co-worked by someone else
+# (that would hand them root), and Email sessions are never shared at all.
+SHARE_EVERYONE = "*"
+
+
+def share_mode(meta, username):
+    """"write" (co-work: send, keys, stop...), "read" (the chat log only) or
+    None for `username` on this session. Anything but a list of user names
+    counts as shared with nobody -- a string would make `in` a substring
+    match ("bob" in "bobby")."""
+    if meta.get("preset") in MAIL_PRESETS:
+        return None
+    shared_with = meta.get("shared_with")
+    if isinstance(shared_with, list) and username in shared_with:
+        return "read" if meta.get("preset") == "root-shell" else "write"
+    shared_read = meta.get("shared_read")
+    if isinstance(shared_read, list) and (username in shared_read or SHARE_EVERYONE in shared_read):
+        return "read"
+    return None
+
+
+def is_shared_with(meta, username):
+    """The one sharing test (the deployment notes) every read on someone else's
+    behalf goes through: opening a session, listing, search."""
+    return share_mode(meta, username) is not None
+
+
 def resolve_session_access(session_id, on_behalf_of):
     """The single check every sessions/<id>/* handler makes before doing
     anything (the deployment notes): loads meta, and -- only when aigw-gateway has
@@ -1364,15 +1401,18 @@ def resolve_session_access(session_id, on_behalf_of):
     meta = load_meta(session_id)
     if meta is None:
         return None, (404, {"error": "no such session"})
-    if on_behalf_of is not None and on_behalf_of not in meta.get("shared_with", []):
+    mode = share_mode(meta, on_behalf_of) if on_behalf_of is not None else None
+    if on_behalf_of is not None and mode is None:
         return None, (404, {"error": "no such session"})
     # Reading a host/root/Email session (its chat, screen, files) needs this
     # browser's passkey window too, not only sending into it (2026-10-09,
     # the deployment notes: a Google login alone must not show what such a
     # session read, e.g. mail). Every sessions/<id>/* route comes through
     # here, so this one check covers them all, including the SSE stream's
-    # start (_sse re-checks while it stays open).
-    gate = session_unlock_location(meta)
+    # start (_sse re-checks while it stays open). A read-only share is the
+    # owner publishing the log, so its reader needs no window of the owner's
+    # (the deployment notes); the live screen stays out of its reach.
+    gate = None if mode == "read" else session_unlock_location(meta)
     if gate is not None:
         try:
             require_unlock_if_outside_sandbox(gate)
@@ -1398,7 +1438,7 @@ def redact_locked_sessions(sessions):
     the label and folder, which for an Email session come from the mail.
     Display only -- every read of the session itself is gated by
     resolve_session_access. One `status` call (no extension) per listing."""
-    needs = [m for m in sessions if session_unlock_location(m) is not None]
+    needs = [m for m in sessions if m.get("share_mode") != "read" and session_unlock_location(m) is not None]
     if not needs:
         return sessions
     st = _unlockd_call("status")
@@ -1412,26 +1452,41 @@ def redact_locked_sessions(sessions):
     return sessions
 
 
-def share_session(session_id, username):
-    # No separate username-format check: getpwnam is itself the check that
-    # matters (a malformed string simply won't resolve to a real account),
-    # and reimplementing adm-adduser's username regex here would just be a
-    # second copy to keep in sync for no extra safety.
+def share_session(session_id, username, mode="write"):
+    """Share with `username` (or SHARE_EVERYONE) as a collaborator ("write")
+    or a reader of the log ("read"); one mode per person, the new one
+    replacing the old (the deployment notes)."""
+    if mode not in ("read", "write"):
+        raise ValueError("invalid mode")
     if not username:
         raise ValueError("invalid username")
-    try:
-        pwd.getpwnam(username)
-    except KeyError:
-        raise ValueError("no such user")
-    if username == getpass.getuser():
-        raise ValueError("cannot share with yourself")
     meta = load_meta(session_id)
     if meta is None:
         raise ValueError("no such session")
-    shared_with = meta.setdefault("shared_with", [])
-    if username not in shared_with:
-        shared_with.append(username)
-        save_meta(session_id, meta)
+    if meta.get("preset") in MAIL_PRESETS:
+        raise ValueError("Email sessions are not shared")
+    if mode == "write" and username == SHARE_EVERYONE:
+        raise ValueError("only read-only sharing can be with everyone")
+    if mode == "write" and meta.get("preset") == "root-shell":
+        raise ValueError("a root shell can only be shared read-only")
+    if username != SHARE_EVERYONE:
+        # No separate username-format check: getpwnam is itself the check
+        # that matters (a malformed string simply won't resolve to a real
+        # account), and reimplementing adm-adduser's username regex here
+        # would just be a second copy to keep in sync for no extra safety.
+        try:
+            pwd.getpwnam(username)
+        except KeyError:
+            raise ValueError("no such user")
+        if username == getpass.getuser():
+            raise ValueError("cannot share with yourself")
+    add, drop = ("shared_read", "shared_with") if mode == "read" else ("shared_with", "shared_read")
+    lst = meta.setdefault(add, [])
+    if username not in lst:
+        lst.append(username)
+    if username in meta.get(drop, []):
+        meta[drop].remove(username)
+    save_meta(session_id, meta)
     return meta
 
 
@@ -1439,9 +1494,13 @@ def unshare_session(session_id, username):
     meta = load_meta(session_id)
     if meta is None:
         raise ValueError("no such session")
-    shared_with = meta.get("shared_with", [])
-    if username in shared_with:
-        shared_with.remove(username)
+    changed = False
+    for key in ("shared_with", "shared_read"):
+        lst = meta.get(key, [])
+        if username in lst:
+            lst.remove(username)
+            changed = True
+    if changed:
         save_meta(session_id, meta)
     return meta
 
@@ -2187,8 +2246,10 @@ def list_sessions(on_behalf_of=None):
         meta = load_meta(d.name)
         if meta is None:
             continue
-        if on_behalf_of is not None and on_behalf_of not in meta.get("shared_with", []):
-            continue
+        if on_behalf_of is not None:
+            meta["share_mode"] = share_mode(meta, on_behalf_of)
+            if meta["share_mode"] is None:
+                continue
         location = meta.get("tmux_location")
         if meta.get("preset") in HEADLESS_PRESETS:
             # No persistent tmux session between turns for headless presets --
@@ -2238,11 +2299,18 @@ def list_sessions(on_behalf_of=None):
                 and meta.get("preset") in SHELL_RESUME_PRESETS and meta.get("claude_session_id")):
             # Looked up once per ended shell session and kept in meta (None
             # when `claude` never ran there): whether its ↻ is offered.
-            meta["claude_cwd"] = find_transcript_cwd(location, meta["claude_session_id"])
-            fresh = load_meta(d.name)
-            if fresh is not None:
-                fresh["claude_cwd"] = meta["claude_cwd"]
-                save_meta(d.name, fresh)
+            # Normally the watcher already noted it while `claude` ran; a log
+            # that cannot be read right now is asked again on a later list,
+            # never kept as None (the deployment notes).
+            try:
+                meta["claude_cwd"] = find_transcript_cwd(location, meta["claude_session_id"])
+            except OSError:
+                pass
+            else:
+                fresh = load_meta(d.name)
+                if fresh is not None:
+                    fresh["claude_cwd"] = meta["claude_cwd"]
+                    save_meta(d.name, fresh)
         link_id, rec = _link_for_session(links, d.name)
         if rec is not None:
             partner_id = _other_side(rec, d.name)
@@ -3377,14 +3445,21 @@ def find_transcript_cwd(location, conv_id):
     own log (every record carries "cwd"), searched across all project
     directories of the $HOME a `claude` in `location` sees -- or None when no
     such log exists there. A shell's pane can move anywhere, so the project
-    directory is not known in advance the way claude-tui's is."""
+    directory is not known in advance the way claude-tui's is.
+
+    Raises PermissionError when the logs could not be read rather than
+    found missing: root's are readable only while aigw-root-tmux@<user>
+    runs (its ExecStopPost takes the ACL away), and the last root pane
+    exiting stops it -- the very moment a root-shell session turns "ended"
+    (the deployment notes)."""
     if not conv_id or not CLAUDE_CONV_ID_RE.match(conv_id):
         return None
     base = _claude_home_for_location(location) / ".claude" / "projects"
     try:
         dirs = list(base.iterdir())
-    except OSError:
+    except FileNotFoundError:
         return None
+    unreadable = False
     for d in dirs:
         try:
             with open(d / f"{conv_id}.jsonl", "rb") as f:
@@ -3398,8 +3473,12 @@ def find_transcript_cwd(location, conv_id):
                         continue
                     if isinstance(rec, dict) and isinstance(rec.get("cwd"), str) and rec["cwd"]:
                         return rec["cwd"]
-        except OSError:
+        except FileNotFoundError:
             continue
+        except OSError:
+            unreadable = True
+    if unreadable:
+        raise PermissionError(f"conversation logs under {base} not readable")
     return None
 
 
@@ -3870,12 +3949,46 @@ def make_ssh_workdir(machine, parent, name):
 
 def make_workdir(scope, parent_rel, name):
     """Create one new, empty folder directly under a picker directory and
-    return its picker-relative path. Same trees, same containment rules as
-    GET /workdirs' "sandhome" (default) and "mail" scopes -- never the
-    host/root/ssh ones, whose pickers browse a whole filesystem where a
-    phone tap creating directories has no business. The name is one plain
-    path component: no "/", no leading "." (the pickers hide those, so it
-    would vanish on creation), no control characters."""
+    return its path in the picker's own form: relative to the tree for
+    "sandhome"/"mail" (same containment rules as GET /workdirs), absolute
+    for "host"/"root" (host-shell/root-shell's own pickers, 2026-10-13, user
+    request: "シェルの場合に新規フォルダ作成のプラスが出ない"). Those two
+    browse a whole filesystem, but a pane of that same preset could already
+    `mkdir` anywhere this creates, so the ＋ adds no reach -- only the same
+    unlock window send_message would demand for typing that `mkdir` there.
+    "root" goes through the root tmux pane, same as list_root_subdirs. The
+    name is one plain path component: no "/", no leading "." (the pickers
+    hide those, so it would vanish on creation), no control characters."""
+    name = (name or "").strip()
+    if (not name or len(name) > FOLDER_NAME_MAX or name.startswith(".")
+            or "/" in name or any(ord(c) < 32 or ord(c) == 127 for c in name)):
+        raise ValueError("invalid folder name")
+    if scope == "host":
+        require_unlock_if_outside_sandbox("host")
+        target = Path(resolve_host_workdir(parent_rel) or str(HOME)) / name
+        try:
+            target.mkdir(mode=0o755)
+        except FileExistsError:
+            raise ValueError(f"already exists: {name}")
+        return str(target)
+    if scope == "root":
+        # resolve_root_workdir runs the unlock gate and the
+        # root_shell_allowed() check itself, in that order.
+        parent = resolve_root_workdir(parent_rel or "/")
+        path = parent.rstrip("/") + "/" + name
+        marker = f"__AIGW_MKDIR_{uuid.uuid4().hex[:8]}__"
+        cmd = (f"if [ -e {shlex.quote(path)} ]; then echo {marker}EXISTS; "
+               f"elif mkdir -m 755 -- {shlex.quote(path)}; then echo {marker}OK; "
+               f"else echo {marker}FAIL; fi")
+        text = _root_tmux_capture(cmd, lambda t: t if re.search(marker + r"(OK|EXISTS|FAIL)", t) else None,
+                                  ROOT_WORKDIR_TIMEOUT)
+        if text is None:
+            raise RuntimeError("no answer from the root shell")
+        if f"{marker}EXISTS" in text:
+            raise ValueError(f"already exists: {name}")
+        if f"{marker}OK" not in text:
+            raise RuntimeError("mkdir failed")
+        return path
     if scope == "mail":
         require_unlock_if_outside_sandbox("host")
         base = MAILBOX["dir"] if MAILBOX else None
@@ -3885,10 +3998,6 @@ def make_workdir(scope, parent_rel, name):
         parent = resolve_workdir(parent_rel)
     else:
         raise ValueError(f"cannot create folders in scope {scope!r}")
-    name = (name or "").strip()
-    if (not name or len(name) > FOLDER_NAME_MAX or name.startswith(".")
-            or "/" in name or any(ord(c) < 32 or ord(c) == 127 for c in name)):
-        raise ValueError("invalid folder name")
     target = Path(parent or base) / name
     try:
         target.mkdir(mode=0o755 if scope == "sandhome" else 0o700)
@@ -4152,7 +4261,10 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         # whatever the client sent; checked by the same rules as a picked one.
         if not CLAUDE_CONV_ID_RE.match(resume):
             raise ValueError("invalid conversation id")
-        conv_cwd = find_transcript_cwd(location, resume)
+        try:
+            conv_cwd = find_transcript_cwd(location, resume)
+        except OSError:
+            raise ValueError("the conversation's log cannot be read right now; try again")
         if conv_cwd is None:
             raise ValueError("no such conversation")
         resolve = {"shell": resolve_workdir, "host-shell": resolve_host_workdir,
@@ -4847,7 +4959,22 @@ def send_message(session_id, text, submit=True, from_user=None):
     # a real error instead, which the frontend already knows how to show
     # (the deployment notes) -- the same alert-and-
     # restore-the-text path added 2026-08-17 for the network-error case.
-    if text:
+    if text and meta and meta.get("preset") in CODEX_TUI_PRESETS:
+        # Codex's composer takes fast typed input for a paste and turns an
+        # Enter that arrives while it is still taking it in into a newline,
+        # so a long message (about 1000 characters, measured 2026-10-12) sat
+        # in the box unsent, its tail sometimes cut off ("imageというcodex
+        # セッションを開始しましたが動いてないように見えます"). A bracketed
+        # paste (-p; Codex turns it on) arrives as one piece, and the Enter
+        # after it submits. Claude Code keeps the typed path: it shows a
+        # paste as "[Pasted text]" instead of the message itself.
+        buf_name = f"aigw-send-{session_id}"
+        r = tmux_exec(location, ["set-buffer", "-b", buf_name, "--", text])
+        if r.returncode == 0:
+            r = tmux_exec(location, ["paste-buffer", "-p", "-d", "-b", buf_name, "-t", tmux_name])
+        if r.returncode != 0:
+            raise RuntimeError(f"tmux paste-buffer failed: {(r.stderr or r.stdout).strip()}")
+    elif text:
         r = tmux_exec(location, ["send-keys", "-t", tmux_name, "-l", "--", text])
         if r.returncode != 0:
             raise RuntimeError(f"tmux send-keys failed: {(r.stderr or r.stdout).strip()}")
@@ -4855,6 +4982,106 @@ def send_message(session_id, text, submit=True, from_user=None):
         r = tmux_exec(location, ["send-keys", "-t", tmux_name, "Enter"])
         if r.returncode != 0:
             raise RuntimeError(f"tmux send-keys (Enter) failed: {(r.stderr or r.stdout).strip()}")
+        if text:
+            _start_stuck_input_check(session_id, location, tmux_name, text)
+
+
+# Claude Code sometimes stops taking input for a long while: the typed text
+# shows in its box, but Enter (and every other key) does nothing, until it
+# comes back on its own. 2026-10-14 the Email session sat 68 minutes like
+# that, and the logs show the same in mail-tui on 10-13/14 three more times
+# (the deployment notes). Nothing in the chat said so -- the bubble
+# looked sent -- and the user only got through by pressing an empty 実行
+# again later. Claude Code clears its box within a fraction of a second when
+# it takes an Enter (also when busy: it queues the message), so our text
+# still in the box a few seconds later means it did not. This says so in
+# the chat and does the user's empty-実行 for them every STUCK_INPUT_RETRY
+# seconds -- an Enter on that box can only submit what is already there.
+STUCK_INPUT_CHECK_DELAY = 5
+STUCK_INPUT_RETRY = 30
+STUCK_INPUT_GIVE_UP = 3 * 3600
+_stuck_input_checks = set()
+_stuck_input_checks_lock = threading.Lock()
+
+
+def _squash(s):
+    return re.sub(r"\s+", "", s)
+
+
+def _claude_composer_text(screen):
+    """The text in Claude Code's input box on a captured screen: the lines
+    between the last two full-width rules, starting with "❯". None when the
+    screen is not Claude Code's prompt (a shell, Codex, a selection menu)."""
+    lines = screen.rstrip("\n").splitlines()
+    rules = [i for i, line in enumerate(lines) if line.startswith("──")]
+    if len(rules) < 2:
+        return None
+    box = lines[rules[-2] + 1:rules[-1]]
+    if not box or not box[0].startswith("❯"):
+        return None
+    return _squash("".join(box)[1:])
+
+
+def _text_still_in_composer(screen, text):
+    """True/False for Claude's input box holding `text`; None when the
+    screen is not Claude Code's prompt at all."""
+    box = _claude_composer_text(screen)
+    if box is None:
+        return None
+    head = _squash(text)[:20]
+    return bool(head) and head in box
+
+
+def _start_stuck_input_check(session_id, location, tmux_name, text):
+    with _stuck_input_checks_lock:
+        if session_id in _stuck_input_checks:
+            return  # the running check already reports on this pane
+        _stuck_input_checks.add(session_id)
+    threading.Thread(target=_stuck_input_check, args=(session_id, location, tmux_name, text),
+                     daemon=True).start()
+
+
+def _stuck_input_check(session_id, location, tmux_name, text):
+    def stuck():
+        try:
+            cap = tmux_query(location, ["capture-pane", "-p", "-t", tmux_name])
+        except subprocess.TimeoutExpired:
+            return None
+        if cap.returncode != 0:
+            return None
+        return _text_still_in_composer(cap.stdout, text)
+
+    try:
+        time.sleep(STUCK_INPUT_CHECK_DELAY)
+        if not stuck():
+            return
+        started = time.time()
+        print(f"[aigw-backend] {session_id}: Enter not taken, text still in Claude's input box", flush=True)
+        append_event(session_id, {
+            "type": "system",
+            "text": "⚠ Claude が入力を受け付けていません(実行した文が入力欄に残ったままです)。"
+                    f"受け付けるようになるまで、{STUCK_INPUT_RETRY}秒ごとに Enter を送り直します。",
+        })
+        while time.time() - started < STUCK_INPUT_GIVE_UP:
+            time.sleep(STUCK_INPUT_RETRY)
+            state = stuck()
+            if state is None:
+                return  # pane gone, or no longer at Claude's prompt
+            if state:
+                tmux_exec(location, ["send-keys", "-t", tmux_name, "Enter"])
+                time.sleep(2)
+                state = stuck()
+            if state is False:
+                minutes = max(1, round((time.time() - started) / 60))
+                print(f"[aigw-backend] {session_id}: input taken after ~{minutes} min", flush=True)
+                append_event(session_id, {"type": "system",
+                                          "text": f"Claude が入力を受け付けました(約{minutes}分後)。"})
+                return
+        append_event(session_id, {"type": "system",
+                                  "text": "Claude はまだ入力を受け付けていません。Enter の送り直しはやめました。"})
+    finally:
+        with _stuck_input_checks_lock:
+            _stuck_input_checks.discard(session_id)
 
 
 # A software keyboard for the tmux/shell preset needs to send tmux *key
@@ -5044,14 +5271,24 @@ def archive_session(session_id, archived):
 
 
 def _load_next_seq(session_id):
+    """One past the highest seq already in events.jsonl -- not one past its
+    line count, which reissued seqs once lines had been removed (2026-10-12,
+    the deployment's changelog: the chat then took the new
+    events for ones it had already shown and dropped them)."""
     events_path = session_dir(session_id) / "events.jsonl"
     if not events_path.exists():
         return 1
-    n = 0
+    n = top = 0
     with events_path.open("r") as f:
-        for _ in f:
+        for line in f:
             n += 1
-    return n + 1
+            try:
+                seq = json.loads(line).get("seq")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(seq, int) and seq > top:
+                top = seq
+    return max(n, top) + 1
 
 
 OUTBOX_MODEL3D_SUFFIXES = {"glb", "gltf", "obj"}
@@ -5455,6 +5692,101 @@ def events_page(session_id, before=None, limit=50):
     return events[-limit:] if limit else events, has_more
 
 
+
+# Full-text search over this user's own chat logs (2026-10-11, at the
+# user's request: "aigwのチャットログを全文検索して該当箇所にジャンプする仕組み").
+# A plain scan, no index: all of one user's events.jsonl together are tens of
+# MB, and each line is first matched against the query in its *stored* form
+# (json.dumps escapes non-ASCII as \uXXXX, lower-case hex) before it is
+# parsed at all, so only candidate lines pay for json.loads.
+SEARCH_EVENT_TYPES = {"user_message", "agent_output", "agent_thinking", "system"}
+SEARCH_MAX_HITS = 200
+SEARCH_MAX_HITS_PER_SESSION = 30
+SEARCH_SNIPPET_CHARS = 60
+
+
+def _search_snippet(text, pos, length):
+    start = max(0, pos - SEARCH_SNIPPET_CHARS)
+    end = min(len(text), pos + length + SEARCH_SNIPPET_CHARS * 2)
+    snippet = " ".join(text[start:end].split())
+    return ("…" if start > 0 else "") + snippet + ("…" if end < len(text) else "")
+
+
+def search_events(query, on_behalf_of=None):
+    """Hits for every whitespace-separated term of `query` (all must occur,
+    case-insensitively) in one chat event's text, newest first. Only this
+    backend's own sessions; with on_behalf_of (a collaborator searching via
+    aigw-gateway's /shared/<owner>/search), only the ones shared with that
+    user -- the same shared_with test as resolve_session_access, so search
+    never shows a log the caller could not open. Sessions whose reading needs a passkey window
+    this browser does not have (resolve_session_access's gate) are skipped
+    and only counted, the same `status` check (no extension) as
+    redact_locked_sessions, so a search never opens or extends a window."""
+    terms = [t.lower() for t in query.split() if t]
+    if not terms:
+        return {"hits": [], "locked": 0, "truncated": False}
+    raw_terms = [json.dumps(t)[1:-1] for t in terms]
+    open_tier = None
+    status_checked = False
+    hits = []
+    locked = 0
+    for d in iter_session_dirs():
+        if not SESSION_ID_RE.match(d.name):
+            continue
+        try:
+            meta = json.loads((d / "meta.json").read_text())
+        except (OSError, ValueError):
+            continue
+        mode = share_mode(meta, on_behalf_of) if on_behalf_of is not None else None
+        if on_behalf_of is not None and mode is None:
+            continue
+        gate = None if mode == "read" else session_unlock_location(meta)
+        if gate is not None:
+            if not status_checked:
+                st = _unlockd_call("status")
+                open_tier = st.get("tier") if st.get("unlocked") else None
+                status_checked = True
+            tier = _tier_for_location(gate)
+            if not (open_tier == "root" or (open_tier == "host" and tier == "host")):
+                locked += 1
+                continue
+        try:
+            f = open(d / "events.jsonl", encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        session_hits = []
+        with f:
+            for raw in f:
+                low = raw.lower()
+                if not all(t in low for t in raw_terms):
+                    continue
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                if ev.get("type") not in SEARCH_EVENT_TYPES or not isinstance(ev.get("text"), str):
+                    continue
+                text_low = ev["text"].lower()
+                if not all(t in text_low for t in terms):
+                    continue
+                pos = text_low.find(terms[0])
+                session_hits.append({
+                    "session_id": d.name,
+                    "label": meta.get("label") or d.name,
+                    "preset": meta.get("preset"),
+                    "archived": bool(meta.get("archived")),
+                    "seq": ev.get("seq"),
+                    "ts": ev.get("ts"),
+                    "type": ev["type"],
+                    "snippet": _search_snippet(ev["text"], pos, len(terms[0])),
+                })
+        # The newest hits of each session, so one long session cannot crowd
+        # out every other one.
+        hits.extend(session_hits[-SEARCH_MAX_HITS_PER_SESSION:])
+    hits.sort(key=lambda h: h.get("ts") or 0, reverse=True)
+    truncated = len(hits) > SEARCH_MAX_HITS
+    return {"hits": hits[:SEARCH_MAX_HITS], "locked": locked, "truncated": truncated}
+
 # ---- session links (agent-to-agent relay) --------------------------------
 #
 # User request: let the Claude Code running in this user's own sandbox
@@ -5813,9 +6145,48 @@ def _poll_talkto_file(session_id, talkto_path, offset):
     helper, called from both loops" shape as _scan_outbox_for_attachments
     right above them."""
     new_offset, texts = _read_new_talkto_lines(talkto_path, offset)
+    if new_offset != offset:
+        # Recorded before relaying: a restart mid-relay may drop a line,
+        # never send one twice.
+        _save_talkto_offset(talkto_path, new_offset)
     for text in texts:
         _relay_to_partner(session_id, text)
     return new_offset
+
+
+def _talkto_offset_path(talkto_path):
+    return talkto_path.with_name(talkto_path.name + ".offset")
+
+
+def _talkto_start_offset(talkto_path):
+    """Where a (re)started watcher resumes reading talkto_out.jsonl: the
+    offset _save_talkto_offset last recorded, else the file's current end.
+    It used to be 0, so every backend restart relayed every line this
+    session had ever sent to its partner again (2026-10-12: six old
+    messages from the partner session pasted into a working Codex session). The
+    fallback treats what is already there as sent, which it was, by the
+    backend that ran before this offset file existed."""
+    try:
+        saved = int(_talkto_offset_path(talkto_path).read_text())
+    except (OSError, ValueError):
+        saved = None
+    try:
+        size = talkto_path.stat().st_size
+    except OSError:
+        size = 0
+    if saved is None or saved > size:
+        return size
+    return saved
+
+
+def _save_talkto_offset(talkto_path, offset):
+    p = _talkto_offset_path(talkto_path)
+    try:
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(str(offset))
+        os.replace(tmp, p)
+    except OSError:
+        pass
 
 
 def _already_announced_attachments(session_id):
@@ -5941,6 +6312,10 @@ def ensure_watcher(session_id):
     # replies (2026-10-04, user report "チャットに全部のClaudeの応答がのらない").
     if meta and (meta.get("preset") == "claude-tui" or meta.get("preset") in MAIL_PRESETS):
         ensure_transcript_tailer(session_id)
+    elif meta and meta.get("preset") in CODEX_TUI_PRESETS:
+        # Codex's own rollout file instead of capture-pane guesswork, the
+        # same move as claude-tui above (see _tail_codex_rollout).
+        ensure_codex_rollout_tailer(session_id)
     elif meta and meta.get("preset") not in HEADLESS_PRESETS:
         # "shell"/"host-shell"/"root-shell"/"attach": no fixed cwd or fixed
         # "this pane runs claude" the way "claude-tui" has, so this watches
@@ -5968,13 +6343,194 @@ def ensure_shell_claude_watcher(session_id):
     t.start()
 
 
+def ensure_codex_rollout_tailer(session_id):
+    with _codex_tailers_lock:
+        if session_id in _codex_tailers_started:
+            return
+        _codex_tailers_started.add(session_id)
+    t = threading.Thread(target=_tail_codex_rollout, args=(session_id,), daemon=True)
+    t.start()
+
+
+CODEX_ROLLOUT_FD_RE = re.compile(r"/\.codex/sessions/.*/rollout-[^/]*\.jsonl$")
+CODEX_ROLLOUT_STATE_FILENAME = "codex_rollout.json"
+
+
+def _codex_rollout_of(talkto_path):
+    """The rollout file (~/.codex/sessions/.../rollout-*.jsonl, Codex's own
+    conversation log) the pane's codex is writing right now, or None.
+    Codex has no pre-assigned id like Claude Code's --session-id, but it
+    keeps that file open for the whole conversation, and every process in
+    the pane carries this session's own AIGW_TALKTO in its environment --
+    so: this user's processes with that variable, then whichever of their
+    open files is a rollout. Container processes are ordinary processes of
+    the same uid in this /proc, and the sandhome bind mount gives the link
+    the same path on this side. Follows codex's own /new and /resume (the
+    fd moves to the other file)."""
+    marker = b"AIGW_TALKTO=" + str(talkto_path).encode() + b"\0"
+    uid = os.getuid()
+    found = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                if marker not in f.read() + b"\0":
+                    continue
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if CODEX_ROLLOUT_FD_RE.search(target):
+                try:
+                    found.append((os.stat(target).st_mtime, target))
+                except OSError:
+                    pass
+    return max(found)[1] if found else None
+
+
+def _codex_rollout_texts(buf):
+    """(complete-line byte count, assistant texts) from a chunk of a rollout
+    file: each `response_item` message of role assistant -- both Codex's
+    progress notes ("commentary") and its answer ("final_answer"), the
+    counterpart of Claude Code's text blocks. A trailing partial line is
+    left for the next read."""
+    end = buf.rfind(b"\n") + 1
+    texts = []
+    for raw in buf[:end].splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        payload = rec.get("payload") if isinstance(rec, dict) else None
+        if (rec.get("type") != "response_item" or not isinstance(payload, dict)
+                or payload.get("type") != "message" or payload.get("role") != "assistant"):
+            continue
+        text = "\n\n".join(c.get("text", "") for c in payload.get("content") or []
+                           if isinstance(c, dict) and c.get("type") == "output_text"
+                           and isinstance(c.get("text"), str)).strip()
+        if text:
+            texts.append(text)
+    return end, texts
+
+
+def _codex_rollout_started(path):
+    """session_meta's own start time of a rollout (epoch seconds), or None."""
+    try:
+        with open(path, "rb") as f:
+            first = json.loads(f.readline())
+        return _parse_iso_timestamp(first["payload"]["timestamp"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _tail_codex_rollout(session_id):
+    """Feeds the chat log of a "codex-tui" session from Codex's rollout file,
+    the way _tail_claude_transcript does for "claude-tui" (2026-10-12, user
+    report "チャット欄にうまくcodexの出力が出ません"): the capture-pane
+    heuristic produced spinner rows, the input box and echoed user text,
+    and lost the answers whenever Codex redrew rather than scrolled.
+    _codex_rollout_active switches that heuristic off for this session
+    once a rollout has been found. Where it stopped reading is kept in
+    sdir/codex_rollout.json, not meta.json (other threads rewrite that), so
+    a backend restart neither replays nor skips anything."""
+    meta = load_meta(session_id)
+    if meta is None:
+        return
+    sdir = session_dir(session_id)
+    talkto_path = sdir / TALKTO_FILENAME
+    state_path = sdir / CODEX_ROLLOUT_STATE_FILENAME
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    path = offset = None
+    checked_at = 0.0
+    while True:
+        meta = load_meta(session_id)
+        if meta is None or meta.get("stopped"):
+            _codex_rollout_active.pop(session_id, None)
+            return
+        now = time.time()
+        if now - checked_at >= LIVE_CONVERSATION_CHECK_INTERVAL:
+            checked_at = now
+            live = _codex_rollout_of(talkto_path)
+            if live and live != path:
+                if path is not None and offset is not None:
+                    # the rest of the file being left (a /new right after an answer)
+                    _emit_codex_rollout(session_id, path, offset, state_path)
+                path = live
+                if state.get("path") == path and isinstance(state.get("offset"), int):
+                    offset = state["offset"]
+                else:
+                    # A conversation begun in this pane is read from its top;
+                    # an older one taken up with /resume, from where it is now.
+                    started = _codex_rollout_started(path)
+                    created = meta.get("created_ts") or 0
+                    if started is not None and started >= created - 5:
+                        offset = 0
+                    else:
+                        try:
+                            offset = os.path.getsize(path)
+                        except OSError:
+                            offset = 0
+                state = {"path": path, "offset": offset}
+                _write_codex_rollout_state(state_path, state)
+                _codex_rollout_active[session_id] = True
+        if path is not None:
+            new_offset = _emit_codex_rollout(session_id, path, offset, state_path)
+            if new_offset != offset:
+                offset = new_offset
+                state = {"path": path, "offset": offset}
+        time.sleep(1.0)
+
+
+def _write_codex_rollout_state(state_path, state):
+    try:
+        tmp = state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, state_path)
+    except OSError:
+        pass
+
+
+def _emit_codex_rollout(session_id, path, offset, state_path):
+    """Appends the assistant texts written to `path` since `offset` and
+    returns the new offset (unchanged if nothing complete was added)."""
+    try:
+        size = os.path.getsize(path)
+        if size < offset:
+            offset = 0
+        if size == offset:
+            return offset
+        with open(path, "rb") as f:
+            f.seek(offset)
+            buf = f.read(size - offset)
+    except OSError:
+        return offset
+    used, texts = _codex_rollout_texts(buf)
+    if not used:
+        return offset
+    for text in texts:
+        append_event(session_id, {"type": "agent_output", "text": text})
+    offset += used
+    _write_codex_rollout_state(state_path, {"path": path, "offset": offset})
+    return offset
+
+
 def _watch_session(session_id):
     sdir = session_dir(session_id)
     log_path = sdir / "output.log"
     outbox = sdir / "outbox"
     talkto_path = sdir / TALKTO_FILENAME
     offset = 0
-    talkto_offset = 0
+    talkto_offset = _talkto_start_offset(talkto_path)
     seen_files = _already_announced_attachments(session_id)
     last_liveness_check = 0.0
     try:
@@ -6285,7 +6841,7 @@ def _watch_tmux_session(session_id):
     sdir = session_dir(session_id)
     outbox = sdir / "outbox"
     talkto_path = sdir / TALKTO_FILENAME
-    talkto_offset = 0
+    talkto_offset = _talkto_start_offset(talkto_path)
     # ssh:<machine>: talkto lands on that machine instead (_ssh_take_talkto),
     # polled only while linked and at its own slower cadence -- each poll is
     # an ssh round trip, unlike the local stat above.
@@ -6588,7 +7144,8 @@ def _watch_tmux_session(session_id):
                 # poll after it exits (the row-count reset that follows is
                 # the same "pane shrank" recovery already used for a bare
                 # `clear`, not special-cased here).
-                if preset != "claude-tui" and preset not in MAIL_PRESETS and not _claude_foreground.get(session_id):
+                if (preset != "claude-tui" and preset not in MAIL_PRESETS and not _claude_foreground.get(session_id)
+                        and not _codex_rollout_active.get(session_id)):
                     baseline_len = len(committed_lines) + (1 if pending_line is not None else 0)
 
                     if not new_lines:
@@ -6684,10 +7241,13 @@ CLAUDE_TRANSCRIPT_POLL_INTERVAL = 0.5
 
 def _split_assistant_text_events(buf):
     """Splits `buf` (raw bytes accumulated from a Claude Code conversation
-    JSONL file) into complete lines and returns (remaining_buf, texts) --
-    `texts` is the list of assistant "text" content-block strings found in
-    those complete lines, in order, each one destined to become its own
-    agent_output event. Shared by _tail_claude_transcript ("claude-tui")
+    JSONL file) into complete lines and returns (remaining_buf, events)
+    -- `events` is the chat-log events for the assistant content blocks
+    found in those complete lines, in order: an agent_output per "text"
+    block and an agent_thinking per "thinking" block that carries text
+    (2026-10-13, user request: show Claude's thinking in the chat too --
+    most of these blocks are signature-only with an empty "thinking", and
+    those are skipped; see _assistant_block_events). Shared by _tail_claude_transcript ("claude-tui")
     and _watch_shell_claude (`claude` launched by hand in shell/host-shell/
     root-shell/attach) -- extracted 2026-09-01 after a codebase health
     pass found this exact parsing block duplicated between them, in
@@ -6702,7 +7262,7 @@ def _split_assistant_text_events(buf):
     line should not happen, but must never crash the caller's watcher loop
     over one."""
     *complete, buf = buf.split(b"\n")
-    texts = []
+    events = []
     for raw in complete:
         if not raw.strip():
             continue
@@ -6712,15 +7272,29 @@ def _split_assistant_text_events(buf):
             continue
         if obj.get("type") != "assistant":
             continue
-        content = (obj.get("message") or {}).get("content")
-        if not isinstance(content, list):
+        events.extend(_assistant_block_events((obj.get("message") or {}).get("content")))
+    return buf, events
+
+
+def _assistant_block_events(content):
+    """agent_output/agent_thinking events for one assistant message's
+    content blocks, in order. tool_use and empty blocks are left out."""
+    if not isinstance(content, list):
+        return []
+    out = []
+    for block in content:
+        if not isinstance(block, dict):
             continue
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text", "")
-                if text.strip():
-                    texts.append(text)
-    return buf, texts
+        btype = block.get("type")
+        if btype == "text":
+            text = block.get("text", "")
+            if text.strip():
+                out.append({"type": "agent_output", "text": text})
+        elif btype == "thinking":
+            text = block.get("thinking", "")
+            if isinstance(text, str) and text.strip():
+                out.append({"type": "agent_thinking", "text": text.strip()})
+    return out
 
 
 def _parse_iso_timestamp(raw):
@@ -6778,17 +7352,10 @@ def _extract_history_events(buf):
                     event["ts"] = ts
                 events.append(event)
         elif obj_type == "assistant":
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if text.strip():
-                        event = {"type": "agent_output", "text": text}
-                        if ts is not None:
-                            event["ts"] = ts
-                        events.append(event)
+            for event in _assistant_block_events(message.get("content")):
+                if ts is not None:
+                    event["ts"] = ts
+                events.append(event)
     return events
 
 
@@ -6996,9 +7563,9 @@ def _tail_claude_transcript(session_id):
                     chunk = f.read(size - offset)
                 offset = size
                 buf += chunk
-                buf, texts = _split_assistant_text_events(buf)
-                for text in texts:
-                    append_event(session_id, {"type": "agent_output", "text": text})
+                buf, events = _split_assistant_text_events(buf)
+                for event in events:
+                    append_event(session_id, event)
 
             now = time.time()
             if now - last_liveness_check > 5:
@@ -7188,12 +7755,22 @@ def _watch_shell_claude(session_id):
     known = set()
     offset = 0
     buf = b""
+    # Texts already in the chat, to skip on the first read after taking up
+    # a conversation from its top whose file already had content -- a
+    # backend restart re-reading the pre-assigned conversation used to
+    # append every reply in it to the chat again (2026-10-12, three
+    # restarts each added the same 16 replies).
+    dedupe = None
+    live_checked_at = 0.0
     # ACL self-heal bookkeeping (_note_transcript_read_failure,
     # ACL_SELF_HEAL_SCHEDULE) -- only ever touched for location == "root",
     # but harmless to carry for every location.
     acl_fail_since = None
     acl_regrant_idx = 0
     acl_error_sent = False
+    # The conversation whose folder is already in meta["claude_cwd"]
+    # (_note_claude_cwd).
+    cwd_noted_for = None
 
     try:
         while True:
@@ -7275,6 +7852,11 @@ def _watch_shell_claude(session_id):
                             _claim_transcript(f"ssh:{machine}:{remote_key}", target_name, session_id)
                             offset = 0
                             buf = b""
+                            # Same restart replay as the local branch's `dedupe`
+                            # below (2026-10-12: a claude-tui-<machine> session got
+                            # all 45 replies again on one restart).
+                            existing = {n for n, _ in _ssh_list_jsonl(machine, remote_key)}
+                            dedupe = _recent_agent_texts(session_id) if target_name in existing else None
                             have_target = True
                         # else: machine unreachable this exact poll -- leave
                         # have_target False. Falls through to the discovery
@@ -7288,6 +7870,7 @@ def _watch_shell_claude(session_id):
                         _claim_transcript(str(proj_dir), target_path.name, session_id)
                         offset = 0
                         buf = b""
+                        dedupe = _recent_agent_texts(session_id) if target_path.exists() else None
                         have_target = True
                 if not have_target:
                     remote_key = _remote_claude_project_dir_key(machine, cwd) if is_ssh else None
@@ -7508,6 +8091,35 @@ def _watch_shell_claude(session_id):
                     if target_path is None:
                         continue  # every fresh candidate already belongs to another session
 
+                if time.time() - live_checked_at >= LIVE_CONVERSATION_CHECK_INTERVAL:
+                    live_checked_at = time.time()
+                    live = _live_claude_conversation(location, tmux_name)
+                    if live and live != target_path.stem:
+                        new_path = target_path.parent / f"{live}.jsonl"
+                        if new_path.exists() and _claim_transcript(str(new_path.parent), new_path.name,
+                                                                   session_id):
+                            # Whatever is left unread in the old one first.
+                            try:
+                                with target_path.open("rb") as f:
+                                    f.seek(offset)
+                                    buf += f.read()
+                            except OSError:
+                                pass
+                            buf, events = _split_assistant_text_events(buf + b"\n")
+                            if dedupe is not None:
+                                events = _drop_already_shown(events, dedupe)
+                            for event in events:
+                                append_event(session_id, event)
+                            target_path, offset, buf = new_path, _switched_conversation_offset(new_path), b""
+                            dedupe = _recent_agent_texts(session_id) if offset == 0 else None
+                            preassigned_id = live
+                            meta = load_meta(session_id)
+                            if meta is not None:
+                                meta["claude_session_id"] = live
+                                save_meta(session_id, meta)
+                            log(f"shell-claude watcher for {session_id}: following conversation {live} "
+                                f"(the pane's claude switched to it, offset {offset})")
+
                 try:
                     size = target_path.stat().st_size
                 except FileNotFoundError:
@@ -7563,14 +8175,38 @@ def _watch_shell_claude(session_id):
                 acl_fail_since, acl_regrant_idx, acl_error_sent = None, 0, False
                 offset = size
                 buf += chunk
+                if cwd_noted_for != target_path and _note_claude_cwd(session_id, location, target_path.stem):
+                    cwd_noted_for = target_path
 
-            buf, texts = _split_assistant_text_events(buf)
-            for text in texts:
-                append_event(session_id, {"type": "agent_output", "text": text})
+            buf, events = _split_assistant_text_events(buf)
+            if dedupe is not None:
+                events, dedupe = _drop_already_shown(events, dedupe), None
+            for event in events:
+                append_event(session_id, event)
     except Exception as e:  # watcher must never crash the process
         log(f"shell-claude watcher for {session_id} exiting on error: {e}")
         with _claude_foreground_lock:
             _claude_foreground.pop(session_id, None)
+
+
+def _note_claude_cwd(session_id, location, conv_id):
+    """Keep the folder conversation `conv_id` runs in as meta["claude_cwd"],
+    the ↻ of an ended shell session (the deployment notes) -- noted
+    while `claude` runs, because a root-shell's logs stop being readable
+    once its last pane is gone. True once noted (or the session is gone)."""
+    try:
+        cwd = find_transcript_cwd(location, conv_id)
+    except OSError:
+        return False
+    if cwd is None:
+        return False  # no record with a cwd yet
+    meta = load_meta(session_id)
+    if meta is None:
+        return True
+    if meta.get("claude_session_id") == conv_id and meta.get("claude_cwd") != cwd:
+        meta["claude_cwd"] = cwd
+        save_meta(session_id, meta)
+    return True
 
 
 # How long a pre-assigned conversation id may stay without its file before
@@ -7613,6 +8249,107 @@ def _adopt_resumed_transcript(session_id, proj_dir, since, start_sizes=None):
             start = (start_sizes or {}).get(path.name)
             return path, (start if start is not None and start <= st.st_size else st.st_size)
     return None
+
+
+# How often _watch_shell_claude asks Claude Code which conversation the
+# pane's `claude` is writing now (_live_claude_conversation).
+LIVE_CONVERSATION_CHECK_INTERVAL = 2.0
+
+
+def _live_claude_conversation(location, tmux_name):
+    """The conversation id the `claude` running in tmux session `tmux_name`
+    is writing right now, or None if that cannot be told.
+
+    Claude Code keeps one record per running process,
+    <its $HOME>/.claude/sessions/<pid>.json, whose "sessionId" it rewrites
+    when /clear (or /resume inside the TUI) moves to another conversation,
+    and whose "tmux" is "<session>:@<window>.%<pane>". Without this the
+    watcher kept reading the conversation `claude` had started on, and the
+    chat showed nothing after a /clear (2026-10-12, a root-shell session,
+    the deployment notes). For "root" the directory is
+    readable only through aigw-root-tmux-grant's ACL; without it this is
+    simply None. Several records naming the same tmux session (a stale one
+    left by an earlier `claude` there): the most recently updated wins, and
+    on this host's own pid namespace (host/root) a dead pid never counts."""
+    d = _claude_home_for_location(location) / ".claude" / "sessions"
+    best = None
+    try:
+        paths = list(d.glob("*.json"))
+    except OSError:
+        return None
+    for p in paths:
+        try:
+            rec = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or str(rec.get("tmux") or "").split(":", 1)[0] != tmux_name:
+            continue
+        cid = rec.get("sessionId")
+        if not isinstance(cid, str) or not CLAUDE_CONV_ID_RE.match(cid):
+            continue
+        if location != "container" and not os.path.exists(f"/proc/{rec.get('pid')}"):
+            continue
+        updated = rec.get("updatedAt") if isinstance(rec.get("updatedAt"), (int, float)) else 0
+        if best is None or updated > best[0]:
+            best = (updated, cid)
+    return best[1] if best else None
+
+
+def _switched_conversation_offset(path):
+    """Where to start reading a conversation the pane's `claude` switched
+    to: from the top when it was started by /clear (everything in it is
+    new), else -- /resume of an older one -- from its current end, so that
+    conversation's earlier turns are not replayed into this chat."""
+    try:
+        with path.open("rb") as f:
+            head = f.read(65536)
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    return 0 if b"<command-name>/clear</command-name>" in head else size
+
+
+def _recent_agent_texts(session_id, limit=1000):
+    """How many times each of this session's last `limit` agent_output/
+    agent_thinking (type, text) pairs occurs, for _watch_shell_claude to skip what is already in the
+    chat when it re-reads a conversation from the top (see `dedupe`
+    there)."""
+    try:
+        lines = (session_dir(session_id) / "events.jsonl").read_text().splitlines()
+    except OSError:
+        return {}
+    counts = {}
+    seen = 0
+    for raw in reversed(lines):
+        try:
+            ev = json.loads(raw)
+        except ValueError:
+            continue
+        if ev.get("type") not in ("agent_output", "agent_thinking") or not isinstance(ev.get("text"), str):
+            continue
+        key = (ev["type"], ev["text"])
+        counts[key] = counts.get(key, 0) + 1
+        seen += 1
+        if seen >= limit:
+            break
+    return counts
+
+
+def _drop_already_shown(events, seen):
+    """`events` minus those `seen` (from _recent_agent_texts) still counts,
+    each occurrence in `seen` cancelling one. An agent_thinking before the
+    last one cancelled is dropped too: a chat from before thinking was shown
+    (2026-10-13) has none of them, and they must not all land at its end."""
+    kept = []
+    last_seen = -1
+    for i, event in enumerate(events):
+        key = (event["type"], event["text"])
+        if seen.get(key, 0) > 0:
+            seen[key] -= 1
+            last_seen = i
+        else:
+            kept.append((i, event))
+    return [e for i, e in kept if not (e["type"] == "agent_thinking" and i < last_seen)]
 
 
 def _resolve_claude_conversation(session_id):
@@ -7989,6 +8726,10 @@ def build_transcript(session_id):
             body.append(f"[{stamp}] {speaker}:")
             body.append(ev.get("text", ""))
             body.append("")
+        elif etype == "agent_thinking":
+            body.append(f"[{stamp}] {speaker}(思考):")
+            body.append(ev.get("text", ""))
+            body.append("")
         elif etype in ("image", "attachment"):  # "image" is what every outbox
             # file was called before "attachment"+"kind" (2026-08-15, see
             # outbox_attachment_kind) -- old sessions' events.jsonl still has
@@ -8101,6 +8842,10 @@ def _shared_get_path_allowed(parts):
     right boundary."""
     if parts == ["sessions"]:
         return True
+    # Chat search (search_events filters to shared_with itself, the same
+    # check resolve_session_access makes per session).
+    if parts == ["search"]:
+        return True
     if len(parts) < 3 or parts[0] != "sessions":
         return False
     action = parts[2]
@@ -8118,6 +8863,19 @@ def _shared_get_path_allowed(parts):
         if action in ("files", "subagents"):
             return True
     return False
+
+
+# The display languages static/i18n.js knows (the deployment notes).
+PREF_LANGS = {"ja", "en", "zh-CN"}
+
+
+def _share_mode_of(session_id, on_behalf_of):
+    """share_mode() for a session id from a request path, None when there is
+    no such session."""
+    if not SESSION_ID_RE.match(session_id):
+        return None
+    meta = load_meta(session_id)
+    return share_mode(meta, on_behalf_of) if meta is not None else None
 
 
 def _shared_post_path_allowed(parts):
@@ -8209,6 +8967,11 @@ class Handler(BaseHTTPRequestHandler):
         # check on_behalf_of does not silently become reachable cross-user.
         if on_behalf_of is not None and not _shared_get_path_allowed(parts):
             return self._json(403, {"error": "sharing does not include this"})
+        # A read-only share is the chat log, not the live pane
+        # (the deployment notes): its stream also skips "screen" events (_sse).
+        if (on_behalf_of is not None and len(parts) == 3 and parts[2] == "screen"
+                and _share_mode_of(parts[1], on_behalf_of) == "read"):
+            return self._json(403, {"error": "read-only sharing does not include the screen"})
 
         if parts == ["sessions"]:
             return self._json(200, {"sessions": redact_locked_sessions(list_sessions(on_behalf_of))})
@@ -8229,6 +8992,25 @@ class Handler(BaseHTTPRequestHandler):
             order_path = STATE_DIR / "session_order.json"
             order = json.loads(order_path.read_text()) if order_path.exists() else []
             return self._json(200, {"order": order})
+
+        # This user's display preferences (the deployment notes: {"lang": ...}), kept
+        # next to session_order.json; never reached on_behalf_of, same as
+        # session-order above.
+        if parts == ["prefs"]:
+            prefs_path = STATE_DIR / "prefs.json"
+            try:
+                prefs = json.loads(prefs_path.read_text())
+            except (OSError, ValueError):
+                prefs = {}
+            return self._json(200, prefs if isinstance(prefs, dict) else {})
+
+        # Full-text search of the chat logs (search_events): this user's own,
+        # or with on_behalf_of only those shared with that user.
+        if parts == ["search"]:
+            q = qs.get("q", [""])[0]
+            if len(q) > 200:
+                return self._json(400, {"error": "query too long"})
+            return self._json(200, search_events(q, on_behalf_of))
 
         if parts == ["tmux-sessions"]:
             return self._json(200, {"sessions": list_untracked_tmux_sessions()})
@@ -8331,7 +9113,8 @@ class Handler(BaseHTTPRequestHandler):
             _, err = resolve_session_access(parts[1], on_behalf_of)
             if err:
                 return self._json(*err)
-            return self._sse(parts[1], qs)
+            return self._sse(parts[1], qs, read_only=(
+                on_behalf_of is not None and _share_mode_of(parts[1], on_behalf_of) == "read"))
 
         # Plain-JSON page of history for the chat UI's lazy load
         # (the deployment notes) -- unlike GET .../events (SSE,
@@ -8642,6 +9425,10 @@ class Handler(BaseHTTPRequestHandler):
         # further down and that is the deployment notes' intended "共同作業".
         if on_behalf_of is not None and not _shared_post_path_allowed(parts):
             return self._json(403, {"error": "sharing does not include this"})
+        # Every route on that list acts on the session: collaborators only
+        # (the deployment notes).
+        if on_behalf_of is not None and _share_mode_of(parts[1], on_behalf_of) != "write":
+            return self._json(403, {"error": "this session is shared read-only"})
 
         if parts == ["sessions"]:
             body = self._read_json_body()
@@ -8668,7 +9455,8 @@ class Handler(BaseHTTPRequestHandler):
         # container -- which is what a client written before the host/root
         # rows existed sends, and still the one these presets mostly use.
         # The folder pickers' "＋" (the deployment notes): {"scope": "sandhome"|
-        # "mail", "dir": <picker-relative parent>, "name": <new folder>}.
+        # "mail"|"host"|"root", "dir": <parent as the picker holds it>,
+        # "name": <new folder>}.
         if parts == ["workdirs"]:
             body = self._read_json_body() or {}
             try:
@@ -8959,7 +9747,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(403, {"error": "cannot re-share a shared session"})
             body = self._read_json_body()
             try:
-                meta = share_session(session_id, (body.get("username") or "").strip())
+                meta = share_session(session_id, (body.get("username") or "").strip(),
+                                     mode=body.get("mode") or "write")
             except ValueError as e:
                 return self._json(400, {"error": str(e)})
             return self._json(200, meta)
@@ -9007,6 +9796,15 @@ class Handler(BaseHTTPRequestHandler):
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             (STATE_DIR / "session_order.json").write_text(json.dumps(order))
             return self._json(200, {"ok": True})
+
+        if parts == ["prefs"]:
+            body = self._read_json_body()
+            lang = body.get("lang")
+            if lang not in PREF_LANGS:
+                return self._json(400, {"error": "lang must be one of " + ", ".join(sorted(PREF_LANGS))})
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            (STATE_DIR / "prefs.json").write_text(json.dumps({"lang": lang}))
+            return self._json(200, {"lang": lang})
 
         if parts == ["push", "subscribe"]:
             body = self._read_json_body()
@@ -9135,7 +9933,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _sse(self, session_id, qs):
+    def _sse(self, session_id, qs, read_only=False):
         if not SESSION_ID_RE.match(session_id) or load_meta(session_id) is None:
             return self._json(404, {"error": "no such session"})
 
@@ -9176,7 +9974,7 @@ class Handler(BaseHTTPRequestHandler):
                             self._write_sse(ev)
                             max_replayed = max(max_replayed, ev["seq"])
 
-            gate = session_unlock_location(load_meta(session_id) or {})
+            gate = None if read_only else session_unlock_location(load_meta(session_id) or {})
             last_gate_check = time.monotonic()
             while True:
                 # A stream opened inside the window must not outlive it
@@ -9199,6 +9997,8 @@ class Handler(BaseHTTPRequestHandler):
                 # duplicate of something the replay above already sent, and
                 # the dedupe check must not swallow them.
                 seq = ev.get("seq")
+                if read_only and ev.get("type") == "screen":
+                    continue
                 if seq is None or seq > max_replayed:
                     self._write_sse(ev)
         except (BrokenPipeError, ConnectionResetError):

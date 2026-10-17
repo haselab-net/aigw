@@ -314,6 +314,9 @@ SESSION_SHARE_RE = re.compile(rf"^{re.escape(BASE_PATH)}/api/sessions/([^/]+)/(s
 # aigw-backend's is the one that actually holds.
 SHARED_ALLOWED_GET_RE = re.compile(
     r"^/sessions$"
+    # Chat search: the owner's backend searches only sessions shared with
+    # the caller (aigw-backend's search_events), like /sessions above.
+    r"|^/search$"
     r"|^/sessions/[^/]+/events(/page)?$"
     r"|^/sessions/[^/]+/screen$"
     r"|^/sessions/[^/]+/files/[^/]+$"
@@ -1289,6 +1292,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file(STATIC_DIR / "sw.js", "application/javascript")
         if path == f"{BASE_PATH}/app.js":
             return self._send_file(STATIC_DIR / "app.js", "application/javascript")
+        # Display language (the deployment notes): also used by the login page, so
+        # unauthenticated like app.js.
+        if path == f"{BASE_PATH}/i18n.js":
+            return self._send_file(STATIC_DIR / "i18n.js", "application/javascript")
         # Optional, deployment-supplied extension for the two empty
         # "site-extra-*" hook points in index.html
         # (the deployment notes' frontend follow-up) -- e.g. an internal docs-viewer
@@ -1837,7 +1844,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(401, {"error": "not logged in"})
 
         index = _load_shares_index()
-        owners = index.get(username, [])
+        # "*": owners who shared something read-only with everyone
+        # (the deployment notes); never one's own sessions.
+        owners = [o for o in dict.fromkeys(index.get(username, []) + index.get("*", [])) if o != username]
         sessions = []
         for owner in owners:
             try:

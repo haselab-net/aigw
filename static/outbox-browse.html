@@ -46,6 +46,9 @@
 <div id="list"></div>
 <div id="empty" style="display:none;">(空のフォルダです)</div>
 <div id="error"></div>
+<!-- Display language (the deployment notes). -->
+<script src="/agents/i18n.js"></script>
+<script>window.aigwI18n.apply(document.body);</script>
 <script>
   const qs = new URLSearchParams(location.search);
   const sessionId = qs.get("session") || "";
@@ -93,7 +96,7 @@
       if (!isLast) b.addEventListener("click", () => navigate(targetDir));
       crumbsEl.appendChild(b);
     };
-    mkCrumb(rootName || "フォルダ", "", parts.length === 0);
+    mkCrumb(rootName || t("フォルダ"), "", parts.length === 0);
     let acc = "";
     parts.forEach((seg, i) => {
       const sep = document.createElement("span");
@@ -140,12 +143,12 @@
       }
       r = await res.json();
     } catch (e) {
-      errorEl.textContent = `読み込めませんでした: ${e.message}`;
+      errorEl.textContent = t("読み込めませんでした: {err}", { err: e.message });
       errorEl.style.display = "block";
       return;
     }
     currentDir = r.dir;
-    document.title = rootName ? `${rootName} — フォルダ` : "フォルダ";
+    document.title = rootName ? `${rootName} — ${t("フォルダ")}` : t("フォルダ");
     renderCrumbs(currentDir);
     const url = new URL(location.href);
     url.searchParams.set("dir", currentDir);
@@ -175,7 +178,7 @@
   }
 
   if (!sessionId) {
-    errorEl.textContent = "セッションが指定されていません。";
+    errorEl.textContent = t("セッションが指定されていません。");
     errorEl.style.display = "block";
   } else {
     navigate(currentDir);
