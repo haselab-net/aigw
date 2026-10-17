@@ -127,6 +127,11 @@
   // aigw's usual entry point, is unaffected -- it always goes through this
   // same closeSession()).
   let sessionOpenedFromAuth = false;
+  // Set once the open login session (claude-login* / codex-login*) has ended:
+  // there is nothing left to do in it, so any tap in the chat view goes back
+  // (2026-10-17, user request: having to find ← after logging in was unclear).
+  let tapToLeave = false;
+  const isLoginPreset = (p) => /^(claude|codex)-login/.test(String(p || ""));
   let currentEventSource = null;
   // The bubble currently showing an "attach"-preset session's still-changing
   // tail line (see the live_tail case in renderEvent) -- updated in place on
@@ -2530,8 +2535,12 @@
       // A claude-login pane ends exactly when `claude auth login` is done,
       // success or failure -- i.e. this is the moment the auth panel's
       // answer changed, and the user should not have to press ⟳ to find out.
-      if (sessionId === currentSessionId && String(currentPreset).startsWith("claude-login")) {
+      if (sessionId === currentSessionId && isLoginPreset(currentPreset)) {
         refreshAuthStatus();
+        div.textContent += "\n" + t("画面のどこかをタップすると戻ります");
+        tapToLeave = true;
+        composerEl.style.display = "none";
+        keyToolbarEl.classList.remove("visible");
       }
     } else if (ev.type === "system") {
       div.className = "bubble system";
@@ -3503,6 +3512,7 @@
   }
 
   function openSession(meta, jumpSeq = null, jumpTerms = []) {
+    tapToLeave = false;
     pendingJumpSeq = jumpSeq;
     pendingJumpTerms = jumpTerms;
     if (window.CSS && CSS.highlights) CSS.highlights.delete("search-term");
@@ -3568,6 +3578,7 @@
   }
 
   function closeSession() {
+    tapToLeave = false;
     if (currentEventSource) currentEventSource.close();
     currentEventSource = null;
     currentSessionId = null;
@@ -3947,6 +3958,13 @@
   });
 
   document.getElementById("back-btn").addEventListener("click", closeSession);
+  // See tapToLeave. Capture phase, so the tap does nothing else on the way.
+  viewChat.addEventListener("click", (e) => {
+    if (!tapToLeave) return;
+    e.preventDefault();
+    e.stopPropagation();
+    closeSession();
+  }, true);
 
   // The chat header's status dot: on one's own ended, resumable session a
   // tap offers to resume it (same as the list row's grey dot); its

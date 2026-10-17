@@ -23,3 +23,10 @@ ExecStartPre=+/usr/bin/install -d -m 1777 -o root -g root /run/aigw-ssh-mux
 ExecStart=/usr/local/sbin/aigw-backend
 Restart=on-failure
 RestartSec=2
+# Stop (a deploy's restart, aigw-reap-idle) ends this backend process only.
+# The host tmux server that host-shell / Email sessions run on is started
+# by this backend and so lives in this unit's cgroup; the default
+# KillMode=control-group took it, and every session on it, down with each
+# restart (2026-10-16/17: Email sessions ended at two deploys). Its control
+# clients exit on their own once this process's pipes close.
+KillMode=process
