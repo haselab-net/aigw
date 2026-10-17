@@ -3,7 +3,7 @@
 Per-user backend for the "aigw" mobile AI control panel.
 
 Runs as the target Unix user (systemd `User=%i` in aigw-backend@.service, one
-instance per host user, started on demand by aigw-backend-proxy@<port>.socket
+instance per host user, started on demand by aigw-backend-proxy-<port>.socket
 -- see the deployment notes). Binds an AF_UNIX socket at
 BACKEND_SOCKET_PATH, not a loopback TCP port (the deployment notes, 2026-08-30
 revision 2): loopback TCP has no per-uid access control on Linux, so a
@@ -13,7 +13,7 @@ Unix-domain socket has real filesystem permissions instead: this one is
 mode 0600, owned by this user alone, so the only things that can ever
 connect are this user's own processes and root -- and the only root process
 that ever does is aigw-proxy-handler, relaying a connection that already
-passed through aigw-backend-proxy@<port>.socket's own, separately
+passed through aigw-backend-proxy-<port>.socket's own, separately
 permissioned AF_UNIX socket (owner "aigw", mode 0600 -- see that unit).
 There is deliberately no group "aigw" anywhere in this: an earlier revision
 of this fix chmod'd this socket group "aigw" and had aigw-gateway connect to
@@ -23,7 +23,7 @@ aigw-backend@<user>` sudo rule to wake a stopped one -- rejected on review
 be the authorization boundary; a wildcard `aigw-backend@*.service` rule put
 that boundary in aigw-gateway's own username-validation code instead, one
 bug away from `aigw-backend@root.service` actually starting as root). Root
-already owns that boundary today -- aigw-backend-proxy@.service has no
+already owns that boundary today -- aigw-backend-proxy-<port>@.service has no
 `User=` line, so it runs as root already, and always has -- so keeping the
 existing activation relay and just swapping its transport closes the same
 hole without moving who is trusted to start a backend at all.
@@ -1038,7 +1038,7 @@ def require_unlock_if_outside_sandbox(location):
 # aigw-backend.conf creates it, mode 1777 like /tmp/SSH_CONTROL_DIR above --
 # every aigw-backend@<user> is a different Unix user and needs to create its
 # own file here, and the sticky bit stops one from deleting another's) is
-# shared with aigw-backend-proxy@.socket's own activation socket
+# shared with aigw-backend-proxy-<port>.socket's own activation socket
 # (/run/aigw-backend/<port>.sock -- see that unit), which is why this one
 # has a "-backend" suffix the two can never collide on: a port number is all
 # digits, a username must start with a letter or underscore. UnixHTTPServer.
@@ -8938,7 +8938,7 @@ class Handler(BaseHTTPRequestHandler):
         BACKEND_SOCKET_PATH's comment, the deployment notes). What can reach this
         backend's socket now is this user's own processes, and root (only
         ever aigw-proxy-handler in practice, relaying a connection that
-        already passed through aigw-backend-proxy@<port>.socket's own,
+        already passed through aigw-backend-proxy-<port>.socket's own,
         separately permissioned activation socket -- see that unit and this
         file's module docstring). There really is nothing left here for
         anyone else to spoof: the owning user setting this header
@@ -10104,7 +10104,7 @@ class UnixHTTPServer(ThreadingHTTPServer):
         # The actual access-control decision (the deployment notes): connecting to
         # an AF_UNIX socket requires *write* permission on it (unix(7)).
         # Owner-only (0600, no group bits at all) is enough here -- unlike
-        # aigw-backend-proxy@.socket's own activation socket (owner "aigw",
+        # aigw-backend-proxy-<port>.socket's own activation socket (owner "aigw",
         # so group access matters for aigw-gateway), the only thing besides
         # this user's own processes that ever connects to *this* socket is
         # aigw-proxy-handler, which runs as root and so isn't subject to

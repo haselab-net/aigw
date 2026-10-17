@@ -55,10 +55,13 @@ tmux操作を行うバックエンド本体(`bin/aigw-backend`・`bin/aigw-gatew
 | `bin/aigw-backend` | ユーザーごとのバックエンド。tmuxセッション管理・SSE配信。`sandbox exec`相当の外部CLIに依存する(前述)。 |
 | `bin/aigw-set-email` | 各ユーザーが自分のGoogleアカウントのメールアドレスを自分のGECOS "Other"欄に自己登録するCLI(`aigw-gateway`はログイン時にこれで発行されたメール↔Unixユーザー名の対応を見る)。`root`への昇格はsudo経由、`etc/sudoers.d/aigw.example`参照。 |
 | `systemd/*` | 上記を動かすためのユニット一式(`aigw-gateway.service`・`aigw-backend@.service`含む)。 |
+| `systemd/aigw-backend-proxy-generator` | systemdのgenerator。起動時と`daemon-reload`のたびに、ポート21000〜21099ごとの`aigw-backend-proxy-<port>.socket`と、その接続用の雛形`aigw-backend-proxy-<port>@.service`を作る(下記「ソケットアクティベーションによるuid単位のファンアウト」)。`/etc/systemd/system-generators/`に置く。 |
 | `etc/tmpfiles.d/aigw-backend.conf` | `/run/aigw-backend/`(ソケットアクティベーション用ディレクトリ)を早期boot時に作る`systemd-tmpfiles`設定。`/etc/tmpfiles.d/`にコピーする。 |
 | `etc/sudoers.d/aigw.example` | `aigw-set-email`をNOPASSWDで許可するsudoersルールの例。`/etc/sudoers.d/aigw`として設置(グループ名は自分のデプロイに合わせて変更)。 |
 | `requirements.txt` | `aigw-gateway`/`aigw-backend`が必要とするPythonパッケージ。 |
-| `static/index.html`・`static/app.js`・`static/manifest.json`・`static/sw.js` | モバイル向けPWAのコアフロントエンド(セッション一覧・チャット画面・tmuxペインの表示/操作)。バックエンドAPI(未公開)への依存はあるが、コード自体にサーバー固有の情報は無い。 |
+| `static/index.html`・`static/app.js`・`static/manifest.json`・`static/sw.js` | モバイル向けPWAのコアフロントエンド(セッション一覧・チャット画面・tmuxペインの表示/操作・共有・検索)。バックエンドAPI(未公開)への依存はあるが、コード自体にサーバー固有の情報は無い。 |
+| `static/i18n.js` | 表示言語(日本語・English・简体中文)。日本語の原文をキーにした辞書と`t()`、静的なHTMLを一度だけ訳す`apply()`。選んだ言語はブラウザ(localStorage)とユーザーごとのバックエンド(`GET/POST /prefs`)に保存する。チャットの中身は訳さない。 |
+| `static/outbox-browse.html` | チャットに置かれたフォルダの中を見るページ。 |
 
 ### フロントエンドの拡張ポイント
 
@@ -71,6 +74,11 @@ site-extras.js`という決まった場所に置いた追加スクリプトが�
 404になり、何も変わらない。3Dモデル添付を開く処理も同じ仕組み
 (`window.aigwSiteExtras.openModel3d`)で、無ければ素のファイルを
 ブラウザ既定の扱いで開く。
+
+表示言語の辞書(`static/i18n.js`)にはコアの画面の文しか入っていない。
+`site-extras.js`やサーバー固有のページ(ログイン画面など)は、自分の文の訳を
+`window.aigwI18n.add({en: {...}, "zh-CN": {...}})`で足してから
+`t()`/`apply()`を使う。キーは日本語の原文、変数は`{name}`。
 
 ### バックエンドの拡張ポイント
 
@@ -131,10 +139,20 @@ site-extras.js`という決まった場所に置いた追加スクリプトが�
 ### ソケットアクティベーションによるuid単位のファンアウト
 
 1ユーザー1バックエンドプロセスを、そのユーザーがアクセスしたときだけ
-systemdに起動させたい。`aigw-backend-proxy@<port>.socket`
-(`port = 21000 + (uid - 1000)`)がuidごとに1つずつ事前有効化されており、
+systemdに起動させたい。`aigw-backend-proxy-<port>.socket`
+(`port = 21000 + (uid - 1000)`)がuidごとに1つずつあり、
 接続が来ると`aigw-proxy-handler`が実際のバックエンドソケットへ中継する
 (存在しなければ`systemctl start`で起こしてから)。
+
+ソケットはポートごとに別の雛形(`aigw-backend-proxy-<port>@.service`)を持つ。
+`Accept=yes`のAF_UNIXソケットは、接続ごとのサービスを
+`<雛形>@<n>-<相手のPID>-<相手のUID>.service`と名付ける(`n`はソケットごとの
+受け付け数)。100個のソケットが1つの雛形を共有すると、ゲートウェイという
+1つのプロセスから2つのポートへの接続は`n`が同じなら同じ名前になり、
+先の接続が開いている間、後のソケットが`Device or resource busy`でfailedになる。
+起動直後は全ソケットの`n`が0から揃って始まるので、すぐに起きる。
+100組のユニットはgenerator(`systemd/aigw-backend-proxy-generator`)が作るので、
+直すのは1か所でよい。
 
 素朴に「リクエストごとに新規TCP/Unix接続」だと、1回のページ読み込みで
 添付が100枚あれば100本超の接続バーストになり、systemdの既定の
@@ -217,21 +235,22 @@ visudo -c -f /etc/sudoers.d/aigw
 ### systemdユニットの設置
 
 ```sh
-cp systemd/*.service systemd/*.socket systemd/*.timer /etc/systemd/system/
+cp systemd/*.service systemd/*.timer /etc/systemd/system/
+install -d /etc/systemd/system-generators
+install -m 755 systemd/aigw-backend-proxy-generator /etc/systemd/system-generators/
 cp etc/tmpfiles.d/aigw-backend.conf /etc/tmpfiles.d/aigw-backend.conf
 systemd-tmpfiles --create
-systemctl daemon-reload
+systemctl daemon-reload        # generator が aigw-backend-proxy-<port>.socket を作り sockets.target に入れる
 systemctl enable --now aigw-gateway.service aigw-unlockd.service \
   aigw-reap-idle.timer
-# aigw-backend@<user>.service・aigw-backend-proxy@<port>.socket は
-# ソケットアクティベーション対象なので enable のみ(起動はしない):
+# aigw-backend@<user>.service はソケットアクティベーションで起きるので enable しない。
+# ソケットは次の起動から自動で listen する。今すぐ使うなら:
 for port in $(seq 21000 21099); do
-  systemctl enable "aigw-backend-proxy@${port}.socket"
-  systemctl start  "aigw-backend-proxy@${port}.socket"
+  systemctl start "aigw-backend-proxy-${port}.socket"
 done
 ```
 
-`port = 21000 + (uid - 1000)`という前提(`aigw-backend-proxy@<port>.socket`
+`port = 21000 + (uid - 1000)`という前提(`aigw-backend-proxy-<port>.socket`
 の対応するuid範囲)は`aigw-gateway`側のコードにハードコードされている。
 別の割り当てにしたい場合はそちら側の定数も合わせて変える必要がある。
 

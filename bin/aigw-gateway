@@ -22,19 +22,19 @@ so a bug here can't grant access to another user's session.
 
 the deployment notes (2026-08-30): the per-user backend used to listen on loopback
 TCP (127.0.0.1:21000+(uid-1000), woken on demand by a socket-activated
-aigw-backend-proxy@<port> unit) -- reachable, since loopback TCP has no
+aigw-backend-proxy-<port> unit) -- reachable, since loopback TCP has no
 per-uid access control on Linux, by any local user on the host, not just
 this process. It is now a Unix-domain socket instead, mode 0660 group
 "aigw", so only this process (aigw runs in that group) and the backend's own
 owning user can connect at all -- see aigw-backend's own BACKEND_SOCKET_PATH
-comment for the other half of this. aigw-backend-proxy@.socket/.service and
+comment for the other half of this. aigw-backend-proxy-<port>.socket/@.service and
 aigw-proxy-handler all stay, unchanged in shape: they are what turns an
 incoming connection into `systemctl start` from a root context, so keeping
 them means this web-exposed process needs no privilege of its own to wake a
 stopped backend (see the NOTE above backend_request for why the alternative
 was rejected). Only what they listen on changed -- an AF_UNIX socket that
 just this account can open, instead of a loopback TCP port every local user
-could. They still cost one aigw-backend-proxy@<conn>.service instance per
+could. They still cost one aigw-backend-proxy-<port>@<conn>.service instance per
 *connection*, which is what makes aigw-gateway's own connection pool
 (see POOL_MAX_IDLE_PER_PORT below) necessary to avoid tripping systemd's
 trigger-limit/MaxConnections in the
@@ -910,11 +910,11 @@ BACKEND_SOCKET_DIR = "/run/aigw-backend"
 # 1000-relative) -- anything below that is a system account, root included.
 # The old TCP-port formula (21000 + (uid - 1000)) excluded those *by
 # accident*: root's uid 0 maps to port 20000, outside the 21000-21099 range
-# any aigw-backend-proxy@<port>.socket was ever enabled for, so connecting
+# any aigw-backend-proxy-<port>.socket was ever enabled for, so connecting
 # there just failed. A path keyed on the username directly has no
 # equivalent accident to lean on. Naming "root" as a /shared/<owner>/...
 # target is an ordinary logged-in aigw user's own request, not a bug, so
-# without this check it would reach aigw-backend-proxy@20000.socket -- and
+# without this check it would reach aigw-backend-proxy-20000.socket -- and
 # aigw-backend@.service's `User=%i` carries no allowlist of its own, so a
 # root-privileged backend really would be what came back. aigw-proxy-handler
 # refuses uid < 1000 for the same reason; two independent checks, because
@@ -930,11 +930,11 @@ def backend_socket_path_for(username: str) -> str:
     caller already handles as "no such user" -- for an unknown name, and also
     (see BACKEND_MIN_UID above) for any system account.
 
-    This is aigw-backend-proxy@<port>.socket's listener, *not* the backend's
+    This is aigw-backend-proxy-<port>.socket's listener, *not* the backend's
     own socket: connecting here is what makes systemd start a stopped backend
     (the deployment notes). The instance name stays the old TCP port number rather
     than the username, purely so the 100 already-enabled
-    aigw-backend-proxy@21000..21099 instances keep working untouched -- one
+    aigw-backend-proxy-21000..21099 instances keep working untouched -- one
     less thing for aigw-self-signup to have to remember for a new account.
     The port number is only a key here; nothing listens on TCP any more."""
     pw = pwd.getpwnam(username)
@@ -1022,7 +1022,7 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 # (the deployment notes), and the deployment notes' "never
 # NOPASSWD: ALL" for the same reason.
 #
-# None of it was necessary: aigw-backend-proxy@.service carries no `User=`,
+# None of it was necessary: aigw-backend-proxy-<port>@.service carries no `User=`,
 # so systemd already runs the handler as root and it has always been able to
 # `systemctl start` the backend with no sudo at all. Keeping socket
 # activation therefore closes the hole (the listener is now an AF_UNIX socket
@@ -1035,7 +1035,7 @@ class UnixHTTPConnection(http.client.HTTPConnection):
 # ---- keep-alive connections to the per-user backends ------------------------
 #
 # aigw-backend used to be reachable only through a socket-activated
-# aigw-backend-proxy@<conn>.service instance -- bash + python + getent +
+# aigw-backend-proxy-<port>@<conn>.service instance -- bash + python + getent +
 # systemctl + socat, one of those per TCP connection. Opening one per
 # request turned a single PWA page load (which fetches every attachment on
 # the session at once) into a burst of hundreds of activations, and past

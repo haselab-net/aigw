@@ -1,5 +1,5 @@
 #!/bin/bash
-# Invoked per-connection by aigw-backend-proxy@<conn>.socket (Accept=yes socket
+# Invoked per-connection by aigw-backend-proxy-<port>.socket (Accept=yes socket
 # activation), mirroring chromedbg-proxy-handler. The connected socket arrives
 # on fd 3; %i under Accept=yes is a per-connection descriptor, not the
 # original listening socket's own instance name -- confirmed 2026-08-30 by
@@ -8,7 +8,7 @@
 # connection tuple, not "21001" -- so we read the actual listening address
 # directly off fd 3 via getsockname() instead. That used to return a TCP
 # (host, port) tuple; now that the activation socket is AF_UNIX
-# (the deployment notes, 2026-08-30 revision 2: see aigw-backend-proxy@.socket), it
+# (the deployment notes, 2026-08-30 revision 2: see aigw-backend-proxy-<port>.socket), it
 # returns the filesystem path the listening socket was bound to instead --
 # /run/aigw-backend/<port-number>.sock, where <port-number> is still the
 # historical 21000-21099 key aigw-gateway derives from a uid (see
@@ -23,7 +23,7 @@ PORT="$(python3 -c 'import socket, pathlib; print(pathlib.Path(socket.socket(fil
 UID_NUM=$((PORT - 21000 + 1000))
 
 # Defense in depth (the deployment notes, 2026-08-30 revision 2): every
-# aigw-backend-proxy@<port>.socket instance that is ever enabled is in
+# aigw-backend-proxy-<port>.socket instance that is ever enabled is in
 # 21000-21099 (uid 1000-1099) by construction, so UID_NUM below 1000 can't
 # actually happen via this script's own arithmetic today -- but a review of
 # an earlier draft of this fix caught a *different* path in the same

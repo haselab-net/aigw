@@ -12,8 +12,8 @@ ExecStartPre=+/usr/bin/install -d -m 1777 -o root -g root /run/aigw-ssh-mux
 # /run/aigw-backend/ (the deployment notes -- see aigw-backend's own
 # BACKEND_SOCKET_PATH comment for why a loopback TCP port became this)
 # holds every user's aigw-backend AF_UNIX socket AND
-# aigw-backend-proxy@.socket's own per-port activation sockets. It is
-# NOT created here: aigw-backend-proxy@<port>.socket binds its half at boot
+# aigw-backend-proxy-<port>.socket's own per-port activation sockets. It is
+# NOT created here: aigw-backend-proxy-<port>.socket binds its half at boot
 # (WantedBy=sockets.target), independently of whether any
 # aigw-backend@<user>.service has ever run, so an ExecStartPre on *this*
 # unit would not exist yet the first time that happens. See
