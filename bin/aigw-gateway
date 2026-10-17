@@ -1423,6 +1423,17 @@ class Handler(BaseHTTPRequestHandler):
         if client is None:
             return self._send_file(STATIC_DIR / "not_configured.html", "text/html; charset=utf-8")
 
+        # Only a page the user is actually navigating to starts a login. An
+        # image or fetch() that nginx's auth_request bounced here (a
+        # /sandbox/port<N>/ app polling while logged out) must not: each one
+        # would replace aigw_oauth_state and aigw_next, so a login the user
+        # had just started came back to "invalid oauth state", or landed on
+        # the polled URL (2026-10-17, one page polling every second). Browsers
+        # without Fetch Metadata send no Sec-Fetch-Mode and keep the old path.
+        fetch_mode = self.headers.get("Sec-Fetch-Mode")
+        if fetch_mode and fetch_mode != "navigate":
+            return self._send_json(401, {"error": "not logged in"})
+
         state = secrets.token_urlsafe(24)
         params = {
             "client_id": client["client_id"],
