@@ -116,6 +116,13 @@
     color: #9aa5b1; font-size: 0.85rem;
   }
   #shared-toggle-btn[hidden] { display: none; }
+  #digest-toggle-btn {
+    display: block; width: 100%; margin-top: 0.2rem; margin-bottom: 0.4rem; padding: 0.6rem;
+    border-radius: 8px; border: 1px solid #2a3542; background: #1c2531;
+    color: #9aa5b1; font-size: 0.85rem;
+  }
+  #digest-toggle-btn[hidden] { display: none; }
+  #digest-list { margin: 0.2rem 0 0.6rem; }
   #shared-list { margin-top: 0.6rem; }
   #shared-list .shared-folder {
     display: block; width: 100%; text-align: left; margin: 0.3rem 0; padding: 0.5rem 0.6rem;
@@ -669,6 +676,9 @@
     <div id="sessions"></div>
     <!-- Closed by default, opened by tapping the
          button -- see renderArchivedSection()/archiveToggleBtn in app.js. -->
+    <!-- The mailbox digest page's Email sessions (the deployment notes, renderDigestSection()). -->
+    <button id="digest-toggle-btn" type="button" hidden>📨 Digest</button>
+    <div id="digest-list" hidden></div>
     <button id="archive-toggle-btn" type="button">🗄 アーカイブを開く</button>
     <div id="archived-list" hidden></div>
     <!-- Sessions shared with me, by owner (the deployment notes, renderSharedSection()). -->

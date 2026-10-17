@@ -37,6 +37,10 @@
   // Sessions others shared with me, folded like the archive and grouped by
   // owner (the deployment notes).
   const sharedToggleBtn = document.getElementById("shared-toggle-btn");
+  // The mailbox digest page's Email sessions, folded on their own
+  // (the deployment notes).
+  const digestToggleBtn = document.getElementById("digest-toggle-btn");
+  const digestListEl = document.getElementById("digest-list");
   const sharedListEl = document.getElementById("shared-list");
   const composerEl = document.getElementById("composer");
   const linkArmedBannerEl = document.getElementById("link-armed-banner");
@@ -213,6 +217,8 @@
   // reload, same as sessionMachine/currentMachine above.
   let archivedVisible = false;
   let lastArchivedSessions = [];
+  let digestVisible = false;
+  let lastDigestSessions = [];
   let sharedVisible = false;
   let lastSharedSessions = [];
   const openSharedOwners = new Set();
@@ -2766,7 +2772,7 @@
       t("🔒 {n} 件のセッションは、パスキーで解錠するまで名前を隠しています", { n: lockedRows.length });
     lockedListBarEl.hidden = lockedRows.length === 0;
     lockedListBarEl.style.display = lockedRows.length === 0 ? "none" : "flex";
-    for (const s of visible.filter((s) => !s.archived && !s.owner)) {
+    for (const s of visible.filter((s) => !s.archived && !s.owner && s.group !== "digest")) {
       const row = document.createElement("div");
       row.className = "session-row";
       row.dataset.sessionId = s.id;
@@ -2851,8 +2857,12 @@
 
       sessionsEl.appendChild(row);
     }
-    lastArchivedSessions = visible.filter((s) => s.archived && !s.owner);
+    // An archived digest session is the digest page's "done" item: it shows
+    // in neither the archive nor the Digest section (the deployment notes).
+    lastArchivedSessions = visible.filter((s) => s.archived && !s.owner && s.group !== "digest");
     renderArchivedSection();
+    lastDigestSessions = visible.filter((s) => !s.archived && !s.owner && s.group === "digest");
+    renderDigestSection();
     // Not filtered by the machine selector: a shared log is found by its
     // owner, not by where it ran.
     lastSharedSessions = sessions.filter((s) => s.owner);
@@ -2909,6 +2919,61 @@
       archivedListEl.appendChild(row);
     }
   }
+
+  // "📨 Digest" (the deployment notes): folded like the archive.
+  function renderDigestSection() {
+    digestToggleBtn.hidden = lastDigestSessions.length === 0 && !digestVisible;
+    digestToggleBtn.textContent = digestVisible
+      ? t("📨 Digest を閉じる")
+      : `📨 Digest (${lastDigestSessions.length})`;
+    digestListEl.hidden = !digestVisible;
+    digestListEl.innerHTML = "";
+    if (!digestVisible) return;
+    for (const s of lastDigestSessions) {
+      const row = document.createElement("div");
+      row.className = "session-row";
+      row.dataset.sessionId = s.id;
+      row.innerHTML = `
+        <div>
+          <span class="dot ${s.alive ? "alive" : "stopped"}"></span>
+          <span class="label">${escapeHtml(s.label)}</span>
+          <div class="meta">${s.preset} &middot; ${fmtTime(s.created_ts)}</div>
+        </div>`;
+      row.addEventListener("click", () => (s.locked ? openLockedSession(s) : openSession(s)));
+      if (!s.alive && !s.locked && canResumeEnded(s)) {
+        const dot = row.querySelector(".dot");
+        dot.classList.add("resumable");
+        dot.title = t("タップで再開");
+        dot.addEventListener("click", (e) => {
+          e.stopPropagation();
+          resumeEndedSession(s);
+        });
+      }
+      const archiveBtn = document.createElement("button");
+      archiveBtn.className = "archive-btn";
+      archiveBtn.textContent = "🗄";
+      archiveBtn.title = t("アーカイブへ移動");
+      archiveBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        archiveSession(s);
+      });
+      row.appendChild(archiveBtn);
+      const delBtn = document.createElement("button");
+      delBtn.className = "delete-btn";
+      delBtn.textContent = "🗑";
+      delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteSession(s);
+      });
+      row.appendChild(delBtn);
+      digestListEl.appendChild(row);
+    }
+  }
+
+  digestToggleBtn.addEventListener("click", () => {
+    digestVisible = !digestVisible;
+    renderDigestSection();
+  });
 
   // "👥 共有ログ" (the deployment notes): folded like the archive; open, one
   // folder per owner, each opened on its own.

@@ -2250,6 +2250,7 @@ def list_sessions(on_behalf_of=None):
             meta["share_mode"] = share_mode(meta, on_behalf_of)
             if meta["share_mode"] is None:
                 continue
+        meta["group"] = session_group(meta)
         location = meta.get("tmux_location")
         if meta.get("preset") in HEADLESS_PRESETS:
             # No persistent tmux session between turns for headless presets --
@@ -4188,7 +4189,7 @@ def _trust_dialog_cursor_move(screen):
 
 
 def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, cols=None, rows=None,
-                   replace_session=None):
+                   replace_session=None, group=None):
     if preset not in PRESETS:
         raise ValueError(f"unknown preset: {preset}")
     # the design notes: gate as early as this function can possibly know
@@ -4214,6 +4215,13 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         if (replaced_meta is None or not replaced_meta.get("stopped") or not resume
                 or replaced_meta.get("claude_session_id") != resume):
             raise ValueError("replace_session must be an ended session holding that conversation")
+    # The list section a session belongs in (the deployment notes): one of
+    # SESSION_GROUPS, or None for the ordinary list. A resumed session keeps
+    # the one it replaces unless the request says otherwise.
+    if group in (None, ""):
+        group = session_group(replaced_meta) if replaced_meta else None
+    elif group not in SESSION_GROUPS:
+        raise ValueError("unknown group")
     require_unlock_if_outside_sandbox(location)
     # A drives-capable ssh machine's Claude preset (winbox-a/winbox-b, never
     # linuxbox -- see SSH_MACHINES' own "drives" field) also takes a cwd, from
@@ -4384,6 +4392,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
         # actually asked for, not just what took effect.
         "skip_permissions": bool(skip_permissions),
         "archived": False,
+        "group": group,
     }
     save_meta(session_id, meta)
 
@@ -5254,6 +5263,24 @@ def rename_session(session_id, label):
     meta["label"] = label
     save_meta(session_id, meta)
     return meta
+
+
+# List sections other than the ordinary one (the deployment notes). "digest":
+# the Email sessions the mailbox digest page opens for one of its items.
+SESSION_GROUPS = {"digest"}
+
+
+def session_group(meta):
+    """meta["group"], or for sessions from before it was recorded, "digest"
+    when an Email session sits in the digest folder under a "digest: " label
+    (how the digest page has always named them)."""
+    group = meta.get("group")
+    if group in SESSION_GROUPS:
+        return group
+    if (meta.get("preset") in MAIL_PRESETS and str(meta.get("label", "")).startswith("digest: ")
+            and str(meta.get("cwd") or "").rstrip("/").endswith("/digest")):
+        return "digest"
+    return None
 
 
 def archive_session(session_id, archived):
@@ -9439,6 +9466,7 @@ class Handler(BaseHTTPRequestHandler):
                     skip_permissions=body.get("skip_permissions", True),
                     cols=body.get("cols"), rows=body.get("rows"),
                     replace_session=body.get("replace_session"),
+                    group=body.get("group"),
                 )
             except UnlockRequired as e:
                 return self._unlock_required(e)
