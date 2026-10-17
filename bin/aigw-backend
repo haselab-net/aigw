@@ -1563,6 +1563,45 @@ def list_root_tmux_sessions():
     return {line for line in r.stdout.splitlines() if line and line != CTL_SESSION}
 
 
+# On an ssh:<machine> every aigw user shares one remote account and so one
+# tmux server, and anyone's sessions show up in everyone's "既存のtmux
+# セッション" (the deployment notes). aigw writes the creating user's name
+# into this session option so the others see whose it is, and an adopt of
+# someone else's session is read-only.
+TMUX_OWNER_OPTION = "@aigw_owner"
+
+
+def tag_tmux_owner(location, tmux_name):
+    """Record this backend's user as the owner of an ssh:<machine> session
+    it created. Best effort: an untagged session just shows no owner."""
+    if not location.startswith("ssh:"):
+        return
+    try:
+        tmux_exec(location, ["set-option", "-t", tmux_name, TMUX_OWNER_OPTION, getpass.getuser()])
+    except Exception:
+        pass
+
+
+def list_ssh_tmux_owners(location):
+    """{name: owner or None} for the live sessions on an ssh:<machine> --
+    list_ssh_tmux_sessions plus each one's TMUX_OWNER_OPTION."""
+    try:
+        # A space, not a tab: tmux prints a control character in -F output
+        # as "_" ("_aigw-ctl" came back as "_aigw-ctl_"). Owners (user
+        # names) never contain one, so the last space splits.
+        r = tmux_query(location, ["list-sessions", "-F", "#S #{" + TMUX_OWNER_OPTION + "}"])
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if r.returncode != 0:
+        return {}
+    out = {}
+    for line in r.stdout.splitlines():
+        name, _, owner = line.rpartition(" ")
+        if name and name != CTL_SESSION:
+            out[name] = owner.strip() or None
+    return out
+
+
 def list_ssh_tmux_sessions(location):
     """Like list_host_tmux_sessions, but for a `ssh:<machine>` location --
     live tmux session names on that machine, or empty if unreachable."""
@@ -2354,11 +2393,11 @@ def list_untracked_tmux_sessions():
     # ~2s of client startup on top of that), so probing SSH_MACHINES in
     # sequence adds their costs instead of taking the slowest one. See
     # the deployment notes.
-    ssh_names = {}  # machine -> sorted names, or [] if unreachable
+    ssh_names = {}  # machine -> {name: owner or None}, or {} if unreachable
 
     def _probe(machine):
         location = f"ssh:{machine}"
-        ssh_names[machine] = sorted(list_ssh_tmux_sessions(location)) if ssh_reachable(machine) else []
+        ssh_names[machine] = list_ssh_tmux_owners(location) if ssh_reachable(machine) else {}
 
     threads = [threading.Thread(target=_probe, args=(machine,)) for machine in SSH_MACHINES]
     for t in threads:
@@ -2367,9 +2406,10 @@ def list_untracked_tmux_sessions():
         t.join()
     for machine in SSH_MACHINES:
         location = f"ssh:{machine}"
-        for name in ssh_names[machine]:
+        for name, owner in sorted(ssh_names[machine].items()):
             if (location, name) not in tracked:
-                result.append({"name": name, "location": location})
+                result.append({"name": name, "location": location, "owner": owner,
+                               "read_only": bool(owner) and owner != getpass.getuser()})
     return result
 
 
@@ -2510,6 +2550,8 @@ def adopt_session(tmux_name, location, label, cols=None, rows=None):
         raise ValueError("invalid tmux session name")
     if tmux_name not in (live_tmux_names(location) or ()):
         raise ValueError("no such live tmux session")
+    owner = list_ssh_tmux_owners(location).get(tmux_name) if location.startswith("ssh:") else None
+    read_only = bool(owner) and owner != getpass.getuser()
     session_id = uuid.uuid4().hex[:12]
     sdir = session_dir(session_id)
     (sdir / "outbox").mkdir(parents=True)
@@ -2526,9 +2568,12 @@ def adopt_session(tmux_name, location, label, cols=None, rows=None):
         "ended_ts": None,
         "claude_session_id": None,
         "archived": False,
+        # Someone else's ssh:<machine> session: watch only (the deployment notes).
+        "read_only": read_only,
+        "remote_owner": owner,
     }
     save_meta(session_id, meta)
-    if cols is not None or rows is not None:
+    if (cols is not None or rows is not None) and not read_only:
         resize_session(session_id, cols, rows)
     ensure_watcher(session_id)
     meta["alive"] = True
@@ -4556,6 +4601,7 @@ def create_session(preset, label, cwd=None, resume=None, skip_permissions=True, 
     # exactly the same role there (see the deployment notes for why
     # these run real MSYS2 tmux rather than psmux, tried first).
     r = tmux_exec(location, ["new-session", "-d", "-s", session_id, "-x", width, "-y", height, *start_dir, "--", "cat"])
+    tag_tmux_owner(location, session_id)
     if r.returncode != 0 and location.startswith("ssh:"):
         # A cold MSYS2/Cygwin tmux-server fork can still be starting up well
         # past tmux_exec's own extended timeout for this call (measured
@@ -5156,9 +5202,14 @@ def stop_session(session_id):
         # container), so this is the only place in this function that ever
         # touches a location other than "container".
         require_unlock_if_outside_sandbox(location)
-        if meta and not meta.get("stopped"):
-            _graceful_claude_exit(location, tmux_name, meta.get("preset"))
-        tmux_exec(location, ["kill-session", "-t", tmux_name])
+        if meta and meta.get("read_only"):
+            # Someone else's session, only watched (the deployment notes):
+            # stop watching, leave their pane alone.
+            pass
+        else:
+            if meta and not meta.get("stopped"):
+                _graceful_claude_exit(location, tmux_name, meta.get("preset"))
+            tmux_exec(location, ["kill-session", "-t", tmux_name])
     meta = load_meta(session_id)
     if meta and meta.get("stopped"):
         # The watcher already saw the pane end (Claude exited on the Ctrl+C
@@ -6323,6 +6374,11 @@ def ensure_watcher(session_id):
     # outbox-watching applies to them, which _watch_session still handles.
     # Everything else is a real tmux pane ("shell" or an adopted "attach"
     # session alike), watched the same way via capture-pane polling.
+    if meta and meta.get("preset") != "attach":
+        # Sessions created before owners were recorded get theirs now
+        # (the deployment notes); a no-op off ssh:<machine>.
+        threading.Thread(target=tag_tmux_owner, daemon=True,
+                         args=(meta.get("tmux_location", "container"), meta.get("tmux_name", session_id))).start()
     headless = meta and meta.get("preset") in HEADLESS_PRESETS
     target = _watch_session if headless else _watch_tmux_session
     t = threading.Thread(target=target, args=(session_id,), daemon=True)
@@ -9456,6 +9512,11 @@ class Handler(BaseHTTPRequestHandler):
         # (the deployment notes).
         if on_behalf_of is not None and _share_mode_of(parts[1], on_behalf_of) != "write":
             return self._json(403, {"error": "this session is shared read-only"})
+        # Someone else's ssh:<machine> session adopted to watch
+        # (the deployment notes): nothing typed or resized reaches it.
+        if (len(parts) == 3 and parts[0] == "sessions" and parts[2] in ("messages", "keys", "resize")
+                and SESSION_ID_RE.match(parts[1]) and (load_meta(parts[1]) or {}).get("read_only")):
+            return self._json(403, {"error": "this session is someone else's, read-only"})
 
         if parts == ["sessions"]:
             body = self._read_json_body()

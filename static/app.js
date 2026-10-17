@@ -3187,16 +3187,19 @@
     const { sessions } = await api("/tmux-sessions").catch(() => ({ sessions: [] }));
     tmuxSessionsEl.innerHTML = "";
     const machineOf = (location) => (location.startsWith("ssh:") ? location.slice(4) : "local");
-    for (const { name, location } of sessions.filter((s) => machineOf(s.location) === currentMachine)) {
+    for (const { name, location, owner, read_only: readOnly } of sessions.filter((s) => machineOf(s.location) === currentMachine)) {
       const row = document.createElement("div");
       row.className = "tmux-row";
       const nameEl = document.createElement("span");
       nameEl.className = "name";
-      nameEl.textContent = `${name} (${locationLabel(location)})`;
+      // Whose it is on a machine every aigw user shares (the deployment notes);
+      // someone else's can only be watched.
+      const who = owner ? ` · ${t("{owner}さん", { owner })}` : "";
+      nameEl.textContent = `${name} (${locationLabel(location)})${who}`;
       row.appendChild(nameEl);
 
       const btn = document.createElement("button");
-      btn.textContent = t("接続");
+      btn.textContent = readOnly ? t("見る") : t("接続");
       btn.addEventListener("click", () => adoptSession(name, location));
       row.appendChild(btn);
 
@@ -3530,9 +3533,12 @@
     currentOwner = meta.owner || null;
     chatLabelEl.textContent = screenBadge(meta) + meta.label;
     currentShareMode = currentOwner ? (meta.share_mode || "write") : null;
-    const readOnly = currentShareMode === "read";
+    // Read-only: a session shared read-only, or someone else's session on a
+    // shared ssh:<machine> adopted only to watch (the deployment notes).
+    const readOnly = currentShareMode === "read" || !!meta.read_only;
     chatOwnerBadgeEl.textContent = currentOwner
-      ? (readOnly ? t("{owner}さんの共有ログ(閲覧のみ)", { owner: currentOwner }) : t("{owner}さんと共有中", { owner: currentOwner })) : "";
+      ? (readOnly ? t("{owner}さんの共有ログ(閲覧のみ)", { owner: currentOwner }) : t("{owner}さんと共有中", { owner: currentOwner }))
+      : meta.read_only ? t("{owner}さんのセッション(見るだけ)", { owner: meta.remote_owner || "?" }) : "";
     // The panel itself is now always reachable (2026-08-28): it also holds
     // 💾 save, which a shared viewer needs too. The sharing *management*
     // controls rendered inside stay owner-only (renderSharePane checks
@@ -3560,7 +3566,9 @@
     // neither applies to the headless preset.
     const hasPane = !HEADLESS_PRESETS.includes(meta.preset) && !readOnly;
     keyToolbarEl.classList.toggle("visible", hasPane);
-    screenBtn.style.display = hasPane ? "" : "none";
+    // Watching someone else's pane is what the screen panel is for; a
+    // read-only share is the chat log only (the deployment notes).
+    screenBtn.style.display = hasPane || meta.read_only ? "" : "none";
     composerEl.style.display = readOnly ? "none" : "";
     // "Type without submitting" needs somewhere for the characters to sit
     // between calls, which only a real pane has -- a headless turn is a whole
