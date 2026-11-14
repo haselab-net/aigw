@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aigw 教程 用 Docker 试用</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5b6575; --line: #dde2ea; --card: #f5f7fa;
+    --accent: #2f6fdf; --accent-soft: #e6eefc; --warn: #a15c00; --warn-soft: #fff4e0;
+    --code-bg: #eef1f5; --shot-border: #c9d0da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151b; --fg: #e4e8ee; --muted: #9aa5b4; --line: #2a313b; --card: #182029;
+      --accent: #6f9ff5; --accent-soft: #1d2b44; --warn: #f0b35a; --warn-soft: #33270f;
+      --code-bg: #1d2530; --shot-border: #343d49;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.75 system-ui, -apple-system, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 1.9rem; line-height: 1.3; margin: 8px 0 4px; }
+  h2 { font-size: 1.4rem; margin: 56px 0 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; margin: 28px 0 8px; }
+  h4 { font-size: 1rem; margin: 20px 0 6px; }
+  p, li { max-width: 72ch; }
+  a { color: var(--accent); }
+  code, kbd, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 6px; background: var(--card); }
+  .lead { color: var(--muted); margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: .95rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .scroll { overflow-x: auto; }
+  .note { background: var(--accent-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn { background: var(--warn-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn strong { color: var(--warn); }
+  nav.toc { background: var(--card); border-radius: 10px; padding: 12px 18px; margin: 20px 0; }
+  nav.toc ol { margin: 4px 0; padding-left: 1.4em; }
+  .shot { display: flex; gap: 20px; align-items: flex-start; margin: 16px 0; flex-wrap: wrap; }
+  .shot figure { margin: 0; flex: 0 0 auto; }
+  .shot img { width: 260px; max-width: 100%; border: 1px solid var(--shot-border); border-radius: 14px; display: block; }
+  .shot figcaption { font-size: .85rem; color: var(--muted); margin-top: 4px; max-width: 260px; }
+  .shot .side { flex: 1 1 280px; min-width: 0; }
+  ol.steps > li { margin-bottom: 6px; }
+  .diagram { margin: 16px 0; }
+  .diagram svg { width: 100%; height: auto; display: block; }
+  .diagram svg text { fill: var(--fg); font-family: inherit; }
+  .diagram .q { fill: var(--muted); }
+  .diagram .box { fill: none; stroke: var(--muted); stroke-width: 1.25; }
+  .diagram .acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+  .diagram .wrn { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+  .diagram .ln { stroke: var(--muted); stroke-width: 1.25; fill: none; }
+  .diagram .mk { fill: var(--muted); }
+  .badge { display: inline-block; font-size: .8rem; padding: 0 8px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
+  footer { margin-top: 64px; color: var(--muted); font-size: .85rem; }
+  .editions { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+  .editions a { display: inline-block; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); text-decoration: none; background: var(--card); }
+  .editions a.here { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .langs { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; font-size: .85rem; margin: 0 0 4px; }
+  .langs a { padding: 2px 10px; border-radius: 999px; text-decoration: none; border: 1px solid transparent; }
+  .langs a.here { border-color: var(--line); background: var(--card); color: var(--fg); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>aigw 教程 用 Docker 试用</h1>
+<nav class="langs" aria-label="Language"><a href="../docker.html" lang="ja">日本語</a><a href="../en/docker.html" lang="en">English</a><a href="docker.html" lang="zh-CN" class="here" aria-current="page">简体中文</a></nav>
+<div class="editions"><a href="index.html">入口</a><a href="docker.html" class="here">用 Docker 试用</a><a href="basic.html">基础篇</a><a href="advanced.html">进阶篇</a></div>
+
+<p class="lead">在自己的电脑（或自己管理的服务器）上，用一个 Docker 容器运行并试用 aigw 的步骤。不需要服务器管理员，大约 15 分钟就能在浏览器里用上 Shell 和 Claude Code 会话。</p>
+
+<p>基础篇和进阶篇面向管理员搭建的正式服务器（用 Google 登录，每个用户有自己的容器）。这个演示是“在本地运行一人份 aigw”的临时构成，有些功能无法使用（<a href="#limits">第 8 章</a>）。</p>
+
+<nav class="toc">
+<strong>目录</strong>
+<ol>
+  <li><a href="#need">需要准备的东西</a></li>
+  <li><a href="#build">获取代码并构建镜像</a></li>
+  <li><a href="#run">启动</a></li>
+  <li><a href="#login">打开并登录</a></li>
+  <li><a href="#shell">使用 Shell 会话</a></li>
+  <li><a href="#claude">使用 Claude Code</a></li>
+  <li><a href="#stop">停止、删除与数据存放位置</a></li>
+  <li><a href="#limits">演示中不能做的事</a></li>
+  <li><a href="#next">接下来读什么</a></li>
+</ol>
+</nav>
+
+<!-- ===================================================================== -->
+<h2 id="need">1. 需要准备的东西</h2>
+<ul>
+  <li><strong>Docker</strong>：Windows、Mac 用 Docker Desktop，Linux 用 Docker Engine。能运行 <code>docker run hello-world</code> 就可以。</li>
+  <li><strong>git</strong>（用于获取仓库；下载 ZIP 也可以）。</li>
+  <li><strong>浏览器</strong>：Chrome、Edge、Firefox。<strong>Safari 无法登录</strong>（<a href="#login">第 4 章</a>）。</li>
+  <li>约 3 GB 的磁盘空间（构建完成的含 Claude Code 的镜像约 940 MB，但构建过程中基础镜像和中间层也会占用空间）。</li>
+  <li>如果使用 Claude Code，需要 Claude 账号（Pro、Max 等套餐，或 API 密钥）。只用 Shell 则不需要。</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="build">2. 获取代码并构建镜像</h2>
+<pre><code>git clone https://github.com/haselab-net/aigw.git
+cd aigw
+docker build -f docker/Dockerfile -t aigw-demo .</code></pre>
+<p>需要几分钟（安装 Debian、Python、tmux 以及 Claude Code 的原生版本）。不需要 Claude Code 的话，用 <code>docker build --build-arg WITH_CLAUDE=0 -f docker/Dockerfile -t aigw-demo .</code> 可以构建得更小更快。</p>
+
+<!-- ===================================================================== -->
+<h2 id="run">3. 启动</h2>
+<pre><code>docker run -d --name aigw-demo -p 127.0.0.1:8878:8878 -v aigw-demo-home:/home/demo aigw-demo</code></pre>
+<div class="scroll"><table>
+  <tr><th>参数</th><th>含义</th></tr>
+  <tr><td><code>-d --name aigw-demo</code></td><td>在后台运行，命名为 <code>aigw-demo</code></td></tr>
+  <tr><td><code>-p 127.0.0.1:8878:8878</code></td><td>只能从这台电脑上通过 <code>8878</code> 端口打开。<strong>请不要去掉 <code>127.0.0.1:</code></strong>（去掉后，同一网络中的任何人都能进入演示）</td></tr>
+  <tr><td><code>-v aigw-demo-home:/home/demo</code></td><td>把演示用户的主目录（你的文件、Claude Code 的登录）放在 Docker 卷里，重建容器后也会保留</td></tr>
+</table></div>
+<p>如果 <code>8878</code> 端口已被占用，把左边的数字改掉，例如 <code>-p 127.0.0.1:18878:8878</code>，下面的 URL 也改用这个端口。</p>
+<div class="note"><strong>在远程服务器上运行时</strong>：不要对外开放端口，而是在自己的电脑上用 <code>ssh -L 8878:127.0.0.1:8878 &lt;服务器&gt;</code> 连接后，在本地浏览器中打开。</div>
+
+<!-- ===================================================================== -->
+<h2 id="login">4. 打开并登录</h2>
+<div class="shot">
+  <figure><img src="../img/21-docker-login.png" alt="演示的登录页面"><figcaption>登录前的页面</figcaption></figure>
+  <div class="side">
+    <ol class="steps">
+      <li>在浏览器中打开 <code>http://localhost:8878/agents/</code>。</li>
+      <li>点击“<strong>Log in as the demo user</strong>”，就会显示会话列表。</li>
+    </ol>
+    <div class="warn"><strong>演示没有 Google 登录。</strong>能打开这个页面的任何人都会成为唯一的演示用户（<code>demo</code>），并能在容器中使用 Shell。请不要让不可信的人使用；在登录了演示的浏览器中，也不要一直开着不可信的网页。</div>
+    <p>只有用 <code>localhost</code> 或 <code>127.0.0.1</code> 地址打开时才能登录。想用其他名字打开时，在 <code>docker run</code> 中加上 <code>-e AIGW_DEMO_HOSTS=名字</code>。</p>
+    <p>Safari 在这种形式（http 的 localhost）下不接受登录的 Cookie，登录后也进不了列表。请使用 Chrome、Edge 或 Firefox。</p>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="shell">5. 使用 Shell 会话</h2>
+<div class="shot">
+  <figure><img src="img/22-docker-list.png" alt="会话列表"><figcaption>会话列表（创建了两个之后）</figcaption></figure>
+  <div class="side">
+    <ol class="steps">
+      <li>在最上面的选择框中选“<strong>Shell(沙箱内)</strong>”，输入名字（可以留空），点击“<strong>开始</strong>”。</li>
+      <li>列表中会多出这个会话。点击名字即可打开。</li>
+    </ol>
+    <p>列表中的 ✏️ 是改名，🔗 是与其他会话连接（会话连接，见进阶篇），🗄 是归档，🗑 是删除。会话在你停止之前会一直在容器中运行，关掉浏览器后也能接着看。</p>
+  </div>
+</div>
+<div class="shot">
+  <figure><img src="img/23-docker-shell.png" alt="Shell 会话"><figcaption>发送命令之后</figcaption></figure>
+  <div class="side">
+    <ol class="steps">
+      <li>在下方的输入框中写命令，点击“<strong>执行</strong>”（带 Enter 发送）。“发送”只发送文字，不带 Enter。</li>
+      <li>你发送的内容显示在右边，终端的输出显示在左边，就像聊天一样。</li>
+      <li>输入框上方的 <kbd>Ctrl</kbd>、<kbd>Alt</kbd>、方向键等按钮，在手机上也能发送特殊按键（例如先按 <kbd>Ctrl</kbd> 再按 <kbd>C</kbd>）。</li>
+      <li>上方的 🖥️ 可以查看终端画面本身。</li>
+    </ol>
+    <p>Shell 以 <code>demo</code> 身份在容器中运行，主目录是 <code>/home/demo/sandhome</code>（代替正式服务器上的“自己专属的容器”）。</p>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="claude">6. 使用 Claude Code</h2>
+<div class="shot">
+  <figure><img src="img/24-docker-claude.png" alt="Claude Code 的初始画面"><figcaption>第一次启动的 Claude Code（用 🖥️ 打开了画面）</figcaption></figure>
+  <div class="side">
+    <ol class="steps">
+      <li>在最上面的选择框中选“<strong>Claude</strong>”，点击“<strong>开始</strong>”。下面的 📁 一行可以选择工作文件夹（<code>sandhome</code> 之下）。</li>
+      <li>打开会话，用上方的 🖥️ 显示画面。<strong>仅第一次</strong>，Claude Code 会要求进行设置：
+        <ul>
+          <li>选择文字风格：用输入框上方的 <kbd>↑</kbd> <kbd>↓</kbd> 移动，在输入框为空时点“执行”确定。</li>
+          <li>选择登录方式后会显示一个 URL。在浏览器中打开它并登录，把显示的代码粘贴到输入框中，点“执行”。</li>
+        </ul>
+      </li>
+      <li>之后只要在聊天中写下指令并点“执行”即可。Claude Code 会在 <code>sandhome</code> 中创建文件、运行命令。</li>
+    </ol>
+    <p>登录信息保存在 <code>/home/demo</code> 下，只要加了 <code>-v aigw-demo-home:/home/demo</code>，重建容器后也会保留。</p>
+    <p>勾选“跳过权限确认”时，Claude Code 执行命令前不会每次都询问。它只在容器中操作；取消勾选则每次都会询问。</p>
+  </div>
+</div>
+<p>界面说明、按键输入、聊天与终端画面的关系，<a href="basic.html">基础篇</a>的第 2、3、5、6 章同样适用。</p>
+
+<!-- ===================================================================== -->
+<h2 id="stop">7. 停止、删除与数据存放位置</h2>
+<div class="scroll"><table>
+  <tr><th>想做的事</th><th>命令</th></tr>
+  <tr><td>停止 / 再次启动</td><td><code>docker stop aigw-demo</code> / <code>docker start aigw-demo</code></td></tr>
+  <tr><td>更新到新版本</td><td><code>git pull</code> 后，执行第 2 章的 <code>docker build</code>、<code>docker rm -f aigw-demo</code>、第 3 章的 <code>docker run</code></td></tr>
+  <tr><td>删除容器（保留数据）</td><td><code>docker rm -f aigw-demo</code></td></tr>
+  <tr><td>连数据一起删除</td><td>在上面的基础上再执行 <code>docker volume rm aigw-demo-home</code></td></tr>
+  <tr><td>进入容器</td><td><code>docker exec -it -u demo aigw-demo bash</code></td></tr>
+</table></div>
+<p>你创建的文件在 <code>/home/demo/sandhome</code>（卷 <code>aigw-demo-home</code> 中）。会话列表和记录也在 <code>/home/demo</code> 下，保留卷的话，下次启动时可以接着使用。重建容器后登录会失效，请再点一次“Log in as the demo user”。</p>
+
+<!-- ===================================================================== -->
+<h2 id="limits">8. 演示中不能做的事</h2>
+<div class="scroll"><table>
+  <tr><th>功能</th><th>在演示中</th></tr>
+  <tr><td>Google 登录、多个用户、自助注册</td><td>没有。只有一个用户 <code>demo</code></td></tr>
+  <tr><td>“Shell(沙箱外,主机)”、root Shell、通行密钥</td><td>不能使用（没有安装通行密钥解锁的机制）。即使显示按钮也会失败</td></tr>
+  <tr><td>Codex</td><td>镜像中没有</td></tr>
+  <tr><td>通过 ssh 连接的其他机器、Windows 机器黑板</td><td>没有配置，不会显示</td></tr>
+  <tr><td>手机通知（Web Push）</td><td>没有密钥，不会发送</td></tr>
+  <tr><td>共享</td><td>没有可共享的其他用户，实际上无法使用</td></tr>
+  <tr><td>按用户分隔的容器</td><td>没有。会话和后端在同一个容器中运行</td></tr>
+</table></div>
+<p>与正式构成的差别汇总在 <code>docker/README.md</code> 中。</p>
+
+<!-- ===================================================================== -->
+<h2 id="next">9. 接下来读什么</h2>
+<ul>
+  <li><a href="basic.html">基础篇</a>：界面说明、日常 AI 编程、按键输入、终端画面与聊天（第 1 章创建账号和第 4 章共享不适用于演示）。</li>
+  <li><a href="advanced.html">进阶篇</a>：文件夹、等待确认与巡览、通知列表、会话连接等（主机、root、通行密钥、其他机器在演示中不能使用）。</li>
+  <li>要按正式构成运行，请看仓库 <code>README.md</code> 中的“導入時に必要な設定”（安装设置）。</li>
+</ul>
+
+<footer>aigw 教程 用 Docker 试用 · 2026-11-14 · 截图按手机宽度拍摄，运行的是本演示（<code>docker/</code>）</footer>
+</div>
+</body>
+</html>

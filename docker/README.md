@@ -1,7 +1,7 @@
 # Docker で試す(デモ)
 
 aigw のゲートウェイ・1人分のバックエンド・PWA を、コンテナ1つで動かす。手元のブラウザ(PCでもスマホの開発者表示でも)で、
-セッション一覧・チャット画面・ターミナル画面・Claude Code のセッションを試せる。**試すためのもので、本番の構成ではない。**
+セッション一覧・チャット画面・ターミナル画面・Claude Code のセッションを試せる。**試すためのもので、本番の構成ではない。** 画面写真付きの手順は`docs/tutorial/docker.html`(GitHub Pages では https://haselab-net.github.io/aigw/tutorial/docker.html )。
 
 ```sh
 # リポジトリの一番上で

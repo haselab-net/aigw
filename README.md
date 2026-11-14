@@ -9,7 +9,7 @@
 開閉するデーモン」と「1ユーザー1プロセスのバックエンドへ、systemdの
 ソケットアクティベーションで振り分けるプロキシ」を備えている。
 
-**使い方のチュートリアル**(画面写真付き、利用者向け): [基本編](docs/tutorial/basic.html)・[発展編](docs/tutorial/advanced.html)([入口](docs/tutorial/index.html))。英語版 [docs/tutorial/en/](docs/tutorial/en/index.html)・簡体中文版 [docs/tutorial/zh/](docs/tutorial/zh/index.html) もあり、各ページの右上で切り替えられる — GitHub Pages では https://haselab-net.github.io/aigw/tutorial/
+**使い方のチュートリアル**(画面写真付き、利用者向け): [Docker で試す](docs/tutorial/docker.html)(自分の PC で動かす。サーバーが無くてもよい)・[基本編](docs/tutorial/basic.html)・[発展編](docs/tutorial/advanced.html)([入口](docs/tutorial/index.html))。英語版 [docs/tutorial/en/](docs/tutorial/en/index.html)・簡体中文版 [docs/tutorial/zh/](docs/tutorial/zh/index.html) もあり、各ページの右上で切り替えられる — GitHub Pages では https://haselab-net.github.io/aigw/tutorial/
 
 **主な機能**(利用者から見たもの): セッション一覧とチャット画面、ターミナル画面の表示とソフトキーボード、続きからの再開、
 フォルダ(入れ子・作業フォルダ・アーカイブの中も同じ形)、確認待ちと巡回、通知の一覧、共有(1件ずつ・フォルダごと、閲覧のみ/共同作業)、
@@ -41,6 +41,8 @@ docker build -f docker/Dockerfile -t aigw-demo .
 docker run -d --name aigw-demo -p 127.0.0.1:8878:8878 -v aigw-demo-home:/home/demo aigw-demo
 # http://localhost:8878/agents/ を開く。詳しくは docker/README.md
 ```
+
+画面写真付きの手順はチュートリアルの[Docker で試す](docs/tutorial/docker.html)(English・简体中文あり)。
 
 ## このリポジトリについて
 
