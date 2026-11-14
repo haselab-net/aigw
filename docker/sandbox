@@ -1,0 +1,40 @@
+#!/bin/sh
+# Stand-in for the `sandbox` CLI that aigw-backend calls (README "外部依存"),
+# for the Docker demo only. A real deployment runs each user's commands in
+# that user's own container; here the demo container itself plays that part,
+# so "inside the container" is just this user, with HOME=$HOME/sandhome the
+# way the real CLI sets it (aigw-backend's SANDHOME).
+#
+#   sandbox [--stdin] [--claude] [--fg] exec -- CMD...   run CMD here
+#   sandbox ip [--box NAME]                              print 127.0.0.1
+# Anything else is not supported by the demo and fails.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --stdin|--claude|--fg|-r|--root) shift ;;
+    *) break ;;
+  esac
+done
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  exec)
+    [ "${1:-}" = "--" ] && shift
+    [ $# -gt 0 ] || { echo "sandbox exec: no command" >&2; exit 2; }
+    SANDHOME="${SANDHOME:-$HOME/sandhome}"
+    mkdir -p "$SANDHOME"
+    export HOME="$SANDHOME"
+    # The real container has its own tmux server; give "inside" its own socket
+    # directory so the backend's own (host-side) tmux does not see these panes.
+    export TMUX_TMPDIR="/tmp/aigw-sandbox-$(id -u)"
+    mkdir -p -m 700 "$TMUX_TMPDIR"
+    cd "$HOME"
+    exec "$@"
+    ;;
+  ip)
+    echo 127.0.0.1
+    ;;
+  *)
+    echo "sandbox: '$cmd' is not available in the aigw Docker demo" >&2
+    exit 2
+    ;;
+esac

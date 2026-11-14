@@ -90,6 +90,10 @@ def _load_public_host():
 PUBLIC_HOST = _load_public_host()
 REDIRECT_URI = f"https://{PUBLIC_HOST}/agents/oauth2callback"
 GATEWAY_PORT = 8878
+# Where to listen. Loopback behind a TLS-terminating reverse proxy in a real
+# deployment; the Docker demo (docker/) sets 0.0.0.0 inside its container and
+# publishes the port on the host's loopback only.
+GATEWAY_HOST = os.environ.get("AIGW_GATEWAY_HOST") or "127.0.0.1"
 
 SESSION_COOKIE = "aigw_session"
 OAUTH_STATE_COOKIE = "aigw_oauth_state"
@@ -1469,6 +1473,9 @@ class Handler(BaseHTTPRequestHandler):
     def _send_redirect(self, location, extra_headers=None):
         self.send_response(302)
         self.send_header("Location", location)
+        # No body: say so, or an HTTP/1.1 client that is not a browser (curl,
+        # the Docker demo's test) waits on the kept-alive connection for one.
+        self.send_header("Content-Length", "0")
         self._send_extra_headers(extra_headers)
         self.end_headers()
 
@@ -2215,8 +2222,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     load_extensions(EXT_DIR)
-    server = ThreadingHTTPServer(("127.0.0.1", GATEWAY_PORT), Handler)
-    log(f"listening on 127.0.0.1:{GATEWAY_PORT}")
+    server = ThreadingHTTPServer((GATEWAY_HOST, GATEWAY_PORT), Handler)
+    log(f"listening on {GATEWAY_HOST}:{GATEWAY_PORT}")
     server.serve_forever()
 
 

@@ -1318,7 +1318,10 @@ BACKEND_SOCKET_PATH = f"{BACKEND_SOCKET_DIR}/{getpass.getuser()}-backend.sock"
 # bridge cannot even do the one thing it used to be able to do here, trigger
 # a spurious push notification. Session content was never reachable.
 NOTIFY_PORT = 23000 + (os.getuid() - 1000)
-DOCKER0_ADDR = "172.17.0.1"
+# AIGW_NOTIFY_HOST: where that is when there is no docker0 between them --
+# the Docker demo (docker/), where the "container" is the demo container
+# itself and `sandbox ip` answers 127.0.0.1.
+DOCKER0_ADDR = os.environ.get("AIGW_NOTIFY_HOST") or "172.17.0.1"
 
 # docker0 does not isolate containers from each other, so binding there means
 # every container on this host can reach this port, not just this user's own.

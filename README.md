@@ -33,6 +33,15 @@ tmux操作を行うバックエンド本体(`bin/aigw-backend`・`bin/aigw-gatew
 自体も公開し、Linux/Windows(MSYS2等)で動く形にする計画があるが、
 現時点では未着手。
 
+**Docker で試す**: その代わりを仮に用意したデモが`docker/`にある。ゲートウェイ・1人分のバックエンド・PWA をコンテナ1つで動かし、
+手元のブラウザでセッション一覧・チャット画面・シェルと Claude Code のセッションを試せる(Google ログインやパスキーは無い)。
+
+```sh
+docker build -f docker/Dockerfile -t aigw-demo .
+docker run -d --name aigw-demo -p 127.0.0.1:8878:8878 -v aigw-demo-home:/home/demo aigw-demo
+# http://localhost:8878/agents/ を開く。詳しくは docker/README.md
+```
+
 ## このリポジトリについて
 
 **このリポジトリは、実際に稼働しているホスト上のツリーからの
@@ -74,6 +83,7 @@ tmux操作を行うバックエンド本体(`bin/aigw-backend`・`bin/aigw-gatew
 | `static/index.html`・`static/app.js`・`static/manifest.json`・`static/sw.js` | モバイル向けPWAのコアフロントエンド(セッション一覧・チャット画面・tmuxペインの表示/操作・共有・検索)。バックエンドAPI(未公開)への依存はあるが、コード自体にサーバー固有の情報は無い。 |
 | `static/i18n.js` | 表示言語(日本語・English・简体中文)。日本語の原文をキーにした辞書と`t()`、静的なHTMLを一度だけ訳す`apply()`。選んだ言語はブラウザ(localStorage)とユーザーごとのバックエンド(`GET/POST /prefs`)に保存する。チャットの中身は訳さない。 |
 | `static/outbox-browse.html` | チャットに置かれたフォルダの中を見るページ。 |
+| `docker/` | Docker で試すデモ(上の「Docker で試す」)。`Dockerfile`・起動スクリプト・`sandbox`の仮の代わり・デモのログインの拡張・通しのテスト`test.sh`。説明は`docker/README.md`。 |
 
 ### フロントエンドの拡張ポイント
 
@@ -339,9 +349,8 @@ ConsoleでOAuth 2.0クライアントID(種別: ウェブアプリケーショ�
 - **コンテナ実行基盤(`sandbox`)が無い**: `shell`/`claude-tui`/`claude`の
   各プリセットはコンテナ内でコマンドを実行する外部CLIに依存しており
   (前述「外部依存」)、これが無いままではセッション作成自体が失敗する。
-  このリポジトリのコードだけで最小限に動作確認したい場合、`sandbox`の
-  代わりに素のローカルシェル/tmuxを直接使う経路への差し替えが必要になる
-  (未実装)。
+  動作を確かめるだけなら`docker/`のデモを使う(`docker/sandbox`が、そのコンテナの中で
+  利用者として実行する仮の代わりをする)。
 - **「Kill Chrome」ボタンは動かない**: `aigw-backend`のコードには、
   ヘッドフルChromeのデバッグセッションを止めるボタンの実装
   (`chromedbg-kill-own`をsudo経由で呼ぶ、`chrome-debug@<user>.service`を
