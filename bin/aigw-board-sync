@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""aigw-board-sync -- one Windows machines' blackboard for several aigw hosts
+(the deployment notes). Runs as root on the host that has the board, from a
+systemd timer every minute:
+
+    aigw-board-sync <feed host> ...
+
+For each feed host (a host whose /etc/aigw/board.json says
+{"role": "feed"}): fetch its backends' own entries (its BOARD_PATH) over ssh
+into BOARD_DIR/feed-<host>.json here, where every backend here merges them
+into the board; then leave a copy of the whole board on the feed host as
+BOARD_DIR/main-copy.json, which `aigw-board` inside its sessions shows.
+
+The ssh destination is the root ssh config's Host of that name (an admin
+account with sudo there). A host that cannot be reached is skipped; its
+feed file keeps its old time, and the board says how long it has been.
+"""
+import grp
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+BOARD_DIR = "/var/lib/aigw-board"
+BOARD_PATH = os.path.join(BOARD_DIR, "board.json")
+GROUP = "sandboxusers"
+SSH_MACHINES = "/etc/aigw/ssh_machines.json"
+FEED_STALE = 15 * 60
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+
+def write(path, data):
+    fd, tmp = tempfile.mkstemp(dir=BOARD_DIR, prefix=".sync.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.chown(tmp, 0, grp.getgrnam(GROUP).gr_gid)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
+
+
+def entries_of(raw):
+    d = json.loads(raw)
+    if not isinstance(d, dict) or not isinstance(d.get("entries"), list):
+        raise ValueError("not a board")
+    return [e for e in d["entries"] if isinstance(e, dict)]
+
+
+def machines():
+    try:
+        with open(SSH_MACHINES) as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [k for k, c in m.items() if c.get("drives") and not c.get("ssh_host")]
+
+
+def main(hosts):
+    rc = 0
+    for h in hosts:
+        try:
+            r = subprocess.run(SSH + [h, f"sudo -n cat {BOARD_PATH} 2>/dev/null || echo '{{\"entries\": []}}'"],
+                               capture_output=True, text=True, timeout=40)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip()[-200:])
+            write(os.path.join(BOARD_DIR, f"feed-{h}.json"), {"entries": entries_of(r.stdout), "at": time.time()})
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+            print(f"aigw-board-sync: {h}: {e}", file=sys.stderr)
+            rc = 1
+    # The whole board, as the backends here show it, for the feed hosts.
+    me = socket.gethostname().split(".")[0]
+    try:
+        with open(BOARD_PATH) as f:
+            entries = [dict(e, host=me) for e in entries_of(f.read())]
+    except (OSError, ValueError):
+        entries = []
+    feeds = {}
+    now = time.time()
+    for h in hosts:
+        p = os.path.join(BOARD_DIR, f"feed-{h}.json")
+        try:
+            at = os.stat(p).st_mtime
+            with open(p) as f:
+                es = entries_of(f.read())
+        except (OSError, ValueError):
+            continue
+        feeds[h] = {"at": at, "stale": now - at > FEED_STALE}
+        if not feeds[h]["stale"]:
+            entries += [dict(e, host=h) for e in es]
+    copy = json.dumps({"machines": machines(), "entries": entries, "feeds": feeds, "main": me, "at": now},
+                      ensure_ascii=False)
+    tmp = f"{BOARD_DIR}/.main-copy.new"
+    for h in hosts:
+        try:
+            r = subprocess.run(SSH + [h, f"sudo -n tee {tmp} >/dev/null && sudo -n chgrp {GROUP} {tmp} && "
+                                         f"sudo -n chmod 640 {tmp} && sudo -n mv {tmp} {BOARD_DIR}/main-copy.json"],
+                               input=copy, capture_output=True, text=True, timeout=40)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip()[-200:])
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+            print(f"aigw-board-sync: copy to {h}: {e}", file=sys.stderr)
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        sys.exit(0 if len(sys.argv) > 1 else 2)
+    sys.exit(main(sys.argv[1:]))

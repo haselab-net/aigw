@@ -1,0 +1,23 @@
+name: 不具合
+description: 期待と違う動き
+type: Bug
+projects: ["haselab-net/4"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 起きたこと
+      description: 何をしたら、何が起きたか(画面・ログがあれば)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待した動き
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 環境
+      description: 端末・ブラウザ・どのホストか・セッションの種類(claude-tui / Email など)

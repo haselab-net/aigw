@@ -1,0 +1,11 @@
+#!/bin/sh
+# Refuses a commit that changes aigw-backend (or the tests) while the
+# cross-user access tests fail (the deployment notes). Enabled per clone with:
+#   git config core.hooksPath .githooks
+files=$(git diff --cached --name-only) || exit 1
+printf '%s\n' "$files" | grep -qE '^(bin/aigw-backend|tests/)' || exit 0
+cd "$(git rev-parse --show-toplevel)" || exit 1
+out=$(python3 -m unittest discover -s tests -q 2>&1); rc=$?
+printf '%s\n' "$out" | grep -v '^\[aigw-backend\]'
+[ $rc -eq 0 ] || echo "pre-commit: aigw access tests failed, commit refused" >&2
+exit $rc

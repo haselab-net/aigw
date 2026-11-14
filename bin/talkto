@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""talkto "message" -- send a message to whichever aigw session (aigw
+workspace doc, `the deployment notes`) this one is currently linked to.
+
+Deliberately explicit, not automatic: aigw does not relay everything this
+session says, only what is passed to this command.
+
+Talks to the backend by appending one JSON line to $AIGW_TALKTO -- a file
+under this session's own directory, not a socket or a port, the same
+share-nothing-except-the-bind-mount trick $AIGW_OUTBOX already uses. Each
+line carries an "id"; the backend appends what became of it to
+talkto_status.jsonl next to that file, and this waits for it and says so
+(2026-10-28). It never talks over the network itself.
+
+Options (2026-10-28, after Claude kept running `talkto --help`, which used
+to send the literal text "--help" to the partner): -h/--help/-help prints
+the help and sends nothing; any other leading "-x" is an error, not a
+message (`--` ends the options); several words are joined with spaces;
+with no message argument (or "-"), the message is read from stdin.
+"""
+import json
+import os
+import secrets
+import sys
+import time
+
+WAIT_SECONDS = 12
+
+HELP = """\
+使い方: talkto [オプション] "相手に送る文"
+        talkto [オプション] <<'END'
+        複数行の文
+        END
+
+aigw の「セッション連携」でこのセッションとつながっている相手のセッション
+(別の Claude Code など)に、文を1つ送ります。送られるのは talkto に渡した文だけで、
+あなたの応答が自動で転送されることはありません。
+3つ以上つながっているときは、ほかの全員に届きます(相手には誰からかが付きます)。
+1人だけに送るときは --to にその名前(aigw の一覧の名前)を付けます。
+相手のセッションが止まっていても連携は残り、再開されればまた送れます。
+
+送ったあと、aigw が転送した結果を最大{wait}秒待って表示します:
+  届きました(…)            相手の入力欄に入った(終了コード 0)
+  つながっている相手がいない…  連携が無い、または切れている(終了コード 1)
+  …は止まっているので…      相手が止まっている。再開されればまた送れる(終了コード 1)
+  解錠が閉じている…          相手が sandbox の外で、解錠を待っている(終了コード 1)
+  まだ確認できません          時間内に結果が来なかった。あとで届くことがあるので、
+                             同じ文を送り直さないでください(終了コード 0)
+「届きました」は相手の入力欄に入ったところまでで、相手が返事をするかは分かりません。
+
+オプション:
+  -h, --help, -help   この説明を表示する(何も送らない)
+  --to 名前           つながっている相手のうち、その名前の1人だけに送る
+  --no-wait           結果を待たずに終わる
+  -                   文を標準入力から読む(文の引数が無いときも同じ)
+  --                  ここから後はオプションでなく文として扱う(- で始まる文を送るとき)
+
+文に ` や $ や引用符が入るときは、シェルに解釈されないよう、上の <<'END' の形か
+単一引用符 '...' で渡してください。引数が複数あれば空白でつないで1つの文にします。
+""".format(wait=WAIT_SECONDS)
+
+
+def usage_error(msg):
+    print(f"talkto: {msg}", file=sys.stderr)
+    print('使い方: talkto "相手に送る文"   (詳しくは talkto --help)', file=sys.stderr)
+    return 2
+
+
+def parse(argv):
+    """(text or None to read stdin, no_wait, to) or an int exit code."""
+    no_wait = False
+    to = None
+    words = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            words = argv[i + 1:]
+            break
+        if a in ("-h", "--help", "-help"):
+            print(HELP, end="")
+            return 0
+        if a == "--no-wait":
+            no_wait = True
+        elif a == "--to" or a.startswith("--to="):
+            if a == "--to":
+                if i + 1 >= len(argv):
+                    return usage_error("--to のあとに相手の名前がありません")
+                i += 1
+                to = argv[i]
+            else:
+                to = a[len("--to="):]
+            if not to.strip():
+                return usage_error("--to の名前が空です")
+        elif a == "-":
+            words = argv[i + 1:]
+            if words:
+                return usage_error("'-'(標準入力から読む)のあとに文は付けられません")
+            return None, no_wait, to
+        elif a.startswith("-") and len(a) > 1:
+            return usage_error(f"知らないオプションです: {a}('-' で始まる文は talkto -- \"{a}…\" で送れます)")
+        else:
+            words = argv[i:]
+            break
+        i += 1
+    return (" ".join(words) if words else None), no_wait, to
+
+
+def wait_for_status(status_path, item_id):
+    deadline = time.time() + WAIT_SECONDS
+    while time.time() < deadline:
+        try:
+            with open(status_path) as f:
+                for raw in f:
+                    try:
+                        obj = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("id") == item_id:
+                        return obj
+        except OSError:
+            pass
+        time.sleep(0.3)
+    return None
+
+
+def main():
+    parsed = parse(sys.argv[1:])
+    if isinstance(parsed, int):
+        return parsed
+    text, no_wait, to = parsed
+    path = os.environ.get("AIGW_TALKTO")
+    if not path:
+        print("talkto: $AIGW_TALKTO is not set -- this shell was not started by aigw, "
+              "or this preset does not support session links", file=sys.stderr)
+        return 1
+    if text is None:
+        if sys.stdin.isatty():
+            return usage_error("送る文がありません")
+        text = sys.stdin.read()
+    if not text.strip():
+        return usage_error("送る文が空です")
+    item_id = secrets.token_hex(8)
+    item = {"ts": time.time(), "id": item_id, "text": text}
+    if to:
+        item["to"] = to
+    line = json.dumps(item)
+    with open(path, "a") as f:
+        f.write(line + "\n")
+    if no_wait:
+        print("talkto: 送りました(結果は待っていません)")
+        return 0
+    st = wait_for_status(os.path.join(os.path.dirname(path), "talkto_status.jsonl"), item_id)
+    if st is None:
+        print("talkto: 受け付けましたが、届いたかはまだ確認できません。あとで届くことがあるので、"
+              "同じ文を送り直さないでください。")
+        return 0
+    print(f"talkto: {st.get('msg') or st.get('status')}")
+    return 0 if st.get("status") == "delivered" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

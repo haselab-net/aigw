@@ -1,0 +1,11 @@
+{
+ "items": [
+  {"id": "mail:18a0000000000001", "source": "mail", "time": "2026-11-01T09:00", "from": "佐藤", "title": "書類の確認のお願い", "summary": "書類の確認を頼まれた。", "action": "確認して返信", "status": "未決", "link": "https://mail.google.com/mail/u/?authuser=test@example.com#all/FAKE18a0000000000001", "byUser": true},
+  {"id": "mail:18a0000000000002", "source": "mail", "time": "2026-11-02T10:30", "from": "鈴木", "title": "打ち合わせの案内", "summary": "打ち合わせの日時の案内。", "action": "", "status": "未読", "link": "https://mail.google.com/mail/u/?authuser=test@example.com#all/FAKE18a0000000000002"},
+  {"id": "mail:18a0000000000003", "source": "mail", "time": "2026-11-03T08:00", "from": "例の会", "title": "[定形済] 定例会の日程", "summary": "[定形] カレンダーに追加した(定例会 11/20 10:00)。\n定例会の日程の連絡。", "action": "確認だけ", "status": "未読", "link": "https://mail.google.com/mail/u/?authuser=test@example.com#all/FAKE18a0000000000003"},
+  {"id": "mail:18a0000000000004", "source": "mail", "time": "2026-10-20T12:00", "from": "高橋", "title": "済んだ話", "summary": "返信済み。", "action": "", "status": "既決", "link": "https://mail.google.com/mail/u/?authuser=test@example.com#all/FAKE18a0000000000004", "synced": {"at": "2026-10-21T00:00:00.000Z", "how": "gmail.py archive"}},
+  {"id": "mail:18a0000000000005", "source": "mail", "time": "2026-11-04T11:00", "from": "伊藤", "title": "返事待ち", "summary": "資料を頼んだ。", "action": "", "status": "未決", "link": "", "byUser": true, "wait": {"cond": "伊藤さんから資料が届いたら", "task": "資料を読んで要点をまとめる", "set": "2026-11-04T12:00"}},
+  {"id": "misc:noaction", "source": "misc", "time": "2026-11-04T12:00", "from": "定期チェック", "title": "対応不要のまとめ", "summary": "11/04 12:00 [メール] 配信・通知: [配信元A](mail:18a00000000000a1)(お知らせ)", "action": "", "status": "未読", "link": "", "refs": ["mail:18a00000000000a1", "mail:18a00000000000a2"]}
+ ],
+ "runs": [{"at": "2026-11-04T12:00", "added": 3, "note": "テストの回"}]
+}

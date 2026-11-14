@@ -1,0 +1,13 @@
+[Unit]
+Description=aigw shared front-door (mobile AI control panel: OAuth login + PWA + per-user proxy fan-out)
+After=network.target
+
+[Service]
+Type=simple
+User=aigw
+ExecStart=/usr/local/sbin/aigw-gateway
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

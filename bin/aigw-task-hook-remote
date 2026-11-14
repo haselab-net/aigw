@@ -1,0 +1,41 @@
+#!/bin/bash
+# aigw-task-hook-remote -- the ssh:<machine> twin of aigw-task-hook
+# (the deployment notes, the deployment notes), installed on each SSH_MACHINES entry as
+# ~/.local/bin/aigw-task-hook and named in that machine's Claude Code
+# settings (~/.claude/settings.json: SessionStart -> "start", Stop and
+# Notification -> "event"). `aigw-task-hook-install <machine>` on the aigw
+# host puts both there.
+#
+# Does something only inside an aigw pane ($AIGW_TALKTO_ID, set by the
+# backend with `tmux respawn-pane -e`). Like talkto-remote it appends one
+# JSON line to $HOME/.aigw-talkto/<id>.jsonl, which the backend takes over
+# ssh: {"ts", "hook": "start"|"event", "pane": 0|1, "b64": <the hook's whole
+# input, base64>}. Plain bash + base64 for the same reason as talkto-remote:
+# on the Windows (MSYS2/Git Bash) machines there is no usable python3.
+# "pane": $TMUX_PANE is set -- this Claude runs in the aigw pane itself, not
+# in a background process of Claude Code's daemon.
+#
+# "start" also prints the status-line rule (stdout becomes context for
+# Claude). The rule below is filled in by aigw-task-hook-install from the
+# local aigw-task-hook's RULE, so the two never differ.
+#
+# Never fails: a hook that errors must not get in Claude's way.
+mode=${1:-}
+payload=$(cat 2>/dev/null)
+if [ -z "${AIGW_TALKTO_ID:-}" ]; then
+    exit 0
+fi
+if [ "$mode" = start ]; then
+    cat <<'AIGW_RULE_END'
+@RULE@
+AIGW_RULE_END
+fi
+case "$mode" in start|event) ;; *) exit 0 ;; esac
+case "$AIGW_TALKTO_ID" in *[!A-Za-z0-9_-]*|'') exit 0 ;; esac
+d="$HOME/.aigw-talkto"
+mkdir -p "$d" 2>/dev/null || exit 0
+pane=0
+[ -n "${TMUX_PANE:-}" ] && pane=1
+b64=$(printf '%s' "$payload" | base64 -w0 2>/dev/null) || b64=$(printf '%s' "$payload" | base64 | tr -d '\n')
+printf '{"ts":%s,"hook":"%s","pane":%s,"b64":"%s"}\n' "$(date +%s)" "$mode" "$pane" "$b64" >> "$d/$AIGW_TALKTO_ID.jsonl" 2>/dev/null
+exit 0

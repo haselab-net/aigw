@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""aigw-task-hook -- Claude Code hooks for aigw's to-do list (the deployment notes).
+
+Run from managed settings (the sandbox image's and the host's
+/etc/claude-code/managed-settings.json) for every Claude Code, but does
+something only inside an aigw session, i.e. when $AIGW_TALKTO is set -- so a
+`claude -p` run from cron or by hand is left alone.
+
+  aigw-task-hook start    SessionStart: print the status-line rule (stdout
+                          becomes context for Claude) and report the
+                          conversation (below)
+  aigw-task-hook event    Stop / Notification: append {"task": <the hook's
+                          input, trimmed>} as one line to $AIGW_TALKTO, which
+                          the aigw backend already watches (like talkto)
+
+Which conversation (the deployment notes, 2026-11-09): every line also carries
+the hook's session_id and transcript_path, and SessionStart appends
+{"conv": {...}} -- Claude Code changes the conversation id by itself (/clear,
+/resume, a fork, a conversation "moved to the background") and this is how
+the backend learns the new one instead of guessing from the files. With it:
+"pane" -- this Claude runs in the aigw pane itself ($TMUX_PANE; a background
+process started by Claude Code's daemon has none), and "nested" -- an
+ancestor process is another Claude (a `claude -p` run by Claude's own Bash
+tool inherits the pane's environment, but is not the pane's conversation).
+
+Never fails: a hook that errors must not get in Claude's way.
+"""
+import json
+import os
+import re
+import sys
+
+RULE = """aigw より(このセッションは aigw で動いていて、利用者は多くのセッションを一覧で見ています):
+返事を終えて利用者に番を返すときは、返事の最後の行に状態を1行だけ書いてください。
+  状態: 要判断 — 〈利用者が決めること・見ること〉
+  状態: 済み — 〈終わったこと〉
+  状態: 寝かせ 11/12 9:00 — 〈待つ理由〉
+- 質問・確認・選んでほしいこと・見てほしい結果があれば「要判断」。
+- 済みか寝かせかは「このまま何も起きなかったら、このセッションが動く必要があるか」で分ける。返信・依頼・送付をしただけで「済み」にしない。
+  - 返事が来なくてもよい(頼まれたことが全部終わって続きが無い) → 「済み」
+  - 返事や反映が無いままだと困る → 「寝かせ」。「いつまでに無ければ確かめるか」の日時(月/日、時刻は省略可)を付ける。
+    自然な期限が無ければ1週間後。
+- ボールは次に動くセッションだけが持つ。仕事を aigw の別のセッションに引き継いだ(talkto で届いた)なら、その先の待ちは相手のもの
+  → 「済み — 〈相手〉へ引き継ぎ」。相手がやったかを待たない。引き継がれた側はそれを自分の仕事として扱い、待つなら自分が寝かせにする。
+  結果を受けてこちらが続ける仕事があるなら、相手がそのとき知らせてくれるよう頼んでおけばよく、先回りして待たない。
+- 件名程度・40字まで。本文の中身・金額・個人情報は書かない(スマホの通知に出ます)。
+- 作業を続けている途中の返事には書かなくてよい。"""
+
+KEEP = ("hook_event_name", "notification_type", "message", "stop_hook_active", "session_id", "transcript_path", "source")
+TAIL = 1500  # the status line is the last line; keeps the write one small append
+
+
+SHELLS = {"sh", "bash", "dash", "zsh", "env", "timeout", "nice"}
+
+
+def _proc(pid):
+    """(comm, ppid, cmdline) of a process, or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            st = f.read().decode(errors="replace")
+        comm = st[st.index("(") + 1:st.rindex(")")]
+        ppid = int(st[st.rindex(")") + 2:].split()[1])
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read()
+        return comm, ppid, cmd
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _is_claude(comm, cmd):
+    return (comm == "claude" or re.fullmatch(r"\d+\.\d+\.\d+", comm) is not None
+            or (comm == "node" and b"claude" in cmd))
+
+
+def nested():
+    """True if the Claude that runs this hook was itself started under
+    another Claude (its Bash tool). The hook's parents up to the first one
+    that is not a shell are that Claude; above it, up to tmux, another
+    Claude means nested."""
+    pid, seen_claude, steps = os.getppid(), False, 0
+    while pid > 1 and steps < 40:
+        steps += 1
+        p = _proc(pid)
+        if p is None:
+            return False
+        comm, ppid, cmd = p
+        if comm.startswith("tmux"):
+            return False
+        if not seen_claude:
+            if comm not in SHELLS:
+                seen_claude = True
+        elif _is_claude(comm, cmd):
+            return True
+        pid = ppid
+    return False
+
+
+def conv_info(payload):
+    info = {k: payload[k] for k in ("session_id", "transcript_path", "source", "hook_event_name")
+            if isinstance(payload.get(k), str)}
+    info["pane"] = bool(os.environ.get("TMUX_PANE"))
+    info["nested"] = nested()
+    try:
+        info["size"] = os.path.getsize(payload["transcript_path"])
+    except (OSError, KeyError, TypeError):
+        pass
+    return info
+
+
+def append(talkto, obj):
+    line = (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+    fd = os.open(talkto, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def read_payload():
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def main():
+    talkto = os.environ.get("AIGW_TALKTO")
+    if not talkto:
+        return
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "start":
+        print(RULE)
+        sys.stdout.flush()
+        payload = read_payload()
+        if payload.get("session_id"):
+            append(talkto, {"conv": conv_info(payload)})
+        return
+    if mode != "event":
+        return
+    payload = read_payload()
+    if not payload:
+        return
+    task = {k: payload[k] for k in KEEP if k in payload}
+    task.update({k: v for k, v in conv_info(payload).items() if k in ("pane", "nested")})
+    last = payload.get("last_assistant_message")
+    if isinstance(last, str):
+        task["last_assistant_message"] = last[-TAIL:]
+    append(talkto, {"task": task})
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

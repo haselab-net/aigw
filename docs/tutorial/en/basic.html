@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aigw Tutorial: Basics</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5b6575; --line: #dde2ea; --card: #f5f7fa;
+    --accent: #2f6fdf; --accent-soft: #e6eefc; --warn: #a15c00; --warn-soft: #fff4e0;
+    --code-bg: #eef1f5; --shot-border: #c9d0da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151b; --fg: #e4e8ee; --muted: #9aa5b4; --line: #2a313b; --card: #182029;
+      --accent: #6f9ff5; --accent-soft: #1d2b44; --warn: #f0b35a; --warn-soft: #33270f;
+      --code-bg: #1d2530; --shot-border: #343d49;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.75 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 1.9rem; line-height: 1.3; margin: 8px 0 4px; }
+  h2 { font-size: 1.4rem; margin: 56px 0 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; margin: 28px 0 8px; }
+  h4 { font-size: 1rem; margin: 20px 0 6px; }
+  p, li { max-width: 72ch; }
+  a { color: var(--accent); }
+  code, kbd, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 6px; background: var(--card); }
+  .lead { color: var(--muted); margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: .95rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .scroll { overflow-x: auto; }
+  .note { background: var(--accent-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn { background: var(--warn-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn strong { color: var(--warn); }
+  nav.toc { background: var(--card); border-radius: 10px; padding: 12px 18px; margin: 20px 0; }
+  nav.toc ol { margin: 4px 0; padding-left: 1.4em; }
+  .shot { display: flex; gap: 20px; align-items: flex-start; margin: 16px 0; flex-wrap: wrap; }
+  .shot figure { margin: 0; flex: 0 0 auto; }
+  .shot img { width: 260px; max-width: 100%; border: 1px solid var(--shot-border); border-radius: 14px; display: block; }
+  .shot figcaption { font-size: .85rem; color: var(--muted); margin-top: 4px; max-width: 260px; }
+  .shot .side { flex: 1 1 280px; min-width: 0; }
+  ol.steps > li { margin-bottom: 6px; }
+  .diagram { margin: 16px 0; }
+  .diagram svg { width: 100%; height: auto; display: block; }
+  .diagram svg text { fill: var(--fg); font-family: inherit; }
+  .diagram .q { fill: var(--muted); }
+  .diagram .box { fill: none; stroke: var(--muted); stroke-width: 1.25; }
+  .diagram .acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+  .diagram .wrn { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+  .diagram .ln { stroke: var(--muted); stroke-width: 1.25; fill: none; }
+  .diagram .mk { fill: var(--muted); }
+  .badge { display: inline-block; font-size: .8rem; padding: 0 8px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
+  footer { margin-top: 64px; color: var(--muted); font-size: .85rem; }
+  .editions { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+  .editions a { display: inline-block; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); text-decoration: none; background: var(--card); }
+  .editions a.here { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .langs { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; font-size: .85rem; margin: 0 0 4px; }
+  .langs a { padding: 2px 10px; border-radius: 999px; text-decoration: none; border: 1px solid transparent; }
+  .langs a.here { border-color: var(--line); background: var(--card); color: var(--fg); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>aigw Tutorial: Basics</h1>
+<nav class="langs" aria-label="Language"><a href="../basic.html" lang="ja">日本語</a><a href="../en/basic.html" lang="en" class="here" aria-current="page">English</a><a href="../zh/basic.html" lang="zh-CN">简体中文</a></nav>
+<div class="editions"><a href="index.html">Start</a><a href="basic.html" class="here">Basics</a><a href="advanced.html">Advanced</a></div>
+<div class="note">The screenshots of the chat, terminal, settings and sharing screens show aigw in Japanese. aigw itself can be switched to English in Settings → Language.</div>
+
+<p class="lead">A guide to using AI agents on a server (Claude Code and others) from the browser on your phone or PC. Basics takes you from creating an account to doing everyday AI coding. The features installed differ a little from server to server, so ask your administrator about anything that is unclear.</p>
+
+<p>aigw is a chat-style screen that opens at <code>https://&lt;server&gt;/agents/</code>. Instructions you write in the chat go to Claude Code running in your own private container on the server, and its replies come back to the chat.</p>
+
+<nav class="toc">
+<strong>Contents</strong>
+<ol>
+  <li><a href="#account">Creating an account</a></li>
+  <li><a href="#screens">Finding your way around the screens</a></li>
+  <li><a href="#coding">Everyday AI coding</a></li>
+  <li><a href="#share">Sharing with others</a></li>
+  <li><a href="#keys">Key input</a></li>
+  <li><a href="#screen-vs-chat">How the terminal screen and the chat relate</a></li>
+  <li><a href="#faq">Troubleshooting</a></li>
+</ol>
+</nav>
+<p>Folders, patrol, notifications, passkeys, host and root shells, other machines and so on are covered in <a href="advanced.html">Advanced</a>.</p>
+
+<!-- ===================================================================== -->
+<h2 id="account">1. Creating an account</h2>
+
+<p>If you have a Google account in a domain the administrator has allowed, you can create your own account from the aigw screen (on servers where this feature is enabled). Otherwise, ask the administrator to create one for you.</p>
+
+<ol class="steps">
+  <li>Open <code>https://&lt;server&gt;/agents/</code> in your browser and, under “Sign in with Google”, choose <strong>an account in an allowed domain</strong>.</li>
+  <li>If you don’t have an account yet, a “Create account” form appears. Choose a <strong>username</strong> and submit it.
+    <ul>
+      <li>Allowed characters are lowercase letters, digits, <code>-</code> and <code>_</code>. It must start with a lowercase letter or <code>_</code>. Up to 32 characters.</li>
+      <li>You cannot change it yourself later.</li>
+    </ul>
+  </li>
+  <li>When you submit, <strong>your SSH private key is shown once and only once</strong>. Be sure to save it before closing the screen. It will never be shown again.</li>
+  <li>You can now use aigw. From next time on, just sign in with Google.</li>
+</ol>
+
+<h3>Setting up SSH access too (needed to register a passkey)</h3>
+<p>If you only use aigw, you don’t need SSH. However, <a href="advanced.html#passkey">registering a passkey for Email and the host shell</a> requires one SSH login, so it saves trouble to do it early. Follow whichever procedure matches your PC.</p>
+<div class="note">Some servers accept SSH only from inside the organization’s network. In that case, when connecting by SSH from outside, first get onto the internal network using the method your administrator provides. The aigw screen (in the browser) works from outside as is.</div>
+
+<h4>Mac, Linux, and MSYS2 on Windows (Git Bash works the same)</h4>
+<pre><code># On your PC: save the key you received and restrict its permissions
+mkdir -p ~/.ssh
+mv ~/Downloads/id_ed25519_&lt;username&gt; ~/.ssh/
+chmod 600 ~/.ssh/id_ed25519_&lt;username&gt;
+
+# First login. Right after logging in you are asked to set a password
+ssh -i ~/.ssh/id_ed25519_&lt;username&gt; &lt;username&gt;@&lt;server&gt;</code></pre>
+<p>In MSYS2, <code>~</code> is the MSYS2 home (e.g. <code>C:\msys64\home\&lt;name&gt;</code>), which is separate from the Windows home (<code>C:\Users\&lt;name&gt;</code>). Downloaded files are in <code>/c/Users/&lt;Windows name&gt;/Downloads/</code>. A key placed in MSYS2’s <code>~/.ssh</code> is not visible to PowerShell’s <code>ssh</code>.</p>
+
+<h4>Windows built-in OpenSSH (PowerShell)</h4>
+<p>Windows 10/11 comes with <code>ssh</code> (if it is missing, add “OpenSSH Client” under “Settings → System → Optional features”). Run the following in PowerShell. <code>chmod</code> is not available, so permissions are restricted with <code>icacls</code>.</p>
+<pre><code># Move the key to C:\Users\&lt;Windows name&gt;\.ssh\
+mkdir -Force $env:USERPROFILE\.ssh
+Move-Item $env:USERPROFILE\Downloads\id_ed25519_&lt;username&gt; $env:USERPROFILE\.ssh\
+$key = "$env:USERPROFILE\.ssh\id_ed25519_&lt;username&gt;"
+
+# Make it unreadable by anyone but you (cut inheritance, grant read to yourself only)
+icacls $key /inheritance:r
+icacls $key /grant:r "$($env:USERNAME):(R)"
+
+# First login. Right after logging in you are asked to set a password
+ssh -i $key &lt;username&gt;@&lt;server&gt;</code></pre>
+<p>If you are told “UNPROTECTED PRIVATE KEY FILE” or “bad permissions”, run the two <code>icacls</code> lines again. In PowerShell the <code>~</code> in <code>-i ~/.ssh/...</code> is sometimes not expanded, which is why <code>$env:USERPROFILE</code> is used here.</p>
+
+<p>Until you set it at this first login, your password cannot be used by anyone. From the second time on, you can log in with the same command.</p>
+
+<h4>Avoiding typing <code>-i</code> every time</h4>
+<p>Put the following in your config file and <code>ssh aigw</code> alone will log you in. The config file is <code>~/.ssh/config</code> on Mac, Linux and MSYS2, and <code>C:\Users\&lt;Windows name&gt;\.ssh\config</code> (no extension) with the Windows built-in one. In either case, <code>ssh</code> reads the <code>~</code> in <code>IdentityFile</code> as your home.</p>
+<pre><code>Host aigw
+    HostName &lt;server&gt;
+    User &lt;username&gt;
+    IdentityFile ~/.ssh/id_ed25519_&lt;username&gt;</code></pre>
+
+<div class="note">If you cannot log in to aigw with an account the administrator created for you, log in by SSH and run <code>aigw-set-email you@example.com</code> once. You can then log in with the Google account for that email address.</div>
+
+<!-- ===================================================================== -->
+<h2 id="screens">2. Finding your way around the screens</h2>
+
+<p>aigw has two screens: the “session list” and the “chat”. A session is one workplace that keeps running on the server (Claude Code or a shell).</p>
+
+<h3>Session list (top screen)</h3>
+<div class="shot">
+  <figure><img src="../img/01-top.png" alt="The aigw top screen. Machine selector and username at the top, below them the box for creating a new session, then the list of sessions"><figcaption>The top screen, with “Claude” selected in the creation box at the top</figcaption></figure>
+  <div class="side">
+    <table>
+      <tr><th>Where</th><th>What it means</th></tr>
+      <tr><td>The <code>server</code> selector</td><td>Which machine to run on (other machines connected over ssh, if any, are listed here). The <strong>Settings</strong> screen is also chosen here</td></tr>
+      <tr><td>Username</td><td>Tap to log out</td></tr>
+      <tr><td><code>Doc</code></td><td>A screen for reading the server’s documentation (not on every server)</td></tr>
+      <tr><td>🔍 📋 🔔</td><td>Chat search, the Windows machines board, the notification list (<a href="advanced.html">Advanced</a>)</td></tr>
+      <tr><td><code>⟳</code></td><td>Reload (swiping the top bar downward does the same)</td></tr>
+      <tr><td>🔑 / 🔓</td><td>Shows you are unlocked with a passkey. 🔑 is up to host, 🔓 is up to root. Tap to lock immediately</td></tr>
+      <tr><td>Creation box</td><td>Choose the kind, folder and name, then <strong>Start</strong></td></tr>
+      <tr><td>Icon before the name</td><td>The kind of session. 🛠️ sandbox (everyday Claude etc.), 📫 Email, 🏠 host, 🔒 root, 💻 another machine connected over ssh</td></tr>
+      <tr><td>📁 rows</td><td>Folders. Tap to open or close (<a href="advanced.html#folders">Advanced</a>)</td></tr>
+      <tr><td>● on each row</td><td>Green means running, grey means stopped. <strong>Tap a green one to stop it; tap a grey one with a blue ring to resume where it left off</strong> (both ask for confirmation)</td></tr>
+      <tr><td>⠿ ✏️ 🔗 🗄 🗑</td><td>Reorder · rename · link to another session · archive (only hides it from the list) · delete</td></tr>
+      <tr><td>👥 Shared logs</td><td>Sessions others have shared with you, in one folder per owner (<a href="#share">Chapter 4</a>)</td></tr>
+    </table>
+  </div>
+</div>
+
+<h3>Chat screen</h3>
+<div class="shot">
+  <figure><img src="../img/02-chat.png" alt="The chat screen. Back button and session name at the top, the conversation in the middle, the key row and input box at the bottom"><figcaption>Having Claude create hello.py</figcaption></figure>
+  <div class="side">
+    <table>
+      <tr><th>Where</th><th>What it means</th></tr>
+      <tr><td><code>←</code></td><td>Back to the list (you can also swipe the screen to the right). Long-press it to use it as a link that opens the list in another tab</td></tr>
+      <tr><td>● (left of the name)</td><td>Whether it is running. <strong>If green, tap to stop; if grey, tap to resume where it left off</strong> (asks for confirmation)</td></tr>
+      <tr><td>🖥️</td><td>Open or close the terminal screen (the screen panel). <a href="#screen-vs-chat">Chapter 6</a></td></tr>
+      <tr><td>🧑‍🤝‍🧑</td><td>Share this session with others (<a href="#share">Chapter 4</a>). Saving the conversation (💾) is in here too</td></tr>
+      <tr><td>Key row</td><td><kbd>Ctrl</kbd> <kbd>⇧</kbd> <kbd>Alt</kbd> <kbd>↑</kbd> <kbd>↓</kbd> … scrolls sideways, with 📎 (attach a file) at the right end. <a href="#keys">Chapter 5</a></td></tr>
+      <tr><td><strong>Send</strong> / <strong>Run</strong></td><td>Run adds Enter, Send does not. <a href="#keys">Chapter 5</a></td></tr>
+    </table>
+    <p>Tapping the chat’s name (right of 🛠️) opens the “patrol” bar for moving to the previous or next session (<a href="advanced.html#patrol">Advanced</a>). Sessions keep running even if you close the browser. Reopen one from the list and you can pick up right where it is. On a phone, if you “Add to Home Screen”, you get a notification when a reply arrives (on iPhone this is required).</p>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="coding">3. Everyday AI coding</h2>
+
+<p>Normally you just choose <strong>Claude</strong>, create a session, and give instructions in the chat. Claude creates files and runs commands inside your own private container (the sandbox).</p>
+
+<h3>Creating a session</h3>
+<ol class="steps">
+  <li>In the creation box, choose <strong>Claude</strong> as the kind.</li>
+  <li>Choose the working folder in the 📁 row. It starts at <code>sandhome</code> (your home inside the container).
+    <ul>
+      <li>Use “Open a subfolder…” to go down one level at a time, and <code>↑</code> to go up.</li>
+      <li><code>＋</code> creates a new folder where you are.</li>
+    </ul>
+  </li>
+  <li>Normally leave the ⏱ field at “New”. To continue an earlier conversation, choose it here (see “Picking up later” below).</li>
+  <li>You can normally leave “Skip permission prompts” on. Since this is inside the container, nothing outside is affected when Claude rewrites files.</li>
+  <li>Give it a name (optional) and press <strong>Start</strong>; the chat screen appears.</li>
+</ol>
+
+<h3>Giving instructions and getting results</h3>
+<ul>
+  <li>Write in the input box (Japanese is fine) and press <strong>Run</strong>. The return key on a phone keyboard does the same as Run (for a line break inside the input box, use Shift+Enter).</li>
+  <li>You can keep sending instructions while Claude is thinking.</li>
+  <li><strong>Handing over a file you have</strong>: choose it with 📎 or paste it into the input box. It is saved on the server and its path goes into the input box, so follow it with something like “Look at this file and…”. Up to 100MB per file.</li>
+  <li><strong>Having images or files shown to you</strong>: ask “show the resulting graph in the chat”, and Claude puts it in the designated place; an image or a download link appears in the chat. Tap a 3D model (.glb etc.) to open a viewer.</li>
+</ul>
+
+<h3>Picking up later</h3>
+<ul>
+  <li>Sessions keep running, so you can continue by opening them from the list. Archiving ones you aren’t using with 🗄 tidies up the list (view archived ones with “🗄 Open the archive” below the list, and bring them back with 📤).</li>
+  <li><strong>Stop</strong>: tap the green ● and confirm to stop it. Claude is sent <kbd>Ctrl</kbd>+<kbd>C</kbd> twice, the same as its usual way of quitting, so the conversation is saved (any command running in the background is stopped).</li>
+  <li><strong>Resume</strong>: tap the grey ● (with a blue ring) of a stopped session and confirm, and it resumes <strong>where it left off</strong> in the same folder. The same session simply continues, and the chat so far is kept. A session that was running Claude inside a shell also resumes from where Claude left off.</li>
+  <li>Even if you delete a session, the conversation remains. When creating a new one, choose the same folder and pick from the date and summary in the ⏱ field to resume where it left off.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="share">4. Sharing with others</h2>
+<div class="shot">
+  <figure><img src="../img/09-share.png" alt="The share panel. A button to save the conversation log, an explanation of read-only, selectors for who (Everyone) and type (Read-only), and a Share button"><figcaption>The share panel opened with 🧑‍🤝‍🧑. It starts at “Everyone, Read-only”</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li>Press 🧑‍🤝‍🧑 on the chat screen, choose who and what type, and press <strong>Share</strong>. It starts at <strong>Everyone, Read-only</strong>.</li>
+      <li><strong>Read-only</strong>: the other person sees only the chat log. They cannot use the screen panel, send or stop. <strong>Everyone</strong> means all aigw users on this server.</li>
+      <li><strong>Co-work</strong>: available only when you enter a name under “A specific user”. The other person can also send messages, type keys and stop. If you share a host shell for co-work, the other person can run commands with your permissions.</li>
+      <li>Root shells can only be shared read-only. Email sessions cannot be shared.</li>
+      <li>To stop sharing, press <strong>Remove</strong> next to the person listed in the panel.</li>
+    </ul>
+  </div>
+</div>
+<div class="shot">
+  <figure><img src="../img/10-shared.png" alt="“Shared logs” below the session list, opened. There are folders per owner (alice, bob), with a read-only session in alice’s folder"><figcaption>Sessions others share with you go into “👥 Shared logs”</figcaption></figure>
+  <div class="side">
+    <p>Sessions others have shared with you go into <strong>👥 Open shared logs</strong> below the list (like the archive, it starts closed). Open it to see one folder (📁) per owner; open a folder to see that person’s sessions. When you open a read-only session there is no input box, and “&lt;name&gt;’s shared log (read-only)” appears at the top.</p>
+  </div>
+</div>
+
+<p>You can also share a whole folder (<a href="advanced.html#folders">Advanced</a>).</p>
+
+<!-- ===================================================================== -->
+<h2 id="keys">5. Key input</h2>
+
+<h3>Send and Run</h3>
+<div class="scroll"><table>
+  <tr><th>Button</th><th>What it sends</th><th>When to use it</th></tr>
+  <tr><td><strong>Run</strong></td><td>Text + Enter. Just Enter if the input box is empty</td><td>Everyday instructions. To accept the current item in a selection menu, press it with the box empty</td></tr>
+  <tr><td><strong>Send</strong></td><td>Text only (no Enter)</td><td>When you want to type text while a menu is showing, or type part of a command and Tab-complete it</td></tr>
+</table></div>
+
+<h3>The key row (soft keyboard)</h3>
+<div class="shot">
+  <figure><img src="../img/05-menu-down.png" alt="Claude’s model selection menu shown in the screen panel, with the cursor mark on the third item"><figcaption>Pressing <kbd>↓</kbd> in the <code>/model</code> menu. That ❯ moved can be seen only in the screen panel</figcaption></figure>
+  <figure><img src="../img/06-ctrl.png" alt="Ctrl pressed and turned blue, with letter and digit keys shown"><figcaption>Pressing <kbd>Ctrl</kbd> brings up letters and digits. Then <kbd>c</kbd> gives Ctrl+C</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd> <kbd>Tab</kbd> <kbd>⇧Tab</kbd> <kbd>Esc</kbd> <kbd>⏎</kbd>(Enter)<kbd>⌫</kbd> <kbd>Del</kbd> <kbd>🏡</kbd>(Home)<kbd>End</kbd> <kbd>PgU</kbd> <kbd>PgD</kbd> <kbd>Spc</kbd> are sent as soon as you tap them.</li>
+      <li><kbd>Ctrl</kbd> <kbd>⇧</kbd> <kbd>Alt</kbd> <strong>act as held down</strong>. Tap one and it lights up; it is sent combined with the next key you press, then turns off. Pressing Ctrl brings up letter and digit keys.</li>
+    </ul>
+    <h3>Common combinations</h3>
+    <table>
+      <tr><th>To do this</th><th>Press</th></tr>
+      <tr><td>Stop what Claude is doing</td><td><kbd>Esc</kbd></td></tr>
+      <tr><td>Interrupt a shell command</td><td><kbd>Ctrl</kbd> → <kbd>c</kbd></td></tr>
+      <tr><td>Choose a menu item</td><td>Move with <kbd>↑</kbd> <kbd>↓</kbd>, then <kbd>⏎</kbd> (or <strong>Run</strong> with the box empty)</td></tr>
+      <tr><td>Close a menu</td><td><kbd>Esc</kbd></td></tr>
+      <tr><td>Switch Claude’s mode (permission prompts, plan mode)</td><td><kbd>⇧Tab</kbd></td></tr>
+      <tr><td>Recall an instruction you sent earlier</td><td><kbd>↑</kbd></td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="screen-vs-chat">6. How the terminal screen and the chat relate</h2>
+
+<p>On the server, Claude and shells run <strong>inside a real terminal</strong>. aigw shows it to you in two forms.</p>
+
+<div class="diagram" role="img" aria-label="The terminal's contents are appended to the chat as a record, and shown as they are in the screen panel">
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mk"/></marker></defs>
+  <text x="24" y="28" font-size="15" font-weight="600">The terminal’s contents, seen in two forms</text>
+  <rect class="acc" x="24" y="88" width="210" height="96" rx="8"/>
+  <text x="129" y="122" text-anchor="middle" font-weight="600">Terminal on the server</text>
+  <text x="129" y="146" text-anchor="middle" class="q" font-size="12">Where Claude Code or</text>
+  <text x="129" y="164" text-anchor="middle" class="q" font-size="12">a shell actually runs</text>
+  <rect class="box" x="436" y="52" width="300" height="72" rx="8"/>
+  <text x="586" y="80" text-anchor="middle" font-weight="600">Chat (speech bubbles)</text>
+  <text x="586" y="104" text-anchor="middle" class="q" font-size="12">A record that appends output; reread it later</text>
+  <rect class="box" x="436" y="150" width="300" height="72" rx="8"/>
+  <text x="586" y="178" text-anchor="middle" font-weight="600">Screen panel (🖥️)</text>
+  <text x="586" y="202" text-anchor="middle" class="q" font-size="12">The live screen, menu cursor and all</text>
+  <path class="ln" d="M234 120 C 330 120, 330 88, 434 88" marker-end="url(#ar1)"/>
+  <path class="ln" d="M234 156 C 330 156, 330 186, 434 186" marker-end="url(#ar1)"/>
+  <text x="334" y="96" text-anchor="middle" class="q" font-size="12">New lines</text>
+  <text x="334" y="196" text-anchor="middle" class="q" font-size="12">Screen every 0.3 s</text>
+  <text x="129" y="226" text-anchor="middle" class="q" font-size="12">Driven by key row &amp; input box</text>
+</svg>
+</div>
+
+<div class="shot">
+  <figure><img src="../img/03-screen.png" alt="Chat screen with the screen panel open. The top half is a monospaced terminal screen, the bottom half the chat bubbles"><figcaption>Press 🖥️ to open the screen panel at the top. Below is the usual chat</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li>The <strong>chat</strong> is a record. New output piles up as bubbles in order, and you can read it back later or save it with 💾 inside 🧑‍🤝‍🧑.</li>
+      <li>The <strong>screen panel</strong> is the current screen itself. “In-place rewrites”, such as the ❯ moving in a selection menu or a progress display changing, don’t appear in the chat, so watch them in the screen panel.</li>
+      <li>Keys work on both. When a menu appears, open the screen panel and operate it with the key row.</li>
+      <li>Scroll the screen panel all the way up to go back through screens that have scrolled away. “● Back to live” at the top left returns to the current screen.</li>
+      <li>The 🤖 at the top right shows the subagents Claude is running in the background.</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="faq">7. Troubleshooting</h2>
+<div class="scroll"><table>
+  <tr><th>Symptom</th><th>What to do</th></tr>
+  <tr><td>Can’t log in to aigw</td><td>Check that you chose an account in an allowed domain. If the administrator created your account, run <code>aigw-set-email</code> over SSH (<a href="#account">Chapter 1</a>)</td></tr>
+  <tr><td>SSH won’t connect, times out, or asks about an unknown host key</td><td>The server may accept SSH only from the internal network. Get onto the internal network using the method your administrator provides, then SSH (<a href="#account">Chapter 1</a>). If you connected from outside and saved the wrong key, remove it with <code>ssh-keygen -R &lt;server&gt;</code></td></tr>
+  <tr><td>Claude doesn’t reply, or asks you to log in</td><td>On the Settings screen, check whether that location’s row says “Not logged in”, and log in (<a href="advanced.html#settings">Advanced</a>)</td></tr>
+  <tr><td>The chat seems stuck</td><td>Open the screen panel with 🖥️. It is often waiting on a menu or a confirmation question, so answer with the key row</td></tr>
+  <tr><td>Pressed Run but Claude doesn’t move (the text stays in its input box)</td><td>aigw notices within a few seconds, shows ⚠ in the chat, and resends Enter every 30 seconds. Once it goes through, an “accepted” message appears. If you are in a hurry, pressing <strong>Run</strong> without typing anything does the same</td></tr>
+  <tr><td>Want the screens in English or Chinese</td><td>Choose in the selector next to the heading on the Settings screen (<a href="advanced.html#settings">Advanced</a>)</td></tr>
+  <tr><td>Pressing keys seems to have no effect</td><td>In-place rewrites don’t appear in the chat. Check in the screen panel (<a href="#screen-vs-chat">Chapter 6</a>)</td></tr>
+  <tr><td>Email or the host shell asks to “unlock” and won’t proceed</td><td>Check that you registered a passkey, and on that device (<a href="advanced.html#passkey">Advanced</a>). If a locked banner is shown, tap it</td></tr>
+  <tr><td>Want to stop what Claude is doing</td><td><kbd>Esc</kbd>. To stop the whole session, tap the green ● left of the name to stop it (the conversation is saved, and tapping the grey ● resumes it where it left off)</td></tr>
+  <tr><td>The screen is out of date</td><td>⟳ at the top right, or swipe the top bar downward</td></tr>
+  <tr><td>Can’t find a session</td><td>It may be inside a folder. Tap a 📁 row to open it. If you remember archiving it, use “🗄 Open the archive” below the list (<a href="advanced.html#folders">Advanced</a>)</td></tr>
+  <tr><td>Still stuck</td><td>Ask your administrator</td></tr>
+</table></div>
+
+<footer>aigw Tutorial · Basics · 2026-11-06 · Screenshots taken at phone width. Usernames, machine names and the like have been replaced, or the screenshots were taken of the same screens with mock data</footer>
+</div>
+</body>
+</html>

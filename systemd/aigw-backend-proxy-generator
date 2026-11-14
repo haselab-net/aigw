@@ -1,0 +1,43 @@
+#!/bin/sh
+# One activation socket per aigw backend port (21000-21099), each with its
+# own service template: aigw-backend-proxy-<port>.socket ->
+# aigw-backend-proxy-<port>@<n>-<pid>-<uid>.service (the deployment notes).
+#
+# They used to share aigw-backend-proxy@.socket/.service. An AF_UNIX
+# Accept=yes socket names its connection "<n>-<pid>-<uid>", n counting per
+# socket, so two ports' connections from the one aigw-gateway process
+# got the same unit name; while the first was still open (the gateway keeps
+# them, the deployment notes) the second socket failed with "Device
+# or resource busy". Right after a boot every count starts at 0 together.
+set -eu
+out="$1"
+mkdir -p "$out/sockets.target.wants"
+port=21000
+while [ "$port" -le 21099 ]; do
+  cat > "$out/aigw-backend-proxy-$port.socket" <<UNIT
+[Unit]
+Description=AF_UNIX listener for per-user aigw backend proxy, port $port
+SourcePath=/etc/systemd/system-generators/aigw-backend-proxy-generator
+
+[Socket]
+ListenStream=/run/aigw-backend/$port.sock
+SocketUser=aigw
+SocketMode=0600
+Accept=yes
+TriggerLimitIntervalSec=10s
+TriggerLimitBurst=3000
+MaxConnections=256
+UNIT
+  cat > "$out/aigw-backend-proxy-$port@.service" <<UNIT
+[Unit]
+Description=Start owning user's aigw-backend (if needed) and proxy this connection to it
+SourcePath=/etc/systemd/system-generators/aigw-backend-proxy-generator
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/usr/local/sbin/aigw-proxy-handler
+SuccessExitStatus=1
+UNIT
+  ln -sf "../aigw-backend-proxy-$port.socket" "$out/sockets.target.wants/aigw-backend-proxy-$port.socket"
+  port=$((port + 1))
+done

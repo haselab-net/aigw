@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically check the tmux servers on aigw's SSH machines
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

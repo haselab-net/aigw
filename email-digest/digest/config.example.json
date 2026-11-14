@@ -1,0 +1,26 @@
+{
+  "_説明": "local/config.json の見本。写して自分の値を入れる。無いキーは conf.mjs の既定になる。_ で始まるキーは読まない",
+  "account": "",
+  "pageUrl": "/email/",
+  "notifyUrl": "",
+  "me": {
+    "name": "山田",
+    "profile": "小さな会社の代表・山田(営業と経理も見る)",
+    "role": "会社の代表",
+    "mentions": [
+      "@山田"
+    ],
+    "nameRe": "山田|yamada",
+    "nameHint": "山田・Yamada"
+  },
+  "session": {
+    "preset": "mail-tui",
+    "cwd": "digest",
+    "group": "digest"
+  },
+  "hooks": {
+    "preCheck": [],
+    "postCheck": [],
+    "hourly": []
+  }
+}

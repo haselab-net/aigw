@@ -1,0 +1,24 @@
+#!/bin/bash
+# aigw-desktop-tmux-start -- run by an interactive ("run only when user is
+# logged on") Windows Scheduled Task on a Windows SSH_MACHINES entry, to
+# start the `tmux -L aigw-desktop` server inside the logged-on user's
+# desktop session (session 1) rather than sshd's session 0. aigw-backend
+# triggers the task with `schtasks /run` (_ensure_desktop_tmux_server) and
+# then drives the server over ssh like any other; every pane it creates is a
+# child of this server, so it inherits session 1 and can reach desktop apps.
+# See the SSH_MACHINES schema comment in aigw-backend.
+#
+# exit-empty off: the server must outlive its last session, since it can
+# only be (re)started from the desktop, never from ssh.
+#
+# Started by the task as a plain (non-login) `bash.exe <this file>`, with
+# Windows' own environment: give the server -- and so every pane -- the same
+# HOME an ssh login gets (the Windows profile dir, not MSYS2's /home/<user>),
+# or talkto-remote's ~/.aigw-talkto and the backend's $HOME over ssh would
+# point at different directories (measured 2026-10-04: `bash -l` from the
+# task did not find ~/.local/bin at all, exit 127).
+set -u
+export HOME="$(/usr/bin/cygpath -u "$USERPROFILE")"
+export PATH="/usr/bin:$PATH"
+SOCK="${1:-aigw-desktop}"
+exec /usr/bin/tmux -L "$SOCK" start-server \; set-option -g exit-empty off

@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aigw 教程</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5b6575; --line: #dde2ea; --card: #f5f7fa;
+    --accent: #2f6fdf; --accent-soft: #e6eefc; --warn: #a15c00; --warn-soft: #fff4e0;
+    --code-bg: #eef1f5; --shot-border: #c9d0da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151b; --fg: #e4e8ee; --muted: #9aa5b4; --line: #2a313b; --card: #182029;
+      --accent: #6f9ff5; --accent-soft: #1d2b44; --warn: #f0b35a; --warn-soft: #33270f;
+      --code-bg: #1d2530; --shot-border: #343d49;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.75 system-ui, -apple-system, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 1.9rem; line-height: 1.3; margin: 8px 0 4px; }
+  h2 { font-size: 1.4rem; margin: 56px 0 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; margin: 28px 0 8px; }
+  h4 { font-size: 1rem; margin: 20px 0 6px; }
+  p, li { max-width: 72ch; }
+  a { color: var(--accent); }
+  code, kbd, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 6px; background: var(--card); }
+  .lead { color: var(--muted); margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: .95rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .scroll { overflow-x: auto; }
+  .note { background: var(--accent-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn { background: var(--warn-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn strong { color: var(--warn); }
+  nav.toc { background: var(--card); border-radius: 10px; padding: 12px 18px; margin: 20px 0; }
+  nav.toc ol { margin: 4px 0; padding-left: 1.4em; }
+  .shot { display: flex; gap: 20px; align-items: flex-start; margin: 16px 0; flex-wrap: wrap; }
+  .shot figure { margin: 0; flex: 0 0 auto; }
+  .shot img { width: 260px; max-width: 100%; border: 1px solid var(--shot-border); border-radius: 14px; display: block; }
+  .shot figcaption { font-size: .85rem; color: var(--muted); margin-top: 4px; max-width: 260px; }
+  .shot .side { flex: 1 1 280px; min-width: 0; }
+  ol.steps > li { margin-bottom: 6px; }
+  .diagram { margin: 16px 0; }
+  .diagram svg { width: 100%; height: auto; display: block; }
+  .diagram svg text { fill: var(--fg); font-family: inherit; }
+  .diagram .q { fill: var(--muted); }
+  .diagram .box { fill: none; stroke: var(--muted); stroke-width: 1.25; }
+  .diagram .acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+  .diagram .wrn { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+  .diagram .ln { stroke: var(--muted); stroke-width: 1.25; fill: none; }
+  .diagram .mk { fill: var(--muted); }
+  .badge { display: inline-block; font-size: .8rem; padding: 0 8px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
+  footer { margin-top: 64px; color: var(--muted); font-size: .85rem; }
+  .editions { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+  .editions a { display: inline-block; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); text-decoration: none; background: var(--card); }
+  .editions a.here { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .langs { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; font-size: .85rem; margin: 0 0 4px; }
+  .langs a { padding: 2px 10px; border-radius: 999px; text-decoration: none; border: 1px solid transparent; }
+  .langs a.here { border-color: var(--line); background: var(--card); color: var(--fg); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>aigw 教程 基础篇</h1>
+<nav class="langs" aria-label="Language"><a href="../basic.html" lang="ja">日本語</a><a href="../en/basic.html" lang="en">English</a><a href="../zh/basic.html" lang="zh-CN" class="here" aria-current="page">简体中文</a></nav>
+<div class="editions"><a href="index.html">入口</a><a href="basic.html" class="here">基础篇</a><a href="advanced.html">进阶篇</a></div>
+<div class="note">聊天、终端、设置和共享界面的截图显示的是日文界面。aigw 本身可以在 设置 → 语言 中切换为简体中文。</div>
+
+<p class="lead">这是一份指南，介绍如何在手机或电脑的浏览器中使用服务器上的 AI 代理（Claude Code 等）。基础篇说明从创建账号到能够进行日常 AI 编程的过程。各服务器安装的功能略有不同，不清楚的地方请向管理员确认。</p>
+
+<p>aigw 是在 <code>https://&lt;サーバー&gt;/agents/</code> 打开的聊天式界面。你在聊天中写下的指令，会发送给在服务器上你专属容器中运行的 Claude Code，回复会返回到聊天中。</p>
+
+<nav class="toc">
+<strong>目录</strong>
+<ol>
+  <li><a href="#account">创建账号</a></li>
+  <li><a href="#screens">界面说明</a></li>
+  <li><a href="#coding">日常 AI 编程的方法</a></li>
+  <li><a href="#share">与他人共享</a></li>
+  <li><a href="#keys">按键输入</a></li>
+  <li><a href="#screen-vs-chat">终端画面与聊天的关系</a></li>
+  <li><a href="#faq">遇到问题时</a></li>
+</ol>
+</nav>
+<p>文件夹、巡览、通知、通行密钥、主机和 root 的 shell、其他机器等内容在<a href="advanced.html">进阶篇</a>中。</p>
+
+<!-- ===================================================================== -->
+<h2 id="account">1. 创建账号</h2>
+
+<p>如果你有管理员允许的域名下的 Google 账号，就可以在 aigw 界面上自己创建账号（仅限启用了此功能的服务器）。否则请让管理员为你创建。</p>
+
+<ol class="steps">
+  <li>在浏览器中打开 <code>https://&lt;サーバー&gt;/agents/</code>，通过“使用 Google 登录”选择<strong>允许的域名下的账号</strong>。</li>
+  <li>如果还没有账号，会出现“创建账号”的表单。确定<strong>用户名</strong>后提交。
+    <ul>
+      <li>可用字符为小写英文字母、数字、<code>-</code>、<code>_</code>。开头必须是小写英文字母或 <code>_</code>。最多 32 个字符。</li>
+      <li>之后自己无法更改。</li>
+    </ul>
+  </li>
+  <li>提交后，<strong>SSH 私钥只会显示一次</strong>。关闭界面前请务必保存。它不会再次显示。</li>
+  <li>这样就可以使用 aigw 了。下次起只需用 Google 登录即可。</li>
+</ol>
+
+<h3>设置 SSH 登录（注册通行密钥时需要）</h3>
+<p>如果只用 aigw，则不需要 SSH。不过，<a href="advanced.html#passkey">注册用于 Email 和主机 shell 的通行密钥</a>需要用 SSH 登录一次，所以尽早完成会比较省事。请根据你使用的电脑，按下面其中一种步骤操作。</p>
+<div class="note">有些服务器只接受来自组织内部网络的 SSH。这种情况下，从外部 SSH 时，请先按管理员指引的方法进入内部网络。aigw 的界面（浏览器）在外部也可以直接使用。</div>
+
+<h4>Mac、Linux，以及 Windows 的 MSYS2（Git Bash 也一样）</h4>
+<pre><code># 在自己的电脑上：保存收到的密钥并收紧权限
+mkdir -p ~/.ssh
+mv ~/Downloads/id_ed25519_<ユーザー名> ~/.ssh/
+chmod 600 ~/.ssh/id_ed25519_<ユーザー名>
+
+# 首次登录。登录后会立即要求设置密码
+ssh -i ~/.ssh/id_ed25519_<ユーザー名> <ユーザー名>@&lt;サーバー&gt;</code></pre>
+<p>在 MSYS2 中，<code>~</code> 是 MSYS2 的主目录（例：<code>C:\msys64\home\&lt;名前&gt;</code>），与 Windows 的主目录（<code>C:\Users\&lt;名前&gt;</code>）不同。下载的文件在 <code>/c/Users/&lt;Windowsの名前&gt;/Downloads/</code> 中。放在 MSYS2 的 <code>~/.ssh</code> 中的密钥，PowerShell 的 <code>ssh</code> 是看不到的。</p>
+
+<h4>Windows 自带的 OpenSSH（PowerShell）</h4>
+<p>Windows 10/11 自带 <code>ssh</code>（如果没有，请在“设置 → 系统 → 可选功能”中添加“OpenSSH 客户端”）。在 PowerShell 中执行以下命令。由于不能使用 <code>chmod</code>，权限用 <code>icacls</code> 来收紧。</p>
+<pre><code># 将密钥移到 C:\Users\&lt;Windowsの名前&gt;\.ssh\
+mkdir -Force $env:USERPROFILE\.ssh
+Move-Item $env:USERPROFILE\Downloads\id_ed25519_<ユーザー名> $env:USERPROFILE\.ssh\
+$key = "$env:USERPROFILE\.ssh\id_ed25519_<ユーザー名>"
+
+# 让自己以外的人无法读取（切断继承，只允许自己读取）
+icacls $key /inheritance:r
+icacls $key /grant:r "$($env:USERNAME):(R)"
+
+# 首次登录。登录后会立即要求设置密码
+ssh -i $key <ユーザー名>@&lt;サーバー&gt;</code></pre>
+<p>如果提示“UNPROTECTED PRIVATE KEY FILE”或“bad permissions”，请重新执行 <code>icacls</code> 那两行。在 PowerShell 中，<code>-i ~/.ssh/...</code> 里的 <code>~</code> 有时不会被展开，所以这里写成了 <code>$env:USERPROFILE</code>。</p>
+
+<p>在这次首次登录设置密码之前，密码处于谁都无法使用的状态。从第二次起用同样的命令即可登录。</p>
+
+<h4>不必每次都写 <code>-i</code></h4>
+<p>把以下内容写进配置文件，只需 <code>ssh aigw</code> 就能登录。配置文件在 Mac、Linux、MSYS2 中是 <code>~/.ssh/config</code>，在 Windows 自带的 OpenSSH 中是 <code>C:\Users\&lt;Windowsの名前&gt;\.ssh\config</code>（无扩展名）。<code>IdentityFile</code> 中的 <code>~</code> 在两者中都会被 <code>ssh</code> 解释为自己的主目录。</p>
+<pre><code>Host aigw
+    HostName &lt;サーバー&gt;
+    User <ユーザー名>
+    IdentityFile ~/.ssh/id_ed25519_<ユーザー名></code></pre>
+
+<div class="note">如果用管理员创建的账号无法登录 aigw，请用 SSH 登录后执行一次 <code>aigw-set-email you@example.com</code>。之后就可以用该邮箱地址的 Google 账号登录了。</div>
+
+<!-- ===================================================================== -->
+<h2 id="screens">2. 界面说明</h2>
+
+<p>aigw 的界面有“会话列表”和“聊天”两个。会话是指在服务器上持续运行的一个工作场所（Claude Code 或 shell）。</p>
+
+<h3>会话列表（首页）</h3>
+<div class="shot">
+  <figure><img src="../img/01-top.png" alt="aigw 的首页。顶部是机器选择和用户名，下面是新建会话的创建栏和会话列表"><figcaption>首页。在上方的创建栏中选择了“Claude”</figcaption></figure>
+  <div class="side">
+    <table>
+      <tr><th>位置</th><th>含义</th></tr>
+      <tr><td><code>server</code> 选择栏</td><td>在哪台机器上运行（如果有通过 ssh 连接的其他机器，会列在这里）。<strong>设置</strong>界面也从这里选择</td></tr>
+      <tr><td>用户名</td><td>点按即退出登录</td></tr>
+      <tr><td><code>Doc</code></td><td>阅读服务器文档的界面（有的服务器没有）</td></tr>
+      <tr><td>🔍 📋 🔔</td><td>搜索聊天、Windows 机器黑板、通知列表（<a href="advanced.html">进阶篇</a>）</td></tr>
+      <tr><td><code>⟳</code></td><td>重新加载（在顶部栏向下滑动也一样）</td></tr>
+      <tr><td>🔑 / 🔓</td><td>用通行密钥解锁中的标志。🔑 表示解锁到主机，🔓 表示解锁到 root。点按立即锁定</td></tr>
+      <tr><td>创建栏</td><td>选择类型、文件夹、名称后点<strong>开始</strong></td></tr>
+      <tr><td>名称前的图标</td><td>会话的类型。🛠️ 沙箱（日常的 Claude 等）、📫 Email、🏠 主机、🔒 root、💻 通过 ssh 连接的其他机器</td></tr>
+      <tr><td>📁 行</td><td>文件夹。点按展开或收起（<a href="advanced.html#folders">进阶篇</a>）</td></tr>
+      <tr><td>每行的 ● </td><td>绿色表示运行中，灰色表示已停止的会话。<strong>点按绿色的会停止，点按带蓝色圆环的灰色的会继续</strong>（都会弹出确认）</td></tr>
+      <tr><td>⠿ ✏️ 🔗 🗄 🗑</td><td>排序、重命名、与其他会话连接、归档（只是从列表中隐藏）、删除</td></tr>
+      <tr><td>👥 共享记录</td><td>别人共享给你的会话。按所有者分别放在各自的文件夹中（<a href="#share">第 4 章</a>）</td></tr>
+    </table>
+  </div>
+</div>
+
+<h3>聊天界面</h3>
+<div class="shot">
+  <figure><img src="../img/02-chat.png" alt="聊天界面。顶部是返回按钮和会话名称，中间是对话，底部是按键行和输入框"><figcaption>让 Claude 创建 hello.py 的情形</figcaption></figure>
+  <div class="side">
+    <table>
+      <tr><th>位置</th><th>含义</th></tr>
+      <tr><td><code>←</code></td><td>返回列表（向右滑动界面也能返回）。长按时，也可以作为在新标签页中打开列表的链接使用</td></tr>
+      <tr><td>●（名称左侧）</td><td>是否在运行。<strong>绿色时点按会停止，灰色时点按会继续</strong>（会弹出确认）</td></tr>
+      <tr><td>🖥️</td><td>打开或关闭终端画面（画面面板）。见<a href="#screen-vs-chat">第 6 章</a></td></tr>
+      <tr><td>🧑‍🤝‍🧑</td><td>与他人共享此会话（<a href="#share">第 4 章</a>）。保存对话（💾）也在这里面</td></tr>
+      <tr><td>按键行</td><td><kbd>Ctrl</kbd> <kbd>⇧</kbd> <kbd>Alt</kbd> <kbd>↑</kbd> <kbd>↓</kbd> … 可以横向滚动，最右边是 📎（添加附件）。见<a href="#keys">第 5 章</a></td></tr>
+      <tr><td><strong>发送</strong> / <strong>执行</strong></td><td>执行会带 Enter，发送不带 Enter。见<a href="#keys">第 5 章</a></td></tr>
+    </table>
+    <p>点按聊天的名称（🛠️ 右侧），会打开切换到前后会话的“巡览”栏（<a href="advanced.html#patrol">进阶篇</a>）。关闭浏览器后会话也会继续运行。从列表重新打开，就能接着看后续内容。在手机上先“添加到主屏幕”，收到回复时就会收到通知（iPhone 上这是必需的）。</p>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="coding">3. 日常 AI 编程的方法</h2>
+
+<p>平时只需选择 <strong>Claude</strong> 创建会话，然后在聊天中下指令。Claude 在你专属的容器（沙箱）中创建文件、执行命令。</p>
+
+<h3>创建会话</h3>
+<ol class="steps">
+  <li>在创建栏的类型中选择 <strong>Claude</strong>。</li>
+  <li>在 📁 行中选择工作目录。一开始是 <code>sandhome</code>（容器中的主目录）。
+    <ul>
+      <li>用“打开子文件夹…”逐级向下，用 <code>↑</code> 向上移动。</li>
+      <li>用 <code>＋</code> 可以在当前位置新建文件夹。</li>
+    </ul>
+  </li>
+  <li>⏱ 栏平时保持“新建”即可。想接着之前的对话时在这里选择（见下文“继续”）。</li>
+  <li>“跳过权限确认”平时保持开启即可。因为是在容器中，即使 Claude 改写文件也不会影响外部。</li>
+  <li>起个名字（可选）后按<strong>开始</strong>，就会进入聊天界面。</li>
+</ol>
+
+<h3>下指令、接收结果</h3>
+<ul>
+  <li>在输入框中用中文写好后点<strong>执行</strong>。手机键盘上的换行键也与执行相同（想在输入框中换行时用 Shift+Enter）。</li>
+  <li>Claude 思考期间，也可以继续发送指令。</li>
+  <li><strong>传递手头的文件</strong>：用 📎 选择，或者粘贴到输入框中。文件会保存在服务器上，路径会填入输入框，接着写“看一下这个文件…”发送即可。每个文件最大 100MB。</li>
+  <li><strong>让它展示图片或文件</strong>：请它“把结果的图表显示在聊天中”，Claude 会把文件放到指定位置，聊天中就会出现图片或下载链接。3D 模型（.glb 等）点按后会打开查看器。</li>
+</ul>
+
+<h3>稍后继续</h3>
+<ul>
+  <li>会话一直在运行，从列表打开即可继续。不用的会话用 🗄 归档，列表会更清爽（归档的会话可以在列表下方的“🗄 打开归档”中查看，用 📤 恢复）。</li>
+  <li><strong>停止</strong>：点按绿色的 ● 并确认即可停止。会像平常结束 Claude 一样发送两次 <kbd>Ctrl</kbd>+<kbd>C</kbd>，所以对话会被保存（如果后台有正在运行的命令，也会停止）。</li>
+  <li><strong>继续</strong>：点按已停止会话的灰色 ●（带蓝色圆环）并确认，就会在同一文件夹中<strong>继续</strong>。还是同一个会话，之前的聊天也会保留。在 shell 中运行 Claude 的会话，也会从 Claude 的后续继续。</li>
+  <li>即使删除了会话，对话依然保留。新建会话时选择同一文件夹，在 ⏱ 栏中按日期时间和内容摘要选择，就能接着继续。</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="share">4. 与他人共享</h2>
+<div class="shot">
+  <figure><img src="../img/09-share.png" alt="共享面板。有保存对话记录的按钮、只读的说明、对象（所有人）和类型（只读）的选择栏以及“共享”按钮"><figcaption>用 🧑‍🤝‍🧑 打开的共享面板。默认为“所有人、只读”</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li>按聊天界面的 🧑‍🤝‍🧑，选择对象和类型后点<strong>共享</strong>。默认为<strong>所有人、只读</strong>。</li>
+      <li><strong>只读</strong>：对方只能看到聊天记录，不能使用画面面板、发送或停止。<strong>所有人</strong>是指本服务器上 aigw 的全部用户。</li>
+      <li><strong>协作</strong>：只有在“指定用户”中填写了名字时才能选择。对方也可以发送消息、按键输入、停止。以协作方式共享主机 shell 后，对方可以用你的权限执行命令。</li>
+      <li>root 的 shell 只能以只读方式共享。Email 会话不能共享。</li>
+      <li>要取消时，按面板中列出的对象的<strong>取消</strong>。</li>
+    </ul>
+  </div>
+</div>
+<div class="shot">
+  <figure><img src="../img/10-shared.png" alt="打开会话列表下方“共享记录”的样子。有按所有者分的文件夹（alice、bob），alice 的文件夹中有只读的会话"><figcaption>别人共享给你的会话会放在“👥 共享记录”中</figcaption></figure>
+  <div class="side">
+    <p>别人共享给你的会话，会放在列表下方的<strong>👥 打开共享记录</strong>中（与归档一样，默认是收起的）。打开后会列出按所有者分的文件夹（📁），打开文件夹就能看到那个人的会话。打开只读的会话时没有输入框，顶部会显示“〇〇 的共享记录(只读)”。</p>
+  </div>
+</div>
+
+<p>也可以按文件夹共享（<a href="advanced.html#folders">进阶篇</a>）。</p>
+
+<!-- ===================================================================== -->
+<h2 id="keys">5. 按键输入</h2>
+
+<h3>发送与执行</h3>
+<div class="scroll"><table>
+  <tr><th>按钮</th><th>发送的内容</th><th>使用时机</th></tr>
+  <tr><td><strong>执行</strong></td><td>文字 + Enter。输入框为空时只发送 Enter</td><td>日常的指令。想在选择菜单中确定当前项时，保持为空并点执行</td></tr>
+  <tr><td><strong>发送</strong></td><td>只发送文字（不带 Enter）</td><td>菜单显示期间想输入文字时，命令输入到一半想按 Tab 补全时</td></tr>
+</table></div>
+
+<h3>按键行（软键盘）</h3>
+<div class="shot">
+  <figure><img src="../img/05-menu-down.png" alt="画面面板中显示着 Claude 的模型选择菜单，光标符号位于第 3 项"><figcaption>在 <code>/model</code> 菜单中按 <kbd>↓</kbd> 后的样子。❯ 的移动只能在画面面板中看到</figcaption></figure>
+  <figure><img src="../img/06-ctrl.png" alt="按下 Ctrl 后变为蓝色，并列出英文字母和数字键的状态"><figcaption>按 <kbd>Ctrl</kbd> 后会列出英文字母和数字。接着按 <kbd>c</kbd> 即为 Ctrl+C</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li><kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd> <kbd>Tab</kbd> <kbd>⇧Tab</kbd> <kbd>Esc</kbd> <kbd>⏎</kbd>（Enter）<kbd>⌫</kbd> <kbd>Del</kbd> <kbd>🏡</kbd>（Home）<kbd>End</kbd> <kbd>PgU</kbd> <kbd>PgD</kbd> <kbd>Spc</kbd> 点按后立即发送。</li>
+      <li><kbd>Ctrl</kbd> <kbd>⇧</kbd> <kbd>Alt</kbd> <strong>按“按住不放”处理</strong>。点按后会变色，与下一个按下的键组合发送，然后恢复原状。按 Ctrl 后会出现英文字母和数字键。</li>
+    </ul>
+    <h3>常用组合</h3>
+    <table>
+      <tr><th>想做的事</th><th>按键</th></tr>
+      <tr><td>停止 Claude 的工作</td><td><kbd>Esc</kbd></td></tr>
+      <tr><td>中断 shell 命令</td><td><kbd>Ctrl</kbd> → <kbd>c</kbd></td></tr>
+      <tr><td>选择菜单项</td><td>用 <kbd>↑</kbd> <kbd>↓</kbd> 移动后按 <kbd>⏎</kbd>（或保持为空点<strong>执行</strong>）</td></tr>
+      <tr><td>关闭菜单</td><td><kbd>Esc</kbd></td></tr>
+      <tr><td>切换 Claude 的模式（权限确认、计划模式）</td><td><kbd>⇧Tab</kbd></td></tr>
+      <tr><td>调出之前发送过的指令</td><td><kbd>↑</kbd></td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="screen-vs-chat">6. 终端画面与聊天的关系</h2>
+
+<p>在服务器上，Claude 和 shell 是在<strong>真正的终端中</strong>运行的。aigw 以两种形式展示其情况。</p>
+
+<div class="diagram" role="img" aria-label="终端的内容会作为记录追加到聊天中，并原样显示在画面面板中">
+<svg viewBox="0 0 760 250" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <defs><marker id="ar1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mk"/></marker></defs>
+  <text x="24" y="28" font-size="15" font-weight="600">终端的内容以两种形式呈现</text>
+  <rect class="acc" x="24" y="88" width="210" height="96" rx="8"/>
+  <text x="129" y="122" text-anchor="middle" font-weight="600">服务器上的终端</text>
+  <text x="129" y="146" text-anchor="middle" class="q" font-size="12">Claude Code 和 shell</text>
+  <text x="129" y="164" text-anchor="middle" class="q" font-size="12">实际运行的地方</text>
+  <rect class="box" x="436" y="52" width="300" height="72" rx="8"/>
+  <text x="586" y="80" text-anchor="middle" font-weight="600">聊天（气泡）</text>
+  <text x="586" y="104" text-anchor="middle" class="q" font-size="12">按顺序追加输出的记录，之后可以回看</text>
+  <rect class="box" x="436" y="150" width="300" height="72" rx="8"/>
+  <text x="586" y="178" text-anchor="middle" font-weight="600">画面面板（🖥️）</text>
+  <text x="586" y="202" text-anchor="middle" class="q" font-size="12">当前画面本身，也能看到菜单光标</text>
+  <path class="ln" d="M234 120 C 330 120, 330 88, 434 88" marker-end="url(#ar1)"/>
+  <path class="ln" d="M234 156 C 330 156, 330 186, 434 186" marker-end="url(#ar1)"/>
+  <text x="334" y="96" text-anchor="middle" class="q" font-size="12">新输出的行</text>
+  <text x="334" y="196" text-anchor="middle" class="q" font-size="12">每 0.3 秒的画面</text>
+  <text x="129" y="226" text-anchor="middle" class="q" font-size="12">操作从按键行和输入框送达</text>
+</svg>
+</div>
+
+<div class="shot">
+  <figure><img src="../img/03-screen.png" alt="打开画面面板的聊天界面。上半部分是等宽的终端画面，下半部分是聊天气泡"><figcaption>按 🖥️ 后上方会打开画面面板，下方是平常的聊天</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li><strong>聊天</strong>是记录。新的输出会作为气泡依次堆叠，之后可以回看，也可以用 🧑‍🤝‍🧑 中的 💾 保存。</li>
+      <li><strong>画面面板</strong>是当前画面本身。选择菜单中 ❯ 的移动、进度显示的变化等“原地改写”不会出现在聊天中，要在画面面板中查看。</li>
+      <li>按键对两者都有效。出现菜单时，请打开画面面板，用按键行操作。</li>
+      <li>把画面面板滚动到最上方，可以回溯过去已经滚出的画面。点左上角的“● 返回实时”回到当前画面。</li>
+      <li>右上角的 🤖 显示 Claude 在后台运行的子代理的情况。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="faq">7. 遇到问题时</h2>
+<div class="scroll"><table>
+  <tr><th>症状</th><th>处理方法</th></tr>
+  <tr><td>无法登录 aigw</td><td>确认选择的是允许的域名下的账号。如果是管理员创建的账号，用 SSH 执行 <code>aigw-set-email</code>（<a href="#account">第 1 章</a>）</td></tr>
+  <tr><td>SSH 连不上、超时、被询问未知主机的密钥</td><td>可能是只允许从内部网络 SSH 的服务器。按管理员指引的方法进入内部网络后再 SSH（<a href="#account">第 1 章</a>）。如果从外部连接时保存了错误的密钥，用 <code>ssh-keygen -R &lt;サーバー&gt;</code> 删除</td></tr>
+  <tr><td>Claude 没有任何回复、要求登录</td><td>在设置界面确认该位置那一行是否显示“未登录”，然后登录（<a href="advanced.html#settings">进阶篇</a>）</td></tr>
+  <tr><td>聊天看起来停住了</td><td>用 🖥️ 打开画面面板。多数情况是停在菜单或确认提问上，用按键行回答</td></tr>
+  <tr><td>点了执行但 Claude 没有动作（输入框中还留着文字）</td><td>aigw 会在几秒内发现并在聊天中显示 ⚠，每 30 秒重新发送一次 Enter。被接收后会显示“受け付けました”（已接收）。着急时，不输入文字直接按<strong>执行</strong>也一样</td></tr>
+  <tr><td>想把界面改成英文或中文</td><td>在设置界面标题旁边的选择栏中选择（<a href="advanced.html#settings">进阶篇</a>）</td></tr>
+  <tr><td>按了键却看不到反应</td><td>因为原地改写不会出现在聊天中。请在画面面板中确认（<a href="#screen-vs-chat">第 6 章</a>）</td></tr>
+  <tr><td>Email 或主机 shell 要求“解锁”而无法继续</td><td>确认是否注册了通行密钥、是否在这台设备上注册的（<a href="advanced.html#passkey">进阶篇</a>）。如果出现了锁定中的提示条，点按它</td></tr>
+  <tr><td>想停止 Claude 的工作</td><td><kbd>Esc</kbd>。如果要停止整个会话，点按名称左侧绿色的 ● 停止（对话会被保存，点按灰色的 ● 可以继续）</td></tr>
+  <tr><td>界面一直是旧的</td><td>点右上角的 ⟳，或在顶部栏向下滑动</td></tr>
+  <tr><td>找不到会话在哪里</td><td>可能在文件夹中。点按 📁 行展开。如果记得归档过，看列表下方的“🗄 打开归档”（<a href="advanced.html#folders">进阶篇</a>）</td></tr>
+  <tr><td>还是不清楚</td><td>找管理员商量</td></tr>
+</table></div>
+
+<footer>aigw 教程 基础篇 · 2026-11-06 · 截图按手机宽度拍摄。用户名、机器名等已替换，或是在装入模拟数据的同一界面上拍摄的</footer>
+</div>
+</body>
+</html>

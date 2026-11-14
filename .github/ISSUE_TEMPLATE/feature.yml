@@ -1,0 +1,26 @@
+name: 機能・まとまり
+description: 複数のタスクに分かれる機能や検証(sub-issue を持つ)
+type: Feature
+projects: ["haselab-net/4"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目的
+      description: 何を実現・検証するか
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: 完了条件
+    validations:
+      required: true
+  - type: textarea
+    id: refs
+    attributes:
+      label: 参照
+      description: 仕様はホストの文書の節 IDで
+  - type: markdown
+    attributes:
+      value: 分解したタスクは、起票後にこの Issue の「Sub-issues」に足す(Claude が分解するときは子を Triage で作るだけ)。

@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""aigw-board -- the Windows machines' blackboard of this aigw host
+(the deployment notes): which session is using which Windows machine.
+
+Like talkto, it never talks over the network: it appends one JSON line with
+a "board" request to $AIGW_TALKTO and waits for this session's backend to
+answer in talkto_status.jsonl next to it.
+"""
+import json
+import os
+import secrets
+import sys
+import time
+
+WAIT_SECONDS = 15
+
+HELP = """\
+使い方:
+  aigw-board                          黒板を見る(どの Windows 機を、誰のどのセッションが使っているか)
+  aigw-board use <機械> "<すること>"    このセッションが <機械> を使うと書く(同じ機械なら、することを書き換え)
+  aigw-board note [<機械>] "<すること>"  このセッションの書き込みの「すること」を書き換える
+  aigw-board done [<機械>]             このセッションの書き込みを外す(機械を省くと全部)
+
+Windows 機を使う前に、まず黒板を見て空きを確かめてください。書き込みは要りません:
+aigw の Windows 機で動いているセッションと、セッションの中から ssh/scp/sftp/rsync で
+Windows 機につないでいるものは、aigw が3分ごとの点検で自動で載せます(つなぎ終わると
+「終了(SSH終了)」)。セッションが止まる・落ちると「終了」、チャットに30分以上動きが
+無いと「30分以上動きなし」と出ます。use/note/done は、することを書き添えたいときだけの
+任意の書き込みです。
+
+オプション: -h, --help  この説明
+"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("show", "list"):
+        req = {"op": "show"}
+    elif argv[0] in ("-h", "--help", "-help", "help"):
+        print(HELP, end="")
+        return 0
+    elif argv[0] in ("use", "claim"):
+        if len(argv) < 2:
+            print('aigw-board: 機械の名前がありません(aigw-board use <機械> "<すること>")', file=sys.stderr)
+            return 2
+        req = {"op": "use", "machine": argv[1], "what": " ".join(argv[2:])}
+    elif argv[0] == "note":
+        rest = argv[1:]
+        machine = rest[0] if len(rest) >= 2 else None
+        what = " ".join(rest[1:] if len(rest) >= 2 else rest)
+        if not what:
+            print('aigw-board: 書く文がありません(aigw-board note [<機械>] "<すること>")', file=sys.stderr)
+            return 2
+        req = {"op": "note", "machine": machine, "what": what}
+    elif argv[0] in ("done", "release"):
+        req = {"op": "done", "machine": argv[1] if len(argv) > 1 else None}
+    else:
+        print(f"aigw-board: 知らない指示です: {argv[0]}(aigw-board --help)", file=sys.stderr)
+        return 2
+    path = os.environ.get("AIGW_TALKTO")
+    if not path:
+        print("aigw-board: $AIGW_TALKTO がありません -- aigw が始めたセッションの中で使ってください", file=sys.stderr)
+        return 1
+    item_id = secrets.token_hex(8)
+    with open(path, "a") as f:
+        f.write(json.dumps({"ts": time.time(), "id": item_id, "board": req}) + "\n")
+    status_path = os.path.join(os.path.dirname(path), "talkto_status.jsonl")
+    deadline = time.time() + WAIT_SECONDS
+    while time.time() < deadline:
+        try:
+            with open(status_path) as f:
+                for raw in f:
+                    try:
+                        obj = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(obj, dict) and obj.get("id") == item_id:
+                        print(obj.get("msg") or obj.get("status"))
+                        return 0 if obj.get("status") == "ok" else 1
+        except OSError:
+            pass
+        time.sleep(0.3)
+    print("aigw-board: 返事がありません(aigw のこのセッションの見張りが止まっているかもしれません)", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

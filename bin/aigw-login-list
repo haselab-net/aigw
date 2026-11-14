@@ -1,0 +1,183 @@
+#!/usr/bin/python3 -I
+"""aigw-login-list: which Claude Code / Codex (ChatGPT) account every aigw
+user is signed in with, for aigw's read-only "全員のログイン" page
+(the deployment notes, 2026-11-04).
+
+Run through sudo by an aigw user's own backend (/etc/sudoers.d/aigw, no
+arguments allowed). Any aigw user (`sandboxusers`) may see everyone's
+logins; root's own logins only someone whose root window is open right now
+(aigw-unlockd's status says a root-tier passkey window is open,
+the deployment notes) -- 2026-11-05, the user: "一覧はルート以外にも
+見えてよいです。ルートのログイン情報だけは、ルート以外には見せません".
+The check that matters is here, in the privileged program, never in its
+caller, judged from $SUDO_USER, which sudo sets and the caller cannot choose.
+
+Read-only. Nothing is changed and no secret leaves this program: only the
+account's e-mail, organisation and plan, never a token or key.
+Each file is opened one path component at a time without following
+symlinks and must belong to that user, so a user cannot point these reads
+at a file of someone else's (or root's).
+
+Scopes per user (where each preset's tool keeps its login):
+  sandbox  ~/sandhome   (Claude/Codex/Shell in devbox-<user>)
+  host     ~            (Shell (sandbox外・ホスト))
+  email    ~/mailbox    (the Email box; Claude only)
+  root     /root        (root-shell; only as described above)
+ssh:<machine> logins live on those machines and are not read here.
+
+Output: JSON on stdout. Exit 3: the caller is not an aigw user.
+"""
+import base64
+import grp
+import json
+import os
+import pwd
+import stat
+import socket
+import sys
+
+USERS_GROUP = "sandboxusers"
+MAX_BYTES = 4 * 1024 * 1024
+
+
+def read_json(home, uid, rel):
+    """The JSON at home/rel, or None. Every component below home is opened
+    with O_NOFOLLOW and must be owned by uid."""
+    try:
+        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        parts = rel.split("/")
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            flags = os.O_RDONLY | os.O_NOFOLLOW | (0 if last else os.O_DIRECTORY)
+            try:
+                nfd = os.open(part, flags, dir_fd=fd)
+            except OSError:
+                return None
+            os.close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if st.st_uid != uid:
+                return None
+            if last:
+                if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_BYTES:
+                    return None
+                with os.fdopen(fd, "rb") as f:
+                    fd = None
+                    return json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def claude_login(home, uid, base):
+    prefix = f"{base}/" if base else ""
+    cfg = read_json(home, uid, f"{prefix}.claude.json") or {}
+    cred = read_json(home, uid, f"{prefix}.claude/.credentials.json") or {}
+    oauth = cred.get("claudeAiOauth") if isinstance(cred, dict) else None
+    account = cfg.get("oauthAccount") if isinstance(cfg, dict) else None
+    out = {"logged_in": False}
+    if isinstance(oauth, dict) and (oauth.get("refreshToken") or oauth.get("accessToken")):
+        out["logged_in"] = True
+        out["method"] = "Claude account"
+        out["plan"] = oauth.get("subscriptionType") or None
+    elif isinstance(cfg, dict) and cfg.get("primaryApiKey"):
+        out["logged_in"] = True
+        out["method"] = "API key"
+    if out["logged_in"] and isinstance(account, dict):
+        out["email"] = account.get("emailAddress") or None
+        out["org"] = account.get("organizationName") or None
+    return out
+
+
+def _jwt_payload(token):
+    try:
+        part = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (AttributeError, IndexError, ValueError):
+        return {}
+
+
+def codex_login(home, uid, base):
+    prefix = f"{base}/" if base else ""
+    auth = read_json(home, uid, f"{prefix}.codex/auth.json")
+    out = {"logged_in": False}
+    if not isinstance(auth, dict):
+        return out
+    tokens = auth.get("tokens")
+    if isinstance(tokens, dict) and (tokens.get("refresh_token") or tokens.get("access_token")):
+        claims = _jwt_payload(tokens.get("id_token") or "")
+        info = claims.get("https://api.openai.com/auth") or {}
+        out.update(logged_in=True, method="ChatGPT", email=claims.get("email") or None,
+                   plan=(info.get("chatgpt_plan_type") if isinstance(info, dict) else None) or None)
+    elif auth.get("OPENAI_API_KEY"):
+        out.update(logged_in=True, method="API key")
+    return out
+
+
+def root_window_open(user):
+    """Whether this user has a root-tier passkey window open right now, as
+    aigw-unlockd (root) answers its read-only `status` (the per-user window;
+    the deployment notes). Any failure: no."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(5)
+            s.connect("/run/aigw-unlockd.sock")
+            s.sendall((json.dumps({"verb": "status", "user": user}) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        st = json.loads(buf)
+    except (OSError, ValueError):
+        return False
+    return bool(st.get("ok") and st.get("unlocked") and st.get("tier") == "root")
+
+
+def main():
+    caller = os.environ.get("SUDO_USER") or ""
+    if os.geteuid() != 0 or not caller:
+        print("run this through sudo", file=sys.stderr)
+        return 2
+    if len(sys.argv) > 1:
+        print("no arguments", file=sys.stderr)
+        return 2
+    try:
+        members = grp.getgrnam(USERS_GROUP).gr_mem
+    except KeyError:
+        return 3
+    if caller not in members:
+        print("only an aigw user can list the logins", file=sys.stderr)
+        return 3
+    users = []
+    for name in sorted(set(members)):
+        try:
+            pw = pwd.getpwnam(name)
+        except KeyError:
+            continue
+        if pw.pw_uid < 1000 or name == "root":
+            continue
+        home, uid = pw.pw_dir, pw.pw_uid
+        scopes = {
+            "sandbox": {"claude": claude_login(home, uid, "sandhome"), "codex": codex_login(home, uid, "sandhome")},
+            "host": {"claude": claude_login(home, uid, ""), "codex": codex_login(home, uid, "")},
+        }
+        if os.path.isdir(os.path.join(home, "mailbox")):
+            scopes["email"] = {"claude": claude_login(home, uid, "mailbox")}
+        users.append({"user": name, "scopes": scopes})
+    root = None
+    if root_window_open(caller):
+        root = {"user": "root", "scopes": {"root": {"claude": claude_login("/root", 0, ""),
+                                                    "codex": codex_login("/root", 0, "")}}}
+    json.dump({"users": users, "root": root}, sys.stdout, ensure_ascii=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

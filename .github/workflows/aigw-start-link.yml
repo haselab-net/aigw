@@ -1,0 +1,29 @@
+# Each new issue gets a link that starts Claude on it in aigw
+# (the deployment notes): the link opens a confirmation in the viewer's own
+# aigw, which then runs Claude in the issue's own worktree of their devbox.
+name: aigw start link
+on:
+  issues:
+    types: [opened]
+permissions:
+  issues: write
+jobs:
+  comment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          # The aigw this repo's people log in to (a repository variable, so the
+          # public snapshot of this file names no host).
+          AIGW_URL: ${{ vars.AIGW_URL }}
+        with:
+          script: |
+            if (!process.env.AIGW_URL) return;
+            const ref = `${context.repo.owner}/${context.repo.repo}%23${context.issue.number}`;
+            const url = `${process.env.AIGW_URL}/agents/#issue=${ref}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `▶ [aigw で Claude を起動](${url})(自分の devbox の、この Issue 用の worktree で動きます。開くと確認が出ます)`,
+            });

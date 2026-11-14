@@ -1,0 +1,69 @@
+[Unit]
+# The trust anchor for root-shell passkey unlock. Runs as root so it can be
+# the sole caller of `systemctl start/stop aigw-root-tmux@<user>` and the
+# sole owner/writer of /etc/aigw/passkeys/<user>.json (root:root 0600). See
+# aigw-unlockd's own module docstring for the full trust-boundary rationale
+# (why the WebAuthn verdict is computed here and never in aigw-gateway/
+# aigw-backend, and why /run/aigw-unlockd.sock being 0666 is deliberate, not
+# a bug).
+Description=aigw root-shell passkey unlock daemon
+Documentation=https://github.com/haselab-net/aigw
+
+[Service]
+Type=simple
+# Not a template unit (%i) -- there is exactly one aigw-unlockd, handling
+# all users, unlike aigw-root-tmux@.service which is one-per-user.
+ExecStart=/usr/local/sbin/aigw-unlockd
+# Belt and suspenders alongside the daemon's own explicit os.chmod() calls:
+# a restrictive process umask means anything this daemon ever creates
+# without remembering to chmod it defaults to root-only, never to something
+# accidentally world-writable. The socket (0666, deliberately lax -- see
+# above) and the credential store (0600) are both chmod'd explicitly in code
+# regardless of this setting.
+UMask=0177
+Restart=on-failure
+RestartSec=2
+
+# Modest process hardening. Deliberately NOT ProtectSystem=strict: this
+# daemon writes directly to /etc/aigw/passkeys/ (not a systemd-managed
+# StateDirectory=) and to /run/aigw-unlockd.sock (not inside a
+# RuntimeDirectory=, because the task's specified socket path is flat, not
+# inside a per-unit subdirectory), and it shells out to `systemctl` which
+# talks to PID 1 over D-Bus. Getting ReadWritePaths= exactly right for that
+# combination without a live host to verify against risks silently breaking
+# the daemon in a way that is hard to diagnose from a unit file alone -- a
+# reviewer with a running host should consider tightening this further
+# (ProtectSystem=strict plus explicit ReadWritePaths=/etc/aigw/passkeys, and
+# checking that systemctl-over-D-Bus still works under it) as a follow-up,
+# rather than guessing at it blind without one.
+NoNewPrivileges=yes
+# ProtectHome removed (2026-08-31, was "yes"): _grant_access()/_revoke_
+# access() now call /usr/local/sbin/aigw-root-tmux-grant directly as a
+# child of THIS process (see "SEVER ACCESS, DON'T KILL THE SERVER" in
+# aigw-unlockd's own module docstring), not only via aigw-root-tmux@
+# <user>.service's own ExecStartPost/ExecStopPost the way it used to run
+# exclusively. That script manages a read-only ACL bridge onto a directory
+# under /root a root-shell pane's chat transcript needs to read -- under
+# ProtectHome=yes, a child process inherits this unit's mount namespace, in
+# which /root is made inaccessible (empty), so every such call failed with
+# "install: cannot create directory '/root/.claude': Read-only file
+# system" (caught 2026-08-31, live: this broke root-shell reconnection for
+# real). Tried `ReadWritePaths=/root` first as a narrower fix -- confirmed
+# by nsenter'ing into the running unit's own mount namespace that it does
+# NOT restore real access under ProtectHome=yes's "inaccessible" mode (only
+# documented to override ProtectSystem=/ProtectHome=read-only, evidently
+# not this mode), so removing ProtectHome= entirely is what actually works.
+# This daemon already runs as uid 0 with unrestricted filesystem access at
+# the DAC layer regardless; ProtectHome=yes was defense against this
+# daemon's OWN code touching /root by accident, not a hard boundary
+# something else relies on, so removing it costs no real isolation this
+# design ever leaned on.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

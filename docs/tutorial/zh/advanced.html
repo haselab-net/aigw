@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aigw 教程</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1d2330; --muted: #5b6575; --line: #dde2ea; --card: #f5f7fa;
+    --accent: #2f6fdf; --accent-soft: #e6eefc; --warn: #a15c00; --warn-soft: #fff4e0;
+    --code-bg: #eef1f5; --shot-border: #c9d0da;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #11151b; --fg: #e4e8ee; --muted: #9aa5b4; --line: #2a313b; --card: #182029;
+      --accent: #6f9ff5; --accent-soft: #1d2b44; --warn: #f0b35a; --warn-soft: #33270f;
+      --code-bg: #1d2530; --shot-border: #343d49;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.75 system-ui, -apple-system, "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 1.9rem; line-height: 1.3; margin: 8px 0 4px; }
+  h2 { font-size: 1.4rem; margin: 56px 0 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  h3 { font-size: 1.1rem; margin: 28px 0 8px; }
+  h4 { font-size: 1rem; margin: 20px 0 6px; }
+  p, li { max-width: 72ch; }
+  a { color: var(--accent); }
+  code, kbd, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .92em; }
+  code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--code-bg); padding: 12px 14px; border-radius: 8px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  kbd { border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 0 6px; background: var(--card); }
+  .lead { color: var(--muted); margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: .95rem; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  .scroll { overflow-x: auto; }
+  .note { background: var(--accent-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn { background: var(--warn-soft); border-radius: 8px; padding: 10px 14px; margin: 14px 0; }
+  .warn strong { color: var(--warn); }
+  nav.toc { background: var(--card); border-radius: 10px; padding: 12px 18px; margin: 20px 0; }
+  nav.toc ol { margin: 4px 0; padding-left: 1.4em; }
+  .shot { display: flex; gap: 20px; align-items: flex-start; margin: 16px 0; flex-wrap: wrap; }
+  .shot figure { margin: 0; flex: 0 0 auto; }
+  .shot img { width: 260px; max-width: 100%; border: 1px solid var(--shot-border); border-radius: 14px; display: block; }
+  .shot figcaption { font-size: .85rem; color: var(--muted); margin-top: 4px; max-width: 260px; }
+  .shot .side { flex: 1 1 280px; min-width: 0; }
+  ol.steps > li { margin-bottom: 6px; }
+  .diagram { margin: 16px 0; }
+  .diagram svg { width: 100%; height: auto; display: block; }
+  .diagram svg text { fill: var(--fg); font-family: inherit; }
+  .diagram .q { fill: var(--muted); }
+  .diagram .box { fill: none; stroke: var(--muted); stroke-width: 1.25; }
+  .diagram .acc { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+  .diagram .wrn { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.5; }
+  .diagram .ln { stroke: var(--muted); stroke-width: 1.25; fill: none; }
+  .diagram .mk { fill: var(--muted); }
+  .badge { display: inline-block; font-size: .8rem; padding: 0 8px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); }
+  footer { margin-top: 64px; color: var(--muted); font-size: .85rem; }
+  .editions { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+  .editions a { display: inline-block; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--line); text-decoration: none; background: var(--card); }
+  .editions a.here { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .langs { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; font-size: .85rem; margin: 0 0 4px; }
+  .langs a { padding: 2px 10px; border-radius: 999px; text-decoration: none; border: 1px solid transparent; }
+  .langs a.here { border-color: var(--line); background: var(--card); color: var(--fg); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>aigw 教程 进阶篇</h1>
+<nav class="langs" aria-label="Language"><a href="../advanced.html" lang="ja">日本語</a><a href="../en/advanced.html" lang="en">English</a><a href="../zh/advanced.html" lang="zh-CN" class="here" aria-current="page">简体中文</a></nav>
+<div class="editions"><a href="index.html">入口</a><a href="basic.html">基础篇</a><a href="advanced.html" class="here">进阶篇</a></div>
+<div class="note">聊天、终端、设置和共享界面的截图显示的是日文界面。aigw 本身可以在 设置 → 语言 中切换为简体中文。</div>
+
+<p class="lead">本篇是<a href="basic.html">基础篇</a>的续篇。介绍会话增多时的整理方法（文件夹、巡览、通知）、与其他会话的连接、沙箱之外（Email、主机、root）以及其他机器的用法。</p>
+
+<nav class="toc">
+<strong>目录</strong>
+<ol>
+  <li><a href="#folders">用文件夹整理</a></li>
+  <li><a href="#patrol">等待确认与巡览</a></li>
+  <li><a href="#notifications">通知列表</a></li>
+  <li><a href="#links">连接会话</a></li>
+  <li><a href="#where">沙箱、主机、root、Email 的区别</a></li>
+  <li><a href="#settings">设置界面与登录 Claude</a></li>
+  <li><a href="#passkey">Email 与通行密钥（钥匙）的注册</a></li>
+  <li><a href="#root">成为 root 的步骤</a></li>
+  <li><a href="#machines">其他机器与 Windows 机器黑板</a></li>
+  <li><a href="#faq">遇到问题时</a></li>
+</ol>
+</nav>
+
+<!-- ===================================================================== -->
+<h2 id="folders">1. 用文件夹整理</h2>
+
+<p>会话可以归入文件夹。文件夹中还可以再建文件夹，层数没有限制。</p>
+
+<div class="shot">
+  <figure><img src="img/11-folders.png" alt="列表中有文件夹“研究”，其中有文件夹“机器人”，再往里有两个会话。机器人文件夹上有共享中的标志"><figcaption>打开“研究”中的“机器人”后的样子。👥 表示整个文件夹正在共享</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li><strong>创建</strong>：列表上方的“＋ 新建文件夹”。要在某个文件夹中创建时，点该文件夹那一行的 <strong>＋</strong> →“在此新建文件夹”。</li>
+      <li><strong>放入、移动</strong>：按住行左侧的 ⠿ 拖动，在文件夹的行上松开即可放入其中。在行与行之间松开，则排序到该位置。也可以把整个文件夹放入另一个文件夹。</li>
+      <li><strong>展开、收起</strong>：点按文件夹的行。行上的数字是其中会话的数量，“等待确认”是其中正在等待回复的会话数量。</li>
+      <li><strong>批量停止、继续</strong>：点按文件夹行上的 ●，会停止其中所有正在运行的会话。停止后点按灰色的 ●，会把当时停止的会话一起继续。</li>
+      <li><strong>归档</strong>：用 🗄 归档整个文件夹。只能删除空文件夹（🗑）。</li>
+    </ul>
+  </div>
+</div>
+
+<h3>工作目录</h3>
+<div class="shot">
+  <figure><img src="img/12-folder-menu.png" alt="按文件夹的 ✏️ 后出现的菜单：重命名、设置工作目录、共享整个文件夹"><figcaption>文件夹 ✏️ 的菜单</figcaption></figure>
+  <div class="side">
+    <p>可以为文件夹指定一个<strong>工作目录</strong>（服务器上的位置）。用 ✏️ →“设置工作目录”，写成 <code>robot</code> 这样。</p>
+    <ul>
+      <li>位置用相对路径写。对沙箱会话来说是 <code>~/sandhome/robot</code>，对主机 shell 来说是自己主目录下，对 root shell 来说是 <code>/root</code> 下的同名位置。</li>
+      <li>点该文件夹的 <strong>＋</strong> →“在此文件夹新建会话”，列表上方的创建栏会显示“📁 机器人 · 工作目录 ~/robot”。按<strong>开始</strong>后，会话会在该位置启动，并放入该文件夹。如果该位置不存在，会自动创建。</li>
+      <li>无论从哪里创建，在工作目录中启动的新会话都会自动放入该文件夹。</li>
+      <li>没有填写工作目录的文件夹，会使用上级文件夹的工作目录。</li>
+    </ul>
+  </div>
+</div>
+
+<h3>按文件夹共享</h3>
+<p>用 ✏️ →“共享整个文件夹…”，可以共享其中的所有会话（包括子文件夹以及之后放入的会话）。对象以及“只读/协作”的选择方法，与单个会话的共享（<a href="basic.html#share">基础篇</a>）相同。root shell 会变为只读，Email 不会按文件夹共享。正在共享的文件夹会带有 👥。</p>
+
+<h3>归档中的文件夹</h3>
+<div class="shot">
+  <figure><img src="img/16-archive.png" alt="打开归档后的样子。归档中也有“研究”“机器人”文件夹，其中是已归档的会话"><figcaption>归档中也按同样的文件夹结构排列</figcaption></figure>
+  <div class="side">
+    <p>在文件夹中归档的会话，在“🗄 打开归档”里也会排在同一文件夹下。用 📤 恢复后会回到原来的文件夹。整个文件夹归档的，可以用该文件夹行上的 📤 一起恢复。</p>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="patrol">2. 等待确认与巡览</h2>
+
+<p>Claude 正在等待回复（工作已完成、请求批准计划等）的会话，会在列表中名称旁边带有黄色的“等待确认”。</p>
+
+<div class="shot">
+  <figure><img src="img/13-patrol.png" alt="聊天界面上方的巡览栏。有文件夹位置、上一个/下一个按钮、1/5、筛选选择栏、归档和垃圾桶按钮"><figcaption>点按聊天名称后打开的巡览栏</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li>在聊天界面<strong>点按名称部分</strong>，会打开巡览栏（再点按一次关闭）。</li>
+      <li>用 <strong>‹ 上一个、下一个 ›</strong> 可以不返回列表，直接切换到前后的会话。顺序与列表（包括文件夹内）一致。</li>
+      <li>在选择栏中可以选择“全部、运行中、等待确认”。选择“等待确认”后，就可以只依次查看正在等待回复的会话。</li>
+      <li>用 🗄 归档当前会话，用 🗑 删除对话记录，然后直接转到下一个。</li>
+      <li>栏上方的小字表示该会话位于列表中的哪个文件夹。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="notifications">3. 通知列表</h2>
+
+<div class="shot">
+  <figure><img src="img/14-notifications.png" alt="通知列表。列出日期时间、会话名称、正文，每条都有归档按钮"><figcaption>用 🔔 打开的通知列表。红色的 ● 表示尚未查看</figcaption></figure>
+  <div class="side">
+    <ul>
+      <li>用界面上方的 🔔 打开至今收到的通知（推送）列表。红色数字是尚未查看的数量。</li>
+      <li>每条都显示日期时间、会话名称和正文。点按即可打开该会话。</li>
+      <li>在列表中显示过的就算已查看。用 🗄 归档一条，用“全部归档”一起归档。</li>
+      <li><strong>已处理完的会自动移到归档</strong>：通知之后自己向该会话发送了内容，或者会话已结束、已归档、已删除，满足任一条件即可。原因会显示在归档栏中。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="links">4. 连接会话</h2>
+<p>用列表中的 🔗，可以把两个会话（例如沙箱中的 Claude 和主机上的 Claude）连接起来。连接后，只有当一方的 Claude 执行 <code>talkto "…"</code> 时，那段文字才会送到对方的输入框。并不会自动转发所有内容。用法 Claude 自己可以通过 <code>talkto --help</code> 查到。</p>
+
+<!-- ===================================================================== -->
+<h2 id="where">5. 沙箱、主机、root、Email 的区别</h2>
+
+<p>创建栏中的类型区别在于“在哪里运行”。平时只用<strong>沙箱</strong>（Claude、Codex、Shell(沙箱内)）。</p>
+
+<div class="diagram" role="img" aria-label="沙箱和 Email 信箱是服务器中各自独立的容器，主机和 root 在容器之外，要出去需要通行密钥">
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" font-size="13">
+  <text x="24" y="28" font-size="15" font-weight="600">要到容器之外（主机、root、Email），需要通行密钥</text>
+  <rect class="box" x="24" y="48" width="712" height="262" rx="10"/>
+  <text x="40" y="72" font-weight="600">服务器</text>
+  <rect class="acc" x="48" y="92" width="300" height="96" rx="8"/>
+  <text x="64" y="118" font-weight="600">沙箱（自己专属的容器）</text>
+  <text x="64" y="140" class="q" font-size="12">Claude / Codex / Shell(沙箱内)</text>
+  <text x="64" y="158" class="q" font-size="12">只能看到 ~/sandhome</text>
+  <text x="64" y="176" class="q" font-size="12">无需通行密钥。平时在这里</text>
+  <rect class="wrn" x="412" y="92" width="300" height="96" rx="8"/>
+  <text x="428" y="118" font-weight="600">Email 信箱（另一个容器）</text>
+  <text x="428" y="140" class="q" font-size="12">Email（仅限已配置的服务器）</text>
+  <text x="428" y="158" class="q" font-size="12">只能看到 ~/mailbox，沙箱中看不到它</text>
+  <text x="428" y="176" class="q" font-size="12">🔑 用主机级别的通行密钥解锁</text>
+  <rect class="wrn" x="48" y="208" width="300" height="84" rx="8"/>
+  <text x="64" y="234" font-weight="600">主机（容器之外，自己的权限）</text>
+  <text x="64" y="256" class="q" font-size="12">Shell(沙箱外,主机)。能看到真正的主目录</text>
+  <text x="64" y="274" class="q" font-size="12">🔑 用主机级别的通行密钥解锁</text>
+  <rect class="wrn" x="412" y="208" width="300" height="84" rx="8"/>
+  <text x="428" y="234" font-weight="600">root（服务器的管理员权限）</text>
+  <text x="428" y="256" class="q" font-size="12">Shell(root,沙箱外)。仅对获许可的人显示</text>
+  <text x="428" y="274" class="q" font-size="12">🔓 用 root 级别的通行密钥解锁</text>
+</svg>
+</div>
+
+<div class="scroll"><table>
+  <tr><th>类型（创建栏中的显示）</th><th>运行位置</th><th>能看到的内容</th><th>通行密钥</th><th>用途</th></tr>
+  <tr><td><strong>Claude</strong> / Codex / Shell(沙箱内)</td><td>沙箱：自己专属的容器</td><td>只有 <code>~/sandhome</code></td><td>不需要</td><td>所有日常开发</td></tr>
+  <tr><td><strong>Email</strong></td><td>Email 信箱：与沙箱分开的另一个容器（仅限已配置的服务器）</td><td>只有 <code>~/mailbox</code></td><td>🔑 主机级别</td><td>邮件、个人信息等不想放在开发用沙箱中的东西</td></tr>
+  <tr><td>Shell(沙箱外,主机)</td><td>服务器本身，以自己的权限</td><td>真正的主目录（<code>~/</code>）等</td><td>🔑 主机级别</td><td>需要操作容器外的文件时</td></tr>
+  <tr><td>Shell(root,沙箱外)</td><td>服务器本身，以 root 身份</td><td>全部</td><td>🔓 root 级别</td><td>管理服务器。仅对获许可的人显示</td></tr>
+</table></div>
+
+<ul>
+  <li><strong>为什么平时用沙箱</strong>：在容器中，无论 Claude 执行什么，都到达不了自己 <code>~/sandhome</code> 之外。所以即使跳过权限确认也是安全的。</li>
+  <li><strong>为什么要把 Email 信箱分开</strong>：在沙箱中，通过 <code>npm install</code> 装进来的他人的软件包也会运行。如果把邮件之类的信息放在那里，这些软件包也能读到。Email 信箱是沙箱看不到的另一个容器，对话记录也保存在 <code>~/mailbox</code> 一侧。</li>
+  <li>在机器选择中选择通过 ssh 连接的其他机器，就可以使用那台机器上的 Claude 或 shell。它与沙箱不共享文件（<a href="#machines">第 9 章</a>）。</li>
+  <li>在列表中，可以通过名称前的图标区分类型：🛠️ 沙箱、📫 Email、🏠 主机、🔒 root、💻 其他机器。</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="settings">6. 设置界面与登录 Claude</h2>
+
+<p>第一次使用 Claude 之前，要<strong>在每个使用位置各登录一次</strong> Claude。沙箱、主机、root、其他机器的登录信息是各自独立的。只有 Email 信箱在设置界面中没有对应的行，要<a href="#passkey">在信箱中</a>登录。</p>
+
+<div class="shot">
+  <figure><img src="../img/07-settings.png" alt="设置界面。Accounts 标题下有沙箱内、沙箱外(主机)、root 几行，每行都有登录和退出登录按钮"><figcaption>设置界面。每行显示当前登录的账号。标题旁边是显示语言的选择栏</figcaption></figure>
+  <div class="side">
+    <h3>打开方法</h3>
+    <p>在首页的机器选择（<code>server</code> 栏）中选择<strong>设置</strong>。返回时，在同一栏中重新选择 <code>server</code>（本服务器）。</p>
+    <h3>登录步骤</h3>
+    <ol class="steps">
+      <li>按“Accounts”中<strong>沙箱内</strong>那一行（如果要在主机或其他机器上使用，就是相应那一行）的<strong>登录</strong>。会打开用于登录的聊天界面。</li>
+      <li>聊天中会显示一个 URL，点按后在浏览器中打开，用 Claude 账号授权。</li>
+      <li>复制显示的代码，粘贴到聊天输入框中并点<strong>执行</strong>。<strong>粘贴的代码不会显示在界面上</strong>，这是正常的。</li>
+      <li>会显示一行成功或失败的结果，用于登录的会话会自动消失。设置界面那一行显示出邮箱地址，就完成了。</li>
+    </ol>
+    <ul>
+      <li>该行显示“未登录”（黄色）的位置，那里的 Claude 无法运行。</li>
+      <li><strong>Codex</strong> 一栏也是同样的步骤（ChatGPT 账号）。</li>
+      <li>用标题旁边的 ⟳ 可以重新获取状态。</li>
+      <li>用标题旁边的选择栏可以更改<strong>显示语言</strong>（日本語、English、简体中文）。选择的语言会被保存，在其他设备上登录后也会相同。登录界面的下方也可以选择。</li>
+      <li>用最下方的<strong>👥 所有人的登录</strong>，可以查看本服务器上所有人在哪里登录了哪个 Claude 或 ChatGPT 账号（仅供查看）。root 的登录只对正在解锁 root 的人显示。</li>
+      <li>其上方的<strong>结束 Chrome</strong>是停止自己用的测试浏览器（有界面 Chrome）的按钮。变卡时可以按。下次使用时会自动重新启动。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="passkey">7. Email 与通行密钥（钥匙）的注册</h2>
+
+<p>像 Email、主机、root 这样要到容器之外时，需要用<strong>通行密钥</strong>（由手机的指纹、面容识别或电脑的 PIN 保护的钥匙）解锁。这样即使 aigw 的登录被盗，没有你手边的设备也出不去。</p>
+
+<h3>注册通行密钥（首次一次）</h3>
+<ol class="steps">
+  <li>从电脑用 SSH 登录服务器（<a href="basic.html#account">基础篇 第 1 章</a>）。对于只允许从内部网络 SSH 的服务器，要先进入内部网络。<pre><code>ssh <ユーザー名>@<サーバー>
+aigw-passkey register</code></pre></li>
+  <li>会显示一个 URL。请在 <strong>5 分钟内</strong>，用想放置通行密钥的设备（平时使用 aigw 的手机等）的浏览器打开它。这个 URL 在外部也能打开（只有 SSH 需要内部网络）。</li>
+  <li>在“注册通行密钥”页面按<strong>注册通行密钥</strong>，用指纹、面容识别或 PIN 确认。</li>
+  <li>显示完成即可。想增加设备时，在那台设备上再执行一遍同样的步骤。</li>
+</ol>
+<div class="note">通行密钥是每台服务器各自独立的。如果在其他服务器上也要使用，也要在那边注册。已注册的列表可以用 <code>aigw-passkey list</code> 查看，当前状态可以用 <code>aigw-passkey status</code> 查看。</div>
+
+<h3>使用 Email</h3>
+<div class="shot">
+  <figure><img src="../img/08-email-bar.png" alt="在创建栏中选择了 Email。文件夹为 Email，继续一栏为新建"><figcaption>在创建栏中选择了 Email</figcaption></figure>
+  <div class="side">
+    <ol class="steps">
+      <li>在创建栏中选择 <strong>Email</strong>（只有已配置的服务器才有）。文件夹从自己的 <code>~/mailbox</code> 开始，可以和 Claude 一样选择子文件夹，或用 <code>＋</code> 新建。</li>
+      <li>按<strong>开始</strong>后，会弹出设备的通行密钥确认。用指纹等确认后，右上角出现 🔑 表示已解锁，会话随即启动。</li>
+      <li><strong>仅限第一次 Email 会话</strong>，信箱中的 Claude 会要求登录。用 🖥️ 打开画面面板，用按键行的 <kbd>↑</kbd> <kbd>↓</kbd> <kbd>⏎</kbd> 选择登录方式（Claude 账号），打开出现的 URL 并授权，把显示的代码粘贴到输入框中点<strong>执行</strong>。接着如果出现是否跳过权限确认的确认，选择同意的那一项。第二次起不会再出现。</li>
+      <li>之后的用法与沙箱中的 Claude 相同。<code>~/mailbox</code> 一开始是空的，需要的工具（读取邮件的脚本等）请自己准备，或者请 Claude 准备。</li>
+    </ol>
+    <ul>
+      <li>解锁状态会持续到你锁定或经过 <strong>2 小时</strong>为止。</li>
+      <li>点按右上角的 🔑 可以立即锁定。锁定期间打开 Email 会话，会出现“🔒 … 解锁”的提示条，点按它即可解锁。</li>
+      <li>沙箱中的 Claude 看不到 Email 信箱。反过来，也请不要下指令把 Email 的内容带到沙箱中。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="root">8. 成为 root 的步骤</h2>
+
+<p>root（服务器的管理员权限）<strong>只有管理员许可的人</strong>才能使用。途径有两种，都需要本人操作。</p>
+
+<h3>使用 aigw 的“Shell(root,沙箱外)”</h3>
+<ol class="steps">
+  <li>请管理员帮忙。管理员在服务器上执行以下命令，并把显示的 URL 交给你。<pre><code>sudo aigw-passkey register <ユーザー名> --tier root</code></pre></li>
+  <li>在 <strong>5 分钟内</strong>用自己设备的浏览器打开收到的 URL，按<strong>注册通行密钥</strong>。这就是 root 级别的通行密钥（也可以用于解锁主机和 Email）。</li>
+  <li>重新加载 aigw 后，创建栏中会出现 <strong>Shell(root,沙箱外)</strong>。选择它并按<strong>开始</strong>，用通行密钥确认后右上角会变为 🔓，root shell 随即打开。</li>
+  <li>要在 root shell 中使用 Claude，需要先在设置界面的 <strong>root</strong> 一行登录 Claude（<a href="#settings">第 6 章</a>）。</li>
+</ol>
+<div class="warn"><strong>即使锁定，root shell 中的工作也不会停止。</strong> 只是窗口关闭后从 aigw 看不到了，下次解锁就能回到同一画面。</div>
+
+<h3>通过 SSH 使用 <code>sudo</code></h3>
+<p>在服务器上获准使用 <code>sudo</code> 的人，可以用 SSH 登录后使用 <code>sudo</code>。许可给谁由管理员决定。</p>
+
+<!-- ===================================================================== -->
+<h2 id="machines">9. 其他机器与 Windows 机器黑板</h2>
+
+<p>如果有通过 ssh 连接到服务器的其他机器（装有 GPU 的 Windows 机器等），它们会列在机器选择（<code>server</code> 栏）中。选择后，列表和创建栏会切换为那台机器的内容，可以在那台机器上运行 Claude 或 shell。连不上的机器（关机等）不会显示。</p>
+<ul>
+  <li>在 Windows 机器上，可以在创建栏中选择工作驱动器和文件夹（<code>C:</code>、<code>D:</code> …）。也可以选择接着之前的对话。</li>
+  <li>用 🐚/🪟 切换，选择在没有画面的地方（🐚）运行，还是在已登录的桌面（🪟，运行带画面的应用时）上运行。</li>
+  <li>其他机器上的会话在列表中带有 💻。</li>
+</ul>
+
+<h3>Windows 机器黑板</h3>
+<div class="shot">
+  <figure><img src="img/15-board.png" alt="Windows 机器黑板。每台机器显示使用者和会话、要做的事和状态（使用中、30分钟以上无活动、结束）"><figcaption>用 📋 打开的黑板（名字为模拟数据）</figcaption></figure>
+  <div class="side">
+    <p>Windows 机器由几个人共用，所以有一块黑板，可以看出“哪台机器正被谁的哪个会话使用”。用界面上方的 📋 打开。<strong>无论是人还是 Claude，使用前只要看一下黑板即可，不需要填写。</strong></p>
+    <ul>
+      <li><strong>自动</strong>：在该 Windows 机器上运行的 aigw 会话会自动列出。</li>
+      <li><strong>SSH（自动）</strong>：在沙箱或主机的会话中用 <code>ssh</code>、<code>scp</code>、<code>sftp</code>、<code>rsync</code> 连接 Windows 机器时，也会自动列出。连接结束后会变为“结束（SSH 已断开）”。</li>
+      <li>每 3 分钟检查一次，已停止或掉线的会话显示“结束”，聊天 30 分钟以上没有动静的显示“30分钟以上无活动”。</li>
+      <li>只有想留下要做的事的备注时，才需要用 ✏️ 补充，或用“＋ 使用”手写（手写条目会一直保留，直到自己“取消”）。在会话中可以用 <code>aigw-board</code> 查看黑板。</li>
+      <li>使用前请先看黑板，如果有人在用，请和对方商量。</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="faq">10. 遇到问题时</h2>
+<div class="scroll"><table>
+  <tr><th>症状</th><th>处理方法</th></tr>
+  <tr><td>找不到会话</td><td>可能在文件夹中。点按文件夹的行展开。也有可能不小心把文件夹在另一个文件夹上松开，放进了里面。也看看归档中（<a href="#folders">第 1 章</a>）</td></tr>
+  <tr><td>Email 或主机 shell 要求“解锁”而无法继续</td><td>确认是否注册了通行密钥、是否在这台设备上注册的（<a href="#passkey">第 7 章</a>）。如果出现了锁定中的提示条，点按它</td></tr>
+  <tr><td>名称变成了 🔒</td><td>Email、主机、root 的会话在解锁前会隐藏名称。从列表上方的提示条解锁</td></tr>
+  <tr><td>Claude 没有任何回复、要求登录</td><td>在设置界面确认该位置那一行是否显示“未登录”，然后登录（<a href="#settings">第 6 章</a>）</td></tr>
+  <tr><td>其他机器没有出现在机器选择中</td><td>连不上那台机器（电源、网络）。找管理员商量</td></tr>
+  <tr><td>想知道 Windows 机器是否有人在用</td><td>看 📋 黑板（<a href="#machines">第 9 章</a>）</td></tr>
+  <tr><td>通知太多</td><td>在 🔔 列表中点“全部归档”。已处理完的会自动移过去（<a href="#notifications">第 3 章</a>）</td></tr>
+  <tr><td>不清楚基本操作</td><td><a href="basic.html#faq">基础篇的“遇到问题时”</a></td></tr>
+</table></div>
+<footer>aigw 教程 进阶篇 · 2026-11-06 · 截图按手机宽度拍摄。用户名、机器名等已替换，或是在装入模拟数据的同一界面上拍摄的</footer>
+</div>
+</body>
+</html>

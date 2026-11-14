@@ -1,0 +1,130 @@
+#!/bin/bash
+# talkto "message" -- ssh:<machine> counterpart of /usr/local/bin/talkto
+# (aigw workspace doc, `the deployment notes`), installed on each SSH_MACHINES
+# entry as ~/.local/bin/talkto.
+#
+# Same contract as the Python original: append one JSON line, never touch
+# the network. The difference is where the file lives. An ssh:<machine>
+# pane shares no filesystem with the aigw host, so instead of a full
+# $AIGW_TALKTO path the backend hands the pane only $AIGW_TALKTO_ID (its
+# session id, via `tmux respawn-pane -e`), and this script writes to
+# $HOME/.aigw-talkto/<id>.jsonl on this machine; the backend reads that file
+# back over ssh while the session is linked.
+#
+# "#!/bin/bash", not "#!/usr/bin/env bash": on winbox-a a non-login MSYS2
+# bash has C:\Windows\System32 ahead of /usr/bin, so `env bash` found the
+# WSL launcher (measured 2026-10-04). /bin/bash resolves to MSYS2/Git Bash/
+# Linux bash alike.
+#
+# Plain bash + base64 rather than Python: on the Windows (MSYS2) machines
+# `python3` is only the Microsoft Store stub. The text travels base64-encoded
+# ({"ts":..,"id":..,"b64":".."}), so no JSON escaping is needed here at all.
+#
+# Options and the delivery report are the same as the Python talkto's (its
+# docstring, 2026-10-28): the backend writes each line's outcome back over
+# ssh to $HOME/.aigw-talkto/<id>.status.jsonl as {"id",..,"msg_b64",..},
+# which this waits for. Unlike a local session, a line is only collected
+# while the session is linked, so with no link this just times out.
+set -u
+
+WAIT_SECONDS=15
+
+help() {
+    cat <<EOF
+使い方: talkto [オプション] "相手に送る文"
+        talkto [オプション] <<'END'
+        複数行の文
+        END
+
+aigw の「セッション連携」でこのセッションとつながっている、もう一方のセッション
+(別の Claude Code など)に、文を1つ送ります。送られるのは talkto に渡した文だけで、
+あなたの応答が自動で転送されることはありません。
+
+送ったあと、aigw が転送した結果を最大${WAIT_SECONDS}秒待って表示します:
+  届きました(…)            相手の入力欄に入った(終了コード 0)
+  解錠が閉じている…          相手が sandbox の外で、解錠を待っている(終了コード 1)
+  まだ確認できません          時間内に結果が来なかった。連携がつながっていないときもこれになる。
+                             あとで届くことがあるので、同じ文を送り直さないでください(終了コード 0)
+「届きました」は相手の入力欄に入ったところまでで、相手が返事をするかは分かりません。
+
+オプション:
+  -h, --help, -help   この説明を表示する(何も送らない)
+  --no-wait           結果を待たずに終わる
+  -                   文を標準入力から読む(文の引数が無いときも同じ)
+  --                  ここから後はオプションでなく文として扱う(- で始まる文を送るとき)
+
+文に \` や \$ や引用符が入るときは、シェルに解釈されないよう、上の <<'END' の形か
+単一引用符 '...' で渡してください。引数が複数あれば空白でつないで1つの文にします。
+EOF
+}
+
+usage_error() {
+    echo "talkto: $1" >&2
+    echo '使い方: talkto "相手に送る文"   (詳しくは talkto --help)' >&2
+    exit 2
+}
+
+no_wait=0
+from_stdin=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        -h|--help|-help) help; exit 0 ;;
+        --no-wait) no_wait=1; shift ;;
+        -) shift; [ "$#" -eq 0 ] || usage_error "'-'(標準入力から読む)のあとに文は付けられません"; from_stdin=1; break ;;
+        -?*) usage_error "知らないオプションです: $1('-' で始まる文は talkto -- \"$1…\" で送れます)" ;;
+        *) break ;;
+    esac
+done
+if [ "$from_stdin" -eq 1 ] || [ "$#" -eq 0 ]; then
+    [ -t 0 ] && usage_error "送る文がありません"
+    text=$(cat; printf x); text=${text%x}
+else
+    text="$*"
+fi
+if [ -z "${text//[[:space:]]/}" ]; then
+    usage_error "送る文が空です"
+fi
+
+if [ -n "${AIGW_TALKTO:-}" ]; then
+    # Should not happen on an ssh:<machine> (the backend never sets it
+    # there), but honour it if some future setup does.
+    path="$AIGW_TALKTO"
+    status="$(dirname "$path")/talkto_status.jsonl"
+elif [ -n "${AIGW_TALKTO_ID:-}" ]; then
+    case "$AIGW_TALKTO_ID" in
+        *[!A-Za-z0-9_-]*)
+            echo "talkto: invalid \$AIGW_TALKTO_ID" >&2
+            exit 1 ;;
+    esac
+    dir="$HOME/.aigw-talkto"
+    mkdir -p "$dir" || exit 1
+    path="$dir/$AIGW_TALKTO_ID.jsonl"
+    status="$dir/$AIGW_TALKTO_ID.status.jsonl"
+else
+    echo "talkto: \$AIGW_TALKTO_ID is not set -- this shell was not started by aigw, " \
+         "or this session was started before ssh:<machine> talkto support" >&2
+    exit 1
+fi
+
+id="$(date +%s)-$$-$RANDOM"
+b64=$(printf '%s' "$text" | base64 | tr -d '\r\n') || exit 1
+printf '{"ts":%s,"id":"%s","b64":"%s"}\n' "$(date +%s)" "$id" "$b64" >> "$path" || exit 1
+if [ "$no_wait" -eq 1 ]; then
+    echo "talkto: 送りました(結果は待っていません)"
+    exit 0
+fi
+
+end=$(( $(date +%s) + WAIT_SECONDS ))
+while [ "$(date +%s)" -lt "$end" ]; do
+    line=$(grep -F "\"id\": \"$id\"" "$status" 2>/dev/null | tail -n 1)
+    if [ -n "$line" ]; then
+        msg=$(printf '%s' "$line" | sed -n 's/.*"msg_b64": "\([A-Za-z0-9+\/=]*\)".*/\1/p' | base64 -d 2>/dev/null)
+        echo "talkto: ${msg:-$line}"
+        case "$line" in *'"status": "delivered"'*) exit 0 ;; *) exit 1 ;; esac
+    fi
+    sleep 1
+done
+echo "talkto: 受け付けましたが、届いたかはまだ確認できません(連携がつながっていない可能性もあります)。" \
+     "あとで届くことがあるので、同じ文を送り直さないでください。"
+exit 0

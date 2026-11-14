@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""aigw-task-hook-install -- put the aigw hooks on ssh machines
+(the deployment notes, the deployment notes).
+
+    sudo -u <aigw user> aigw-task-hook-install [--dry] [machine ...]
+
+For each machine (default: every SSH_MACHINES entry in
+/etc/aigw/ssh_machines.json, one per ssh host -- the "-desktop" twins share
+their machine's home), over the backend's own ssh config:
+  - ~/.local/bin/aigw-task-hook  <- aigw-task-hook-remote (next to this
+    script) with the status-line rule of aigw-task-hook (also next to it)
+  - ~/.claude/settings.json      <- hooks SessionStart ("start"), Stop and
+    Notification ("event"); any earlier aigw-task-hook entries are replaced,
+    everything else is kept. The old file is kept as
+    settings.json.bak-aigw-hook-<date>.
+A machine that cannot be reached is reported and skipped.
+"""
+import datetime
+import json
+import os
+import runpy
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SSH = ["ssh", "-F", "/opt/aigw-ssh/config", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+MACHINES = "/etc/aigw/ssh_machines.json"
+CMD = "~/.local/bin/aigw-task-hook"
+EVENTS = {"SessionStart": "start", "Stop": "event", "Notification": "event"}
+
+
+def ssh(host, cmd, data=None):
+    return subprocess.run(SSH + [host, cmd], input=data, capture_output=True, timeout=60)
+
+
+def script():
+    rule = runpy.run_path(os.path.join(HERE, "aigw-task-hook"))["RULE"]
+    with open(os.path.join(HERE, "aigw-task-hook-remote"), encoding="utf-8") as f:
+        text = f.read()
+    assert "@RULE@" in text and "AIGW_RULE_END" not in rule
+    return text.replace("@RULE@", rule)
+
+
+def merged(settings):
+    hooks = settings.setdefault("hooks", {})
+    for ev, mode in EVENTS.items():
+        groups = [g for g in hooks.get(ev, []) if not any(
+            "aigw-task-hook" in str(h.get("command", "")) for h in g.get("hooks", []))]
+        groups.append({"hooks": [{"type": "command", "command": f"{CMD} {mode}"}]})
+        hooks[ev] = groups
+    return settings
+
+
+def install(host, body, dry):
+    r = ssh(host, "cat ~/.claude/settings.json 2>/dev/null || true")
+    if r.returncode != 0:
+        return f"unreachable ({r.stderr.decode(errors='replace').strip()[:80]})"
+    raw = r.stdout.decode("utf-8", errors="replace").strip()
+    try:
+        settings = json.loads(raw) if raw else {}
+    except ValueError:
+        return "settings.json is not JSON; left alone"
+    new = json.dumps(merged(settings), ensure_ascii=False, indent=2) + "\n"
+    if dry:
+        return "would install; settings would become:\n" + new
+    r = ssh(host, f'mkdir -p ~/.local/bin && cat > {CMD}.new && chmod 755 {CMD}.new && mv -f {CMD}.new {CMD}',
+            body.encode())
+    if r.returncode != 0:
+        return f"script not installed: {r.stderr.decode(errors='replace').strip()[:120]}"
+    stamp = datetime.date.today().strftime("%Y%m%d")
+    r = ssh(host, f'mkdir -p ~/.claude && f=~/.claude/settings.json; '
+                  f'[ -f "$f" ] && [ ! -f "$f.bak-aigw-hook-{stamp}" ] && cp -p "$f" "$f.bak-aigw-hook-{stamp}"; '
+                  f'cat > "$f.new" && mv -f "$f.new" "$f"', new.encode())
+    if r.returncode != 0:
+        return f"settings not written: {r.stderr.decode(errors='replace').strip()[:120]}"
+    return "installed"
+
+
+def main():
+    args = sys.argv[1:]
+    dry = "--dry" in args
+    names = [a for a in args if not a.startswith("--")]
+    with open(MACHINES, encoding="utf-8") as f:
+        machines = json.load(f)
+    hosts = []
+    for name in names or list(machines):
+        host = (machines.get(name) or {}).get("ssh_host", name)
+        if host not in hosts:
+            hosts.append(host)
+    body = script()
+    for host in hosts:
+        try:
+            print(f"{host}: {install(host, body, dry)}")
+        except subprocess.TimeoutExpired:
+            print(f"{host}: timed out")
+
+
+if __name__ == "__main__":
+    main()

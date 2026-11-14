@@ -1,0 +1,35 @@
+name: タスク
+description: 人か Claude が手を動かす1件の作業
+type: Task
+projects: ["haselab-net/4"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        起票すると Project「AIGW」に入る。Status・Worker・Area は Project 側で設定する。
+        大きな作業の一部なら、起票後に親 Issue の「Sub-issues」からこの Issue をぶら下げる。
+  - type: textarea
+    id: goal
+    attributes:
+      label: 目的
+      description: 何のためにやるか(検証したい問い・困っていること)
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: 完了条件
+      description: 何ができたら終わりか。テスト(`python3 -m unittest discover -s tests`)や稼働中のホストでの確認方法があれば書く
+      placeholder: "- [ ] …"
+    validations:
+      required: true
+  - type: textarea
+    id: refs
+    attributes:
+      label: 参照
+      description: 仕様はホストの文書の節 IDか、GitHub 上のコードの URL で。手元のパスへのリンクは使わない
+  - type: textarea
+    id: notes
+    attributes:
+      label: メモ
+      description: 制約・前提・未決事項など

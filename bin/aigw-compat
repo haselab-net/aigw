@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""aigw-compat -- does this Claude Code / Codex still behave the way aigw
+expects? (the deployment notes, 2026-11-09, the user: "クロードやコデックスのバージョンが
+上がった時にこの aigw が期待してる仕様を満たしているか確認して…毎朝のチェックの
+中に入れて欲しい")
+
+    aigw-compat versions             installed versions (this host, its containers, the ssh machines)
+    aigw-compat check [--no-live]    run the checks with root's own Claude Code and the shared Codex
+    aigw-compat daily DIR [--no-save]  fleet-seccheck's 5:00 run: versions, compare with yesterday,
+                                     check when a version changed (or the last check failed);
+                                     writes DIR/aigw-compat.md, exits 1 if a check failed
+
+Run as root on the aigw host. Every check goes through aigw-backend's own
+code (loaded as a module, like the unit tests), so "passes" means "what aigw
+does today works with this version". The live checks start the real CLIs in
+a private tmux server and a throwaway folder, on the cheapest model: a few
+short turns a day, and only when a version changed.
+
+Never runs a user's binary as root (a user can replace the one in their
+home): their versions are read from each install's symlink. The live Claude
+checks use root's own install and login (the one fleet-seccheck already
+uses; `claude update` first -- the same channel as the users' installs), as
+a root-shell runs it: Claude Code refuses --dangerously-skip-permissions for
+root, so the container's "claude-tui" screen texts are checked in the binary
+instead. The shared Codex is root-owned; its live check runs as CHECK_USER
+with that user's Codex login. A usage limit or an expired login is "could
+not check" (retried the next morning), not a failure.
+"""
+import argparse
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+BACKEND = os.environ.get("AIGW_COMPAT_BACKEND", "/usr/local/sbin/aigw-backend")
+ROOT_CLAUDE = "/root/.local/bin/claude"
+CODEX = "/opt/sandbox-shared/codex/codex"
+CHECK_USER = os.environ.get("AIGW_COMPAT_USER", "")       # runs the live checks: its Claude Code and Codex logins (set by the caller)
+CODEX_USER = CHECK_USER
+SSH_USER = CHECK_USER                                       # whose aigw ssh config reaches the machines
+STATE = Path("/var/lib/aigw-compat/state.json")
+MODEL = "haiku"
+VER_RE = re.compile(r"(\d+\.\d+\.\d+)")
+
+
+# ---------------------------------------------------------------- versions
+def _ver_from_link(path):
+    """X.Y.Z from an install's symlink (…/versions/X.Y.Z), without running it."""
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return None
+    m = VER_RE.search(os.path.basename(target))
+    return m.group(1) if m else None
+
+
+def _run(cmd, timeout=60, **kw):
+    try:
+        # stdin closed: `codex exec` otherwise waits for input on an open stdin.
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL, **kw)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return subprocess.CompletedProcess(cmd, 255, "", str(e))
+
+
+def versions_local():
+    v = versions(ssh=False)
+    return v
+
+
+def versions(ssh=True):
+    """{"claude": {where: version}, "codex": {where: version}, "ssh": {machine: version}}"""
+    out = {"claude": {}, "codex": {}, "ssh": {}}
+    r = _run([ROOT_CLAUDE, "--version"])
+    m = VER_RE.search(r.stdout)
+    out["claude"]["root"] = m.group(1) if m else None
+    for pattern, kind in (("/home/*/.local/bin/claude", "host"), ("/home/*/sandhome/.local/bin/claude", "box"),
+                          ("/home/*/mailbox/.local/bin/claude", "mail")):
+        for p in sorted(glob.glob(pattern)):
+            user = p.split("/")[2]
+            v = _ver_from_link(p)
+            if v:
+                out["claude"][f"{kind}:{user}"] = v
+    r = _run([CODEX, "--version"])
+    m = VER_RE.search(r.stdout)
+    out["codex"]["shared"] = m.group(1) if m else None
+    try:
+        machines = json.load(open("/etc/aigw/ssh_machines.json"))
+    except (OSError, ValueError):
+        machines = {}
+    seen = set()
+    for name, spec in (machines.items() if ssh else ()):
+        host = spec.get("ssh_host", name)
+        if host in seen:
+            continue
+        seen.add(host)
+        # The newest install folder, not `claude --version`: over ssh the
+        # Windows claude.exe ignores its arguments (it waits for a prompt).
+        r = _run(["sudo", "-u", SSH_USER, "ssh", "-F", "/opt/aigw-ssh/config", "-o", "ConnectTimeout=8",
+                  "-o", "BatchMode=yes", host, "ls -t ~/.local/share/claude/versions 2>/dev/null | head -1"], timeout=40)
+        m = VER_RE.search(r.stdout)
+        out["ssh"][host] = m.group(1) if m else None
+    return out
+
+
+# ---------------------------------------------------------------- checks
+class Checks:
+    def __init__(self):
+        self.results = []   # (area, name, ok, detail)
+
+    def add(self, area, name, ok, detail=""):
+        self.results.append((area, name, bool(ok), str(detail)[:400]))
+        print(f"{'ok  ' if ok else 'FAIL'} {area}/{name} {detail if not ok else ''}".rstrip(), flush=True)
+
+    def failed(self):
+        return [r for r in self.results if not r[2]]
+
+
+def user_home():
+    """The checking user's container $HOME (~/sandhome): where aigw's
+    "claude-tui" runs, logged in, with that install."""
+    return Path(pwd.getpwnam(CHECK_USER).pw_dir) / "sandhome"
+
+
+CLAUDE_HOME = Path("/root")
+
+
+class Unavailable(Exception):
+    """The account cannot answer (usage limit, expired login): not aigw's
+    problem, and not a result -- try again next morning."""
+
+
+UNAVAILABLE_RE = re.compile(r"hit your .*limit|usage limit|Failed to authenticate|OAuth|Please run /login|Not logged in|rate limit",
+                            re.IGNORECASE)
+
+
+def as_user(*cmd, home=None):
+    return ["sudo", "-u", CHECK_USER, "env", f"HOME={home or user_home()}", *cmd]
+
+
+def load_backend():
+    loader = importlib.machinery.SourceFileLoader("aigw_backend_compat", BACKEND)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    scratch = Path(tempfile.mkdtemp(prefix="aigw-compat-sessions-"))
+    mod.SESSIONS_DIR = scratch / "sandhome"
+    mod.MAIL_SESSIONS_DIR = scratch / "mailbox"
+    return mod
+
+
+def check_claude_static(c, exe):
+    r = _run([exe, "--help"])
+    help_text = r.stdout + r.stderr
+    for flag in ("--session-id", "--resume", "--print", "--output-format", "--input-format", "--verbose",
+                 "--dangerously-skip-permissions", "--settings", "--model", "--permission-mode", "--allowedTools"):
+        c.add("claude", f"flag {flag}", flag in help_text, "not in `claude --help`")
+    try:
+        blob = Path(os.path.realpath(exe)).read_bytes()
+    except OSError as e:
+        c.add("claude", "binary", False, e)
+        return
+    # Names aigw relies on that no CLI flag shows (the deployment notes, PANE_ENV, mark_claude_onboarded).
+    # The screen texts aigw waits for in the container's "claude-tui" (run there with
+    # --dangerously-skip-permissions, which the live check below cannot use as root).
+    for s in (b"CLAUDE_CODE_DISABLE_AGENT_VIEW", b"continuedInSessionId", b"parkedJobId", b"hasCompletedOnboarding",
+              b"last_assistant_message", b"transcript_path", B_TUI_READY, B_TRUST):
+        c.add("claude", f"string {s.decode()}", s in blob, "no longer in the binary")
+
+
+def check_claude_headless(c, B, exe, work):
+    """`claude -p … --output-format stream-json --verbose` (the "claude" preset, the voice Haiku)."""
+    sid = str(uuid.uuid4())
+    r = _run([exe, "-p", "Reply with just the word OK.", "--output-format", "stream-json", "--verbose",
+              "--model", MODEL, "--session-id", sid], timeout=180, cwd=work)
+    types, result = [], None
+    for line in r.stdout.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        types.append((obj.get("type"), obj.get("subtype")))
+        if obj.get("type") == "result":
+            result = obj.get("result")
+    if isinstance(result, str) and UNAVAILABLE_RE.search(result):
+        raise Unavailable(result)
+    c.add("headless", "system/init line", ("system", "init") in types, f"types seen: {types[:6]} rc={r.returncode} {r.stderr[:200]}")
+    c.add("headless", "result line with the answer", isinstance(result, str) and "OK" in result, f"result={result!r}")
+    path = B.claude_project_dir(work, home=CLAUDE_HOME) / f"{sid}.jsonl"
+    c.add("headless", "transcript where aigw looks", path.exists(), path)
+    if path.exists():
+        _, evs = B._split_assistant_text_events(path.read_bytes() + b"\n")
+        c.add("headless", "transcript parsed by aigw", any("OK" in e.get("text", "") for e in evs if e["type"] == "agent_output"),
+              f"events: {[e['type'] for e in evs]}")
+
+
+class Pane:
+    def __init__(self, sock, name):
+        self.sock, self.name = sock, name
+
+    def tmux(self, *args, timeout=15):
+        return _run(["tmux", "-S", self.sock, *args], timeout=timeout)
+
+    def screen(self):
+        return self.tmux("capture-pane", "-p", "-J", "-t", self.name).stdout
+
+    def keys(self, *keys):
+        self.tmux("send-keys", "-t", self.name, *keys)
+
+    def type(self, text):
+        self.tmux("send-keys", "-t", self.name, "-l", text)
+        time.sleep(0.5)
+        self.keys("Enter")
+
+
+def _wait(pred, timeout, step=1.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        v = pred()
+        if v:
+            return v
+        time.sleep(step)
+    return None
+
+
+def _hook_lines(path):
+    out = []
+    try:
+        for line in open(path, encoding="utf-8"):
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    return out
+
+
+def check_claude_tui(c, B, exe, work):
+    """The interactive Claude in a pane, as aigw runs it for "claude-tui"/"root-shell"."""
+    tmp = Path(tempfile.mkdtemp(prefix="aigw-compat-tmux-"))
+    sock, name = str(tmp / "sock"), "aigwcompat"
+    talkto = tmp / "talkto.jsonl"
+    pane = Pane(sock, name)
+    sid = str(uuid.uuid4())
+    # aigw-backend's own tmux helpers, pointed at this private server.
+    B.tmux_query = B.tmux_exec = lambda location, args, timeout=15: pane.tmux(*args, timeout=timeout)
+    jobs = CLAUDE_HOME / ".claude/jobs"
+    jobs_before = set(os.listdir(jobs)) if jobs.is_dir() else set()
+    B._claude_home_for_location = lambda location: CLAUDE_HOME
+    env = ["env", f"AIGW_TALKTO={talkto}", *B.PANE_ENV]
+    r = pane.tmux("new-session", "-d", "-s", name, "-x", "200", "-y", "50", "-c", str(work), "--",
+                  *env, exe, "--session-id", sid, "--model", MODEL)
+    if r.returncode != 0:
+        c.add("tui", "start in tmux", False, r.stderr)
+        return
+    try:
+        B.TRUST_DIALOG_POLL_TIMEOUT = 40
+        B._accept_workspace_trust_if_shown("compat", name)
+        # As root-shell runs it (no --dangerously-skip-permissions for root): ready is the prompt.
+        ready = _wait(lambda: B.TRUST_DIALOG_MARKER not in pane.screen() and B._PROMPT_READY_RE.search(pane.screen()), 60)
+        c.add("tui", "trust dialog passed (aigw's own handling), prompt ready", ready, pane.screen()[-600:])
+        if not ready:
+            return
+        cmd = pane.tmux("display-message", "-p", "-t", name, "#{pane_current_command}").stdout.strip()
+        c.add("tui", "pane_current_command is claude", B._is_claude_foreground(cmd), cmd)
+
+        # 1. a turn
+        pane.type("Reply with just the word OK.")
+        stop = _wait(lambda: next((h["task"] for h in _hook_lines(talkto) if "task" in h
+                                    and h["task"].get("hook_event_name") == "Stop"), None), 120)
+        scr = pane.screen()
+        if not stop and UNAVAILABLE_RE.search(scr):
+            raise Unavailable(scr[-300:])
+        c.add("hooks", "Stop hook through aigw-task-hook", stop, "no Stop line in $AIGW_TALKTO (managed settings' hooks?)")
+        convs = [h["conv"] for h in _hook_lines(talkto) if "conv" in h]
+        start = convs[0] if convs else {}
+        c.add("hooks", "SessionStart reports the conversation", start.get("session_id") == sid and start.get("source") == "startup",
+              start)
+        c.add("hooks", "SessionStart: pane, not nested", start.get("pane") is True and start.get("nested") is False, start)
+        rep = B._conv_from_report(start) if start else None
+        proj = B.claude_project_dir(str(work), home=CLAUDE_HOME)
+        c.add("hooks", "transcript_path is where aigw looks", rep and rep["dir"] == proj.name, f"{start.get('transcript_path')} vs {proj}")
+        if stop:
+            c.add("hooks", "Stop: session_id, last_assistant_message", stop.get("session_id") == sid and "OK" in str(stop.get("last_assistant_message")),
+                  {k: str(v)[:80] for k, v in stop.items()})
+            decl = B.parse_task_line(str(stop.get("last_assistant_message") or ""))
+            c.add("hooks", "status line rule reached Claude (warn only)", True,
+                  "" if decl else "no 状態: line in the reply")
+        path = proj / f"{sid}.jsonl"
+        _, evs = B._split_assistant_text_events(path.read_bytes() + b"\n") if path.exists() else (b"", [])
+        c.add("transcript", "reply parsed by aigw", any("OK" in e.get("text", "") for e in evs if e["type"] == "agent_output"),
+              f"{path} exists={path.exists()} events={[e['type'] for e in evs][:8]}")
+        live = B._live_claude_conversation("root", name)
+        c.add("records", "~/.claude/sessions/<pid>.json names the pane's conversation", live == sid, f"live={live}")
+
+        # 2. a dialog waiting for the user (the deployment notes)
+        pane.type("Use the AskUserQuestion tool to ask me whether I prefer A or B. Do nothing else.")
+        waiting = _wait(lambda: B.screen_is_waiting(pane.screen()), 120)
+        c.add("screen", "question dialog seen as waiting", waiting, pane.screen()[-800:])
+        pane.keys("Escape")
+        _wait(lambda: not B.screen_is_waiting(pane.screen()), 20)
+        time.sleep(3)
+
+        # 3. /clear: a new conversation, reported by SessionStart (the deployment notes)
+        n = len(convs)
+        pane.type("/clear")
+        clear = _wait(lambda: next((h["conv"] for h in _hook_lines(talkto)[0:] if "conv" in h
+                                    and h["conv"].get("source") == "clear"), None), 60)
+        c.add("hooks", "/clear: SessionStart source=clear, new id", clear and clear.get("session_id") != sid, clear)
+        if clear:
+            new = clear["session_id"]
+            time.sleep(2)
+            pane.type("Reply with just the word TWO.")
+            npath = proj / f"{new}.jsonl"
+            got = _wait(lambda: npath.exists() and any("TWO" in e.get("text", "") for e in
+                                                       B._split_assistant_text_events(npath.read_bytes() + b"\n")[1]
+                                                       if e["type"] == "agent_output"), 120)
+            c.add("transcript", "after /clear: new log parsed by aigw", got, npath)
+            c.add("transcript", "after /clear: read from the top", npath.exists() and B._switched_conversation_offset(npath) == 0, "")
+            c.add("records", "after /clear: record follows", B._live_claude_conversation("root", name) == new, "")
+        _ = n
+
+        # 4. agent view off (PANE_ENV): ← on an empty prompt must not move the conversation away
+        time.sleep(2)
+        pane.keys("Left")
+        time.sleep(4)
+        scr = pane.screen()
+        jobs_after = set(os.listdir(jobs)) if jobs.is_dir() else set()
+        c.add("agent-view", "← does not background the conversation",
+              "moved to the background" not in scr and jobs_after == jobs_before, scr[-400:])
+    finally:
+        pane.tmux("kill-server")
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_codex(c, B, work):
+    r = _run([CODEX, "--version"])
+    c.add("codex", "--version", VER_RE.search(r.stdout), r.stdout + r.stderr)
+    try:
+        pw = pwd.getpwnam(CODEX_USER)
+    except KeyError:
+        c.add("codex", "login owner", False, CODEX_USER)
+        return
+    home = user_home()
+    r = _run(as_user(CODEX, "login", "status", home=home))
+    st = B._codex_status_result(r.returncode, r.stdout, r.stderr)
+    c.add("codex", "login status read by aigw", st["loggedIn"], st)
+    wdir = Path(tempfile.mkdtemp(prefix="aigw-compat-codex-"))
+    shutil.chown(wdir, CODEX_USER)
+    started = time.time()
+    r = _run(as_user(CODEX, "exec", "--skip-git-repo-check", "Reply with just the word OK.", home=home), timeout=300, cwd=str(wdir))
+    if UNAVAILABLE_RE.search(r.stdout[-500:] + r.stderr[-500:]):
+        raise Unavailable("codex: " + (r.stderr or r.stdout)[-300:])
+    found = [p for p in glob.glob(str(home / ".codex/sessions/*/*/*/rollout-*.jsonl")) if os.path.getmtime(p) >= started - 5]
+    c.add("codex", "rollout file where aigw looks", found and B.CODEX_ROLLOUT_FD_RE.search(found[0]),
+          f"rc={r.returncode} {r.stderr[-300:]}")
+    for p in found:
+        data = Path(p).read_bytes()
+        _, texts = B._codex_rollout_texts(data)
+        c.add("codex", "rollout parsed by aigw", any("OK" in t for t in texts), texts[:3])
+        c.add("codex", "rollout start time", B._codex_rollout_started(Path(p)) is not None, p)
+        os.unlink(p)   # a test turn, not the user's history
+        break
+    shutil.rmtree(wdir, ignore_errors=True)
+
+
+def run_checks(live=True):
+    c = Checks()
+    B = load_backend()
+    B.sb_open, B.sb_stat, B.sb_read_text = open, os.stat, lambda p: Path(p).read_text()
+    work = Path(tempfile.mkdtemp(prefix="aigw-compat-work-"))
+    global B_TUI_READY, B_TRUST
+    # "bypass permissions on" is put together on screen; the binary has its first part.
+    B_TUI_READY, B_TRUST = B.TUI_READY_MARKER.rsplit(" ", 1)[0].encode(), B.TRUST_DIALOG_MARKER.encode()
+    exe = ROOT_CLAUDE
+    c.unavailable = []
+    try:
+        check_claude_static(c, exe)
+        if live:
+            for fn, args in ((check_claude_headless, (c, B, exe, str(work))), (check_claude_tui, (c, B, exe, work)),
+                             (check_codex, (c, B, str(work)))):
+                try:
+                    fn(*args)
+                except Unavailable as e:
+                    c.unavailable.append(f"{fn.__name__}: {str(e)[:200]}")
+                    print(f"SKIP {fn.__name__}: account unavailable: {str(e)[:200]}", flush=True)
+    except Exception as e:  # a crash is a failed check, not a silent one
+        c.add("run", "checks ran to the end", False, f"{type(e).__name__}: {e}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        proj = CLAUDE_HOME / ".claude/projects"
+        for d in proj.glob("*aigw-compat-work-*"):
+            shutil.rmtree(d, ignore_errors=True)
+    return c
+
+
+def report(c, vers):
+    lines = [f"Claude Code {vers['claude'].get('root')}, Codex {vers['codex'].get('shared')}", ""]
+    for u in getattr(c, "unavailable", []):
+        lines.append(f"- 試せなかった(アカウント): {u}")
+    for area, name, ok, detail in c.results:
+        lines.append(f"- {'ok' if ok else '**FAIL**'} {area}: {name}" + ("" if ok else f" — {detail}"))
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------- daily
+def daily(d, save=True):
+    d = Path(d)
+    d.mkdir(parents=True, exist_ok=True)
+    _run([ROOT_CLAUDE, "update"], timeout=300)   # root's install follows the same channel as the users'
+    now = versions()
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        state = {}
+    before = state.get("versions") or {}
+    changes = []
+    for kind in ("claude", "codex", "ssh"):
+        old_set = set(v for v in (before.get(kind) or {}).values() if v)
+        new_set = set(v for v in now[kind].values() if v)
+        added = sorted(new_set - old_set)
+        if added and before:
+            changes.append(f"{kind}: {', '.join(added)} (前: {', '.join(sorted(old_set)) or '-'})")
+    tested = state.get("tested") or {}
+    mine = now["claude"].get("root")
+    want = (tested.get("claude") != mine or tested.get("codex") != now["codex"].get("shared")
+            or state.get("failing"))
+    out = ["# aigw の互換チェック (the deployment notes)", ""]
+    out += [f"- 版が変わった: {x}" for x in changes] or ["- 版の変化なし"]
+    out.append("")
+    out.append("今の版: " + json.dumps(now, ensure_ascii=False))
+    failed, unavailable = [], []
+    if want:
+        c = run_checks(live=True)
+        if c.failed():
+            # Once more: a live turn can go wrong on its own (the model, a slow
+            # start). Only what fails both times is reported.
+            again = {(a, n) for a, n, ok, _ in run_checks(live=True).failed()}
+            c.results = [r if r[2] or (r[0], r[1]) in again else (r[0], r[1], True, "") for r in c.results]
+        (d / "aigw-compat-check.md").write_text(report(c, now))
+        failed = c.failed()
+        unavailable = c.unavailable
+        out.append("")
+        out.append(f"チェック: {len(c.results) - len(failed)}/{len(c.results)} 通過(詳細 {d}/aigw-compat-check.md)")
+        out += [f"- aigw-compat FAIL {a}: {n} — {det}" for a, n, ok, det in failed]
+        out += [f"- 試せなかった(アカウントの利用上限・ログイン切れ。明朝もう一度): {u}" for u in unavailable]
+    else:
+        out.append("")
+        out.append(f"チェック: 前回({tested.get('claude')} / {tested.get('codex')})から変わっていないので省いた")
+    (d / "aigw-compat.md").write_text("\n".join(out) + "\n")
+    if save:
+        state["versions"] = now
+        if want:
+            state["failing"] = bool(failed)
+            if not failed and not unavailable:
+                state["tested"] = {"claude": mine, "codex": now["codex"].get("shared")}
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps(state, ensure_ascii=False, indent=1))
+    print("\n".join(out))
+    return 1 if failed else 0
+
+
+def main():
+    if not CHECK_USER:
+        sys.exit("aigw-compat: set AIGW_COMPAT_USER to the user whose Claude Code / Codex logins run the live checks")
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("versions")
+    p = sub.add_parser("check")
+    p.add_argument("--no-live", action="store_true")
+    p = sub.add_parser("daily")
+    p.add_argument("dir")
+    p.add_argument("--no-save", action="store_true")
+    a = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit("aigw-compat: run as root")
+    if a.cmd == "versions":
+        print(json.dumps(versions(), ensure_ascii=False, indent=1))
+    elif a.cmd == "check":
+        c = run_checks(live=not a.no_live)
+        print()
+        print(report(c, versions_local()))
+        sys.exit(1 if c.failed() else 0)
+    else:
+        sys.exit(daily(a.dir, save=not a.no_save))
+
+
+if __name__ == "__main__":
+    main()
